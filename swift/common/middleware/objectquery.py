@@ -34,7 +34,7 @@ from swift.common.exceptions import DiskFileError, DiskFileNotExist
 
 class ObjectQueryMiddleware(object):
     
-    def __init__(self, app, conf, logger=None, object_ring=None):
+    def __init__(self, app, conf, logger=None):
         self.app = app
         if logger:
             self.logger = logger

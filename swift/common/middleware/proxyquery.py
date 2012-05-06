@@ -9,7 +9,7 @@ from webob.exc import HTTPNotFound, HTTPPreconditionFailed, \
     HTTPRequestTimeout, HTTPRequestEntityTooLarge
     
 from swift.common.utils import split_path, get_logger, TRUE_VALUES
-from swift.proxy.server import update_headers
+from swift.proxy.server import update_headers, Controller, ObjectController
 from swift.common.bufferedhttp import http_connect
 from swift.common.ring import Ring
 from swift.common.exceptions import ConnectionTimeout, ChunkReadTimeout, \
@@ -38,7 +38,7 @@ class ProxyQueryMiddleware(object):
                 account_name=account,
                 container_name=container,
                 object_name=obj)
-        return ObjectController, d
+        return QueryController, d
             
     def __call__(self, env, start_response):
         req = Request(env)
@@ -51,23 +51,15 @@ class ProxyQueryMiddleware(object):
         controller = controller(self, self.app, **path_parts)
         
         if hasattr(controller, req.method):
-            res = getattr(controller, req.method)(env, start_response)
+            res = getattr(controller, req.method)(req)
         else:
             return self.app(env, start_response)
         
         return res(env, start_response)
-                    
-class Controller(object):
-    def __init__(self, app):
-        self.app = app
-        self.response_args = []
 
-    def do_start_response(self, *args):
-        self.response_args.extend(args)
 
-class ObjectController(Controller):
+class QueryController(Controller):
     """WSGI controller for object requests."""
-    server_type = _('Object')
 
     def __init__(self, app, account_name, container_name, object_name,
                  **kwargs):
@@ -75,6 +67,7 @@ class ObjectController(Controller):
         self.account_name = unquote(account_name)
         self.container_name = unquote(container_name)
         self.object_name = unquote(object_name)
+        self.proxy_controller = ObjectController(self, app, account_name, container_name, object_name)
         
     def QUERY(self, req):
         """Handler for HTTP QUERY requests."""
@@ -108,7 +101,7 @@ class ObjectController(Controller):
             orig_container_name = self.container_name
             self.object_name = src_obj_name
             self.container_name = src_container_name
-            source_resp = self.GET(source_req)
+            source_resp = self.proxy_controller.GET(source_req)
             if source_resp.status_int >= 300:
                 return source_resp
             self.object_name = orig_obj_name
@@ -254,7 +247,7 @@ class ObjectController(Controller):
             orig_container_name = self.container_name
             self.object_name = dest_obj_name
             self.container_name = dest_container_name
-            dest_resp = self.PUT(dest_req)
+            dest_resp = self.proxy_controller.PUT(dest_req)
             if dest_resp.status_int >= 300:
                 return dest_resp
             self.object_name = orig_obj_name
