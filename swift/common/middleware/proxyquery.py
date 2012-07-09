@@ -50,8 +50,8 @@ class ProxyQueryMiddleware(object):
         
         controller = controller(self, self.app, **path_parts)
         
-        if hasattr(controller, req.method):
-            res = getattr(controller, req.method)(req)
+        if req.method == 'POST' and 'x-zerovm-execute' in req.headers :
+            res = controller.zerovm_query(req)
         else:
             return self.app(env, start_response)
         
@@ -69,7 +69,7 @@ class QueryController(Controller):
         self.object_name = unquote(object_name)
         self.proxy_controller = ObjectController(self, app, account_name, container_name, object_name)
         
-    def QUERY(self, req):
+    def zerovm_query(self, req):
         """Handler for HTTP QUERY requests."""
         # TODO: log the path and the components on loglevel_debug.
         
@@ -97,15 +97,15 @@ class QueryController(Controller):
             source_req = req.copy_get()
             source_req.path_info = source_header
             source_req.headers['X-Newest'] = 'true'
-            orig_obj_name = self.object_name
-            orig_container_name = self.container_name
-            self.object_name = src_obj_name
-            self.container_name = src_container_name
+            #orig_obj_name = self.object_name
+            #orig_container_name = self.container_name
+            self.proxy_controller.object_name = src_obj_name
+            self.proxy_controller.container_name = src_container_name
             source_resp = self.proxy_controller.GET(source_req)
             if source_resp.status_int >= 300:
                 return source_resp
-            self.object_name = orig_obj_name
-            self.container_name = orig_container_name
+            #self.object_name = orig_obj_name
+            #self.container_name = orig_container_name
             new_req = Request.blank(req.path_info,
                         environ=req.environ, headers=req.headers)
             code_source = source_resp.app_iter
@@ -243,15 +243,15 @@ class QueryController(Controller):
             dest_req.environ['wsgi.input'] = server_response
             dest_req.headers['Content-Length'] = \
                           server_response.getheader('Content-Length')
-            orig_obj_name = self.object_name
-            orig_container_name = self.container_name
-            self.object_name = dest_obj_name
-            self.container_name = dest_container_name
+            #orig_obj_name = self.object_name
+            #orig_container_name = self.container_name
+            self.proxy_controller.object_name = dest_obj_name
+            self.proxy_controller.container_name = dest_container_name
             dest_resp = self.proxy_controller.PUT(dest_req)
             if dest_resp.status_int >= 300:
                 return dest_resp
-            self.object_name = orig_obj_name
-            self.container_name = orig_container_name
+            #self.object_name = orig_obj_name
+            #self.container_name = orig_container_name
             client_response = dest_resp
         else:
             client_response.app_iter = file_iter()
