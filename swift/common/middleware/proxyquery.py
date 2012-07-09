@@ -275,4 +275,5 @@ def filter_factory(global_conf, **local_conf):
 
     def query_filter(app):
         return ProxyQueryMiddleware(app, conf)
+
     return query_filter

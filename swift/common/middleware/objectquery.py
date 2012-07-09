@@ -449,5 +449,4 @@ def filter_factory(global_conf, **local_conf):
 
     def obj_query_filter(app):
         return ObjectQueryMiddleware(app, conf)
-
     return obj_query_filter
