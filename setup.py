@@ -93,13 +93,6 @@ setup(
             'tempurl=swift.common.middleware.tempurl:filter_factory',
             'formpost=swift.common.middleware.formpost:filter_factory',
             'name_check=swift.common.middleware.name_check:filter_factory',
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> bug fixes
-=======
-            ' proxyquery=swift.common.middleware.proxyquery:filter_factory'
->>>>>>> bug fixes
             ],
         },
     )
