@@ -1,56 +1,62 @@
 import os
-
+import uuid
 from urllib import unquote
 from webob import Request, Response
 from random import shuffle
 from eventlet.timeout import Timeout
 
 from webob.exc import HTTPNotFound, HTTPPreconditionFailed, \
-    HTTPRequestTimeout, HTTPRequestEntityTooLarge
+    HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest
     
-from swift.common.utils import split_path, get_logger, TRUE_VALUES
+from swift.common.utils import split_path, get_logger, TRUE_VALUES, get_remote_client
 from swift.proxy.server import update_headers, Controller, ObjectController
 from swift.common.bufferedhttp import http_connect
 from swift.common.ring import Ring
 from swift.common.exceptions import ConnectionTimeout, ChunkReadTimeout, \
     ChunkWriteTimeout
+from swift.common.constraints import check_utf8
 
 class ProxyQueryMiddleware(object):
     
-    def __init__(self, app, conf, logger=None, object_ring=None):
+    def __init__(self, app, conf, logger=None):
         self.app = app
         if logger:
             self.logger = logger
         else:
             self.logger = get_logger(conf, log_route='proxy-query')
-        self.zerovm_maxnexe = int(conf.get('zerovm_maxnexe', 256*1048576))
-        swift_dir = conf.get('swift_dir', '/etc/swift')
-        self.object_ring = object_ring or \
-            Ring(os.path.join(swift_dir, 'object.ring.gz'))
-        self.client_chunk_size = int(conf.get('client_chunk_size', 65536))
-        self.node_timeout = int(conf.get('node_timeout', 10))
-        self.conn_timeout = float(conf.get('conn_timeout', 0.5))
-        self.object_chunk_size = int(conf.get('object_chunk_size', 65536))
-            
-    def get_controller(self, path):
-        version, account, container, obj = split_path(path, 1, 4, True)
-        d = dict(version=version,
-                account_name=account,
-                container_name=container,
-                object_name=obj)
-        return QueryController, d
-            
+        self.app.zerovm_maxnexe = int(conf.get('zerovm_maxnexe', 256*1048576))
+
     def __call__(self, env, start_response):
         req = Request(env)
-        
-        try:
-            controller, path_parts = self.get_controller(req.path)
-        except ValueError:
-            return HTTPNotFound(request=req)
-        
-        controller = controller(self, self.app, **path_parts)
-        
         if req.method == 'POST' and 'x-zerovm-execute' in req.headers :
+            if req.content_length and req.content_length < 0:
+                return HTTPBadRequest(request=req,
+                    body='Invalid Content-Length')
+            try:
+                version, account, container, obj = split_path(req.path, 1, 4, True)
+                path_parts = dict(version=version,
+                    account_name=account,
+                    container_name=container,
+                    object_name=obj)
+                controller = QueryController(self.app, account, container, obj)
+            except ValueError:
+                return HTTPNotFound(request=req)
+
+            if not check_utf8(req.path_info):
+                return HTTPPreconditionFailed(request=req, body='Invalid UTF8')
+            if not controller:
+                return HTTPPreconditionFailed(request=req, body='Bad URL')
+
+            if 'swift.trans_id' not in req.environ:
+                # if this wasn't set by an earlier middleware, set it now
+                trans_id = 'tx' + uuid.uuid4().hex
+                req.environ['swift.trans_id'] = trans_id
+                self.logger.txn_id = trans_id
+            req.headers['x-trans-id'] = req.environ['swift.trans_id']
+            controller.trans_id = req.environ['swift.trans_id']
+            self.logger.client_ip = get_remote_client(req)
+            if path_parts['version']:
+                req.path_info_pop()
             res = controller.zerovm_query(req)
         else:
             return self.app(env, start_response)
@@ -61,18 +67,19 @@ class ProxyQueryMiddleware(object):
 class QueryController(Controller):
     """WSGI controller for object requests."""
 
+    server_type = _('Object')
+
     def __init__(self, app, account_name, container_name, object_name,
                  **kwargs):
         Controller.__init__(self, app)
         self.account_name = unquote(account_name)
         self.container_name = unquote(container_name)
         self.object_name = unquote(object_name)
-        self.proxy_controller = ObjectController(self, app, account_name, container_name, object_name)
-        
+
     def zerovm_query(self, req):
         """Handler for HTTP QUERY requests."""
         # TODO: log the path and the components on loglevel_debug.
-        
+
         if 'swift.authorize' in req.environ:
             req.acl = \
                 self.container_info(self.account_name, self.container_name)[2]
@@ -97,15 +104,9 @@ class QueryController(Controller):
             source_req = req.copy_get()
             source_req.path_info = source_header
             source_req.headers['X-Newest'] = 'true'
-            #orig_obj_name = self.object_name
-            #orig_container_name = self.container_name
-            self.proxy_controller.object_name = src_obj_name
-            self.proxy_controller.container_name = src_container_name
-            source_resp = self.proxy_controller.GET(source_req)
+            source_resp = ObjectController(self.app, acct, src_container_name, src_obj_name).GET(source_req)
             if source_resp.status_int >= 300:
                 return source_resp
-            #self.object_name = orig_obj_name
-            #self.container_name = orig_container_name
             new_req = Request.blank(req.path_info,
                         environ=req.environ, headers=req.headers)
             code_source = source_resp.app_iter
@@ -133,6 +134,7 @@ class QueryController(Controller):
         else:
             reader = req.environ['wsgi.input'].read
             code_source = iter(lambda: reader(self.app.client_chunk_size), '')
+
         partition, nodes = self.app.object_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
         shuffle(nodes)
@@ -243,15 +245,9 @@ class QueryController(Controller):
             dest_req.environ['wsgi.input'] = server_response
             dest_req.headers['Content-Length'] = \
                           server_response.getheader('Content-Length')
-            #orig_obj_name = self.object_name
-            #orig_container_name = self.container_name
-            self.proxy_controller.object_name = dest_obj_name
-            self.proxy_controller.container_name = dest_container_name
-            dest_resp = self.proxy_controller.PUT(dest_req)
+            dest_resp = ObjectController(self.app, acct, dest_container_name, dest_obj_name).PUT(dest_req)
             if dest_resp.status_int >= 300:
                 return dest_resp
-            #self.object_name = orig_obj_name
-            #self.container_name = orig_container_name
             client_response = dest_resp
         else:
             client_response.app_iter = file_iter()

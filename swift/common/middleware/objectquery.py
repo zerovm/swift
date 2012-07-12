@@ -41,13 +41,13 @@ class ObjectQueryMiddleware(object):
         else:
             self.logger = get_logger(conf, log_route='obj-query')
 
-        self.devices = conf.get('devices', '/srv/node/')
-        self.mount_check = conf.get('mount_check', 'true').lower() in\
-                           ('true', 't', '1', 'on', 'yes', 'y')
-        self.max_upload_time = int(conf.get('max_upload_time', 86400))
-        self.disk_chunk_size = int(conf.get('disk_chunk_size', 65536))
-        self.network_chunk_size = int(conf.get('network_chunk_size', 65536))
-        self.log_requests = conf.get('log_requests', 't')[:1].lower() == 't'
+        #self.devices = conf.get('devices', '/srv/node/')
+        #self.mount_check = conf.get('mount_check', 'true').lower() in\
+        #                   ('true', 't', '1', 'on', 'yes', 'y')
+        #self.max_upload_time = int(conf.get('max_upload_time', 86400))
+        #self.disk_chunk_size = int(conf.get('disk_chunk_size', 65536))
+        #self.network_chunk_size = int(conf.get('network_chunk_size', 65536))
+        #self.log_requests = conf.get('log_requests', 't')[:1].lower() == 't'
 
         self.zerovm_exename = set(i.strip() for i in conf.get('zerovm_exename', 'zerovm1').split() if i.strip())
         self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '-Y2').split() if i.strip())
@@ -89,6 +89,7 @@ class ObjectQueryMiddleware(object):
         # green thread for zerovm execution
         self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
 
+
     def zerovm_query(self, req):
         """Handle HTTP QUERY requests for the Swift Object Server."""
 
@@ -101,11 +102,13 @@ class ObjectQueryMiddleware(object):
 
         # TODO log the path and the components on loglevel_debug
 
+        if self.zerovm_thrdpool.size != self.zerovm_maxpool:
+            self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
         if self.zerovm_thrdpool.free() <= 0\
         and self.zerovm_thrdpool.waiting() >= self.zerovm_maxqueue:
             return HTTPServiceUnavailable(body='Slot not available',
                 request=req, content_type='text/plain')
-        if self.mount_check and not check_mount(self.devices, device):
+        if self.app.mount_check and not check_mount(self.app.devices, device):
             # TODO: not consistent return of error code, copied from GET
 
             return Response(status='507 %s is not mounted' % device)
@@ -125,14 +128,14 @@ class ObjectQueryMiddleware(object):
                 body='Invalid Content-Type',
                 content_type='text/plain')
         file = DiskFile(
-            self.devices,
+            self.app.devices,
             device,
             partition,
             account,
             container,
             obj,
             self.logger,
-            disk_chunk_size=self.disk_chunk_size,
+            disk_chunk_size=self.app.disk_chunk_size,
         )
         try:
             input_file_size = file.get_data_file_size()
@@ -148,8 +151,8 @@ class ObjectQueryMiddleware(object):
             reader = req.environ['wsgi.input'].read
             upload_size = 0
             etag = md5()
-            upload_expiration = time.time() + self.max_upload_time
-            for chunk in iter(lambda: reader(self.network_chunk_size),
+            upload_expiration = time.time() + self.app.max_upload_time
+            for chunk in iter(lambda: reader(self.app.network_chunk_size),
                 ''):
                 upload_size += len(chunk)
                 if time.time() > upload_expiration:
@@ -199,8 +202,8 @@ class ObjectQueryMiddleware(object):
 
             try:
                 # outputiter is responsible to delete temp file
-                (zerovm_output_fd, zerovm_output_fn) =\
-                mkstemp(dir=file.tmpdir)
+                (zerovm_output_fd, zerovm_output_fn) = mkstemp(dir=file.tmpdir)
+                #import pdb; pdb.set_trace()
                 fallocate(zerovm_output_fd, self.zerovm_maxoutput)
                 outputiter = file_iter(zerovm_output_fd,
                     zerovm_output_fn)
@@ -424,7 +427,7 @@ class ObjectQueryMiddleware(object):
                                         ' %(path)s '), {'method': req.method, 'path': req.path})
                 res = HTTPInternalServerError(body=traceback.format_exc())
         trans_time = time.time() - start_time
-        if self.log_requests:
+        if self.app.log_requests:
             log_line = '%s - - [%s] "%s %s" %s %s "%s" "%s" "%s" %.4f' % (
                 req.remote_addr,
                 time.strftime('%d/%b/%Y:%H:%M:%S +0000',
