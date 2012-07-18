@@ -304,15 +304,15 @@ class ObjectQueryMiddleware(object):
 #                            '#x-nexe-attr       =' + header[14:]\
 #                            + ':' + req.headers[header] + '\n'
 
-                zerovm_inputmnfst += 'Channel=%s,/dev/stdin,%s,%s,0,0\n'\
+                zerovm_inputmnfst += 'Channel=%s,/dev/stdin,4,%s,%s,0,0\n'\
                 % ('/dev/null' if zerovm_execute_only else nexe_input_fn,
                    self.zerovm_maxiops, self.zerovm_maxinput)
 
-                zerovm_inputmnfst += 'Channel=%s,/dev/stdout,0,0,%s,%s\n'\
+                zerovm_inputmnfst += 'Channel=%s,/dev/stdout,5,0,0,%s,%s\n'\
                 % (nexe_output_fn if 'stdout' in nexe_std_list else '/dev/null',
                    self.zerovm_maxiops, self.zerovm_maxoutput)
 
-                zerovm_inputmnfst += 'Channel=%s,/dev/stderr,0,0,%s,%s\n'\
+                zerovm_inputmnfst += 'Channel=%s,/dev/stderr,6,0,0,%s,%s\n'\
                 % (nexe_error_fn if 'stderr' in nexe_std_list else '/dev/null',
                    self.zerovm_maxiops, self.zerovm_maxoutput)
 
@@ -345,6 +345,11 @@ class ObjectQueryMiddleware(object):
                     stderr_data = ''
                     readable = [proc.stdout, proc.stderr]
                     start = time.time()
+                    def get_output(stdout_data, stderr_data):
+                        (data1, data2) = proc.communicate()
+                        stdout_data += data1
+                        stderr_data += data2
+                        return stdout_data, stderr_data
                     while time.time() - start < self.zerovm_timeout:
                         rlist, wlist, xlist = \
                         select.select(readable, [], [], start - time.time() + self.zerovm_timeout)
@@ -359,11 +364,12 @@ class ObjectQueryMiddleware(object):
                                 stdout_data += data
                             elif stream == proc.stderr:
                                 stderr_data += data
-                            if stdout_data > self.zerovm_stdout_size \
-                            or stderr_data > self.zerovm_stderr_size:
+                            if len(stdout_data) > self.zerovm_stdout_size \
+                            or len(stderr_data) > self.zerovm_stderr_size:
                                 proc.kill()
                                 return 3, stdout_data, stderr_data
                         if proc.poll() is not None:
+                            stdout_data, stderr_data = get_output(stdout_data, stderr_data)
                             return 0, stdout_data, stderr_data
                         sleep(0.1)
                     if proc.poll() is None:
@@ -372,9 +378,11 @@ class ObjectQueryMiddleware(object):
                         while time.time() - start\
                         < self.zerovm_kill_timeout:
                             if proc.poll() is not None:
+                                stdout_data, stderr_data = get_output(stdout_data, stderr_data)
                                 return 1, stdout_data, stderr_data
                             sleep(0.1)
                         proc.kill()
+                        stdout_data, stderr_data = get_output(stdout_data, stderr_data)
                         return 2, stdout_data, stderr_data
 
                 thrd = self.zerovm_thrdpool.spawn(ex_zerovm)
@@ -385,7 +393,7 @@ class ObjectQueryMiddleware(object):
                                     ' zerovm_stderr=%s'\
                                     % (self.retcode_map[zerovm_retcode], zerovm_stdout, zerovm_stderr))
                 report = zerovm_stdout.splitlines()
-                nexe_retcode = report[0]
+                nexe_retcode = int(report[0])
                 nexe_etag = report[1]
                 nexe_status = '\n'.join(report[2:])
 
@@ -472,7 +480,7 @@ class ObjectQueryMiddleware(object):
                 for fn in fn_list:
                     content_length += os.path.getsize(fn)
                 response.content_length = content_length
-                response.headers['x-nexe-stdsize'] += ' '.join([str(os.path.getsize(fn)) for fn in fn_list])
+                response.headers['x-nexe-stdsize'] = ' '.join([str(os.path.getsize(fn)) for fn in fn_list])
                 if 'x-nexe-content-type' in req.headers:
                     response.headers['Content-Type'] = req.headers['x-nexe-content-type']
                 return req.get_response(response)
