@@ -2,15 +2,18 @@
 import re
 # for capturing zerovm stdout and stderr
 import os
+from subprocess import PIPE
 import time
 import traceback
 
 # needed for spawning zerovm processes
-from subprocess import Popen, STDOUT, PIPE
+#from subprocess import Popen, STDOUT, PIPE
 
 # needed to limit the number of simultaneously running zerovms
 from eventlet import GreenPool, sleep
+from eventlet.green import select, subprocess
 from eventlet.timeout import Timeout
+import subprocess
 
 # needed for parsing manifest files returned from zerovm
 from string import split
@@ -49,11 +52,8 @@ class ObjectQueryMiddleware(object):
         #self.network_chunk_size = int(conf.get('network_chunk_size', 65536))
         #self.log_requests = conf.get('log_requests', 't')[:1].lower() == 't'
 
-        self.zerovm_exename = set(i.strip() for i in conf.get('zerovm_exename', 'zerovm1').split() if i.strip())
-        self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '-Y2').split() if i.strip())
-        # for debug only, harmless
-        # self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', 'ok. 0').split() if i.strip())
-        self.zerovm_nexe_xparams = set(i.strip() for i in conf.get('zerovm_nexe_xparams', '').split() if i.strip())
+        self.zerovm_exename = set(i.strip() for i in conf.get('zerovm_exename', 'zerovm').split() if i.strip())
+        self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '').split() if i.strip())
 
         # maximum number of simultaneous running zerovms, others are queued
         self.zerovm_maxpool = int(conf.get('zerovm_maxpool', 2))
@@ -76,6 +76,8 @@ class ObjectQueryMiddleware(object):
         # maximum input data file size
         self.zerovm_maxinput = int(conf.get('zerovm_maxinput', 256 * 1048576))
 
+        self.zerovm_maxiops = int(conf.get('zerovm_maxiops', 1024 * 1048576))
+
         # maximum nexe size
         self.zerovm_maxnexe = int(conf.get('zerovm_maxnexe', 256 * 1048576))
 
@@ -83,6 +85,18 @@ class ObjectQueryMiddleware(object):
         self.zerovm_maxoutput = int(conf.get('zerovm_maxoutput', 64 * 1048576)) # TODO this breaks some tests
 
         self.zerovm_maxchunksize = int(conf.get('zerovm_maxchunksize', 1024 * 1024))
+
+        # max syscall number
+        self.zerovm_maxsyscalls = int(conf.get('zerovm_maxsyscalls', 1024 * 1048576))
+
+        # max nexe memory size
+        self.zerovm_maxnexemem = int(conf.get('zerovm_maxnexemem', 4 * 1024 * 1048576))
+
+        # hardcoded, we don't want to crush the server
+        self.zerovm_stderr_size = 65536
+        self.zerovm_stdout_size = 65536
+        self.retcode_map = ('OK', 'Timed out', 'Killed', 'Output too long')
+
         self.fault_injection = conf.get('fault_injection', '') # for unit-tests.
         self.os_interface = os
 
@@ -93,14 +107,14 @@ class ObjectQueryMiddleware(object):
     def zerovm_query(self, req):
         """Handle HTTP QUERY requests for the Swift Object Server."""
 
+        # TODO: we need a way to execute without an input path
+        zerovm_execute_only = False
         try:
             (device, partition, account, container, obj) =\
             split_path(unquote(req.path), 5, 5, True)
         except ValueError, err:
             return HTTPBadRequest(body=str(err), request=req,
                 content_type='text/plain')
-
-        # TODO log the path and the components on loglevel_debug
 
         if self.zerovm_thrdpool.size != self.zerovm_maxpool:
             self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
@@ -109,15 +123,12 @@ class ObjectQueryMiddleware(object):
             return HTTPServiceUnavailable(body='Slot not available',
                 request=req, content_type='text/plain')
         if self.app.mount_check and not check_mount(self.app.devices, device):
-            # TODO: not consistent return of error code, copied from GET
-
             return Response(status='507 %s is not mounted' % device)
         if 'content-length' not in req.headers\
         and req.headers.get('transfer-encoding') != 'chunked':
             return HTTPLengthRequired(request=req)
         if 'content-length' in req.headers\
-        and int(req.headers['content-length'])\
-        > self.zerovm_maxnexe:
+        and int(req.headers['content-length']) > self.zerovm_maxnexe:
             return HTTPRequestEntityTooLarge(body='Your request is too large.'
                 , request=req, content_type='text/plain')
         if 'Content-Type' not in req.headers:
@@ -127,6 +138,31 @@ class ObjectQueryMiddleware(object):
             return HTTPBadRequest(request=req,
                 body='Invalid Content-Type',
                 content_type='text/plain')
+
+        def get_multi_header(hdr_count,hdr_prefix):
+            result = []
+            if hdr_count not in req.headers:
+                return result
+            for c in xrange(0,int(req.headers[hdr_count])):
+                channel = hdr_prefix+str(c)
+                if channel not in req.headers:
+                    return HTTPBadRequest(request=req,
+                        body='Missing header %s' % channel,
+                        content_type='text/plain')
+                result[c] = req.headers[channel]
+            return result
+
+        channel_list = ''
+        channels = get_multi_header('x-nexe-channels','x-nexe-channel-')
+        for channel in channels:
+            channel_list += 'Channel=%s\n' % channel
+
+        nexe_std_list = []
+        if 'x-nexe-stdlist' in req.headers:
+            nexe_std_list = re.split('\s*,\s*', req.headers['x-nexe-stdlist'])
+        if not nexe_std_list:
+            nexe_std_list = ['stdout']
+
         file = DiskFile(
             self.app.devices,
             device,
@@ -169,245 +205,277 @@ class ObjectQueryMiddleware(object):
             != etag:
                 return HTTPUnprocessableEntity(request=req)
 
-            def file_iter(fd, fn):
+            def file_iter(fd_list, fn_list):
                 """Returns an iterator over the data file."""
 
                 try:
                     chunk_size = file.disk_chunk_size
-                    read = 0
-                    dropped_cache = 0
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    while True:
-                        chunk = os.read(fd, chunk_size)
-                        if chunk:
-                            read += len(chunk)
-                            if read - dropped_cache > self.zerovm_maxchunksize:
-                                drop_buffer_cache(fd, dropped_cache,
-                                    read - dropped_cache)
-                                dropped_cache = read
-                            yield chunk
-                        else:
-                            drop_buffer_cache(fd, dropped_cache, read
-                            - dropped_cache)
-                            break
+                    for fd in fd_list:
+                        read = 0
+                        dropped_cache = 0
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        while True:
+                            chunk = os.read(fd, chunk_size)
+                            if chunk:
+                                read += len(chunk)
+                                if read - dropped_cache > self.zerovm_maxchunksize:
+                                    drop_buffer_cache(fd, dropped_cache,
+                                        read - dropped_cache)
+                                    dropped_cache = read
+                                yield chunk
+                            else:
+                                drop_buffer_cache(fd, dropped_cache, read
+                                - dropped_cache)
+                                break
                 finally:
                     try:
-                        self.os_interface.close(fd)
+                        for fd in fd_list:
+                            self.os_interface.close(fd)
                     except OSError:
                         pass
                     try:
-                        self.os_interface.unlink(fn)
+                        for fn in fn_list:
+                            self.os_interface.unlink(fn)
                     except OSError:
                         pass
 
+
             try:
+                fd_list = []
+                fn_list = []
+                for stream in nexe_std_list:
+                    if 'stdout' in stream:
+                        (nexe_output_fd, nexe_output_fn) = mkstemp(dir=file.tmpdir)
+                        fallocate(nexe_output_fd, self.zerovm_maxoutput)
+                        fd_list.append(nexe_output_fd)
+                        fn_list.append(nexe_output_fn)
+                    elif 'stderr' in stream:
+                        (nexe_error_fd, nexe_error_fn) = mkstemp(dir=file.tmpdir)
+                        fallocate(nexe_error_fd, self.zerovm_maxoutput)
+                        fd_list.append(nexe_error_fd)
+                        fn_list.append(nexe_error_fn)
                 # outputiter is responsible to delete temp file
-                (zerovm_output_fd, zerovm_output_fn) = mkstemp(dir=file.tmpdir)
-                #import pdb; pdb.set_trace()
-                fallocate(zerovm_output_fd, self.zerovm_maxoutput)
-                outputiter = file_iter(zerovm_output_fd,
-                    zerovm_output_fn)
+                outputiter = file_iter(fd_list,fn_list)
             except:
                 try:
-                    self.os_interface.close(zerovm_output_fd)
+                    if nexe_output_fd:
+                        self.os_interface.close(nexe_output_fd)
+                    if nexe_error_fd:
+                        self.os_interface.close(nexe_error_fd)
                 except OSError:
                     pass
                 try:
-                    self.os_interface.unlink(zerovm_output_fn)
+                    if nexe_output_fn:
+                        self.os_interface.unlink(nexe_output_fn)
+                    if nexe_error_fn:
+                        self.os_interface.unlink(nexe_error_fn)
                 except OSError:
                     pass
                 raise
-            with file.mkstemp() as (zerovm_outputmnfst_fd,
-                                    zerovm_outputmnfst_fn):
-                with file.mkstemp() as (zerovm_inputmnfst_fd,
-                                        zerovm_inputmnfst_fn):
-                    zerovm_input_fn = file.data_file
-                    zerovm_inputmnfst_part1 = (
-                        'version            =11nov2011\n'
-                        'zerovm             =%s\n'
-                        'nexe               =%s\n'
-                        'maxnexe            =%s\n'
-                        'input              =%s\n'
-                        'maxinput           =%s\n'
-                        '#etag              =%s\n'
-                        '#content-type      =%s\n'
-                        '#x-timestamp       =%s\n'
-                        % (
-                            self.zerovm_exename,
-                            zerovm_nexe_fn,
-                            self.zerovm_maxnexe,
-                            zerovm_input_fn,
-                            self.zerovm_maxinput,
-                            file.metadata['ETag'],
-                            file.metadata['Content-Type'],
-                            file.metadata['X-Timestamp'],
-                            ))
-                    zerovm_inputmnfst_part2 = ''
-                    for (key, value) in file.metadata.iteritems():
-                        if key.lower().startswith('x-object-meta-'):
-                            zerovm_inputmnfst_part2 +=\
-                            '#x-data-attr       =' + key[14:] + ':'\
-                            + value + '\n'
-                    for header in req.headers:
-                        if header.lower().startswith('x-object-meta-'):
-                            zerovm_inputmnfst_part2 +=\
-                            '#x-nexe-attr       =' + header[14:]\
-                            + ':' + req.headers[header] + '\n'
-                    zerovm_inputmnfst_part3 = (
-                        'input_mnfst        =%s\n'
-                        'output             =%s\n'
-                        'maxoutput          =%s\n'
-                        'output_mnfst       =%s\n'
-                        'maxmnfstline       =%s\n'
-                        'maxmnfstlines      =%s\n'
-                        'timeout            =%s\n'
-                        'kill_timeout       =%s\n'
-                        '?zerovm_retcode    =required\n'
-                        '?zerovm_status     =required\n'
-                        '?etag              =required\n'
-                        '?#retcode          =optional\n'
-                        '?#status           =optional\n'
-                        '?#content-type     =optional\n'
-                        '?#x-data-attr      =optional\n'
-                        '?#x-nexe-attr      =optional\n'
-                        % (
-                            zerovm_inputmnfst_fn,
-                            zerovm_output_fn,
-                            self.zerovm_maxoutput,
-                            zerovm_outputmnfst_fn,
-                            self.zerovm_maxmnfstline,
-                            self.zerovm_maxmnfstlines,
-                            self.zerovm_timeout,
-                            self.zerovm_kill_timeout,
-                            ))
-                    zerovm_inputmnfst = zerovm_inputmnfst_part1\
-                                        + zerovm_inputmnfst_part2\
-                    + zerovm_inputmnfst_part3
-                    while zerovm_inputmnfst:
-                        written = os.write(zerovm_inputmnfst_fd,
-                            zerovm_inputmnfst)
-                        zerovm_inputmnfst = zerovm_inputmnfst[written:]
 
-                    def ex_zerovm():
-                        cmdline = []
-                        cmdline += self.zerovm_exename
-                        if len(self.zerovm_xparams) > 0:
-                            cmdline += self.zerovm_xparams
-                        cmdline += ['-M%s' % zerovm_inputmnfst_fn]
-                        if len(self.zerovm_nexe_xparams) > 0:
-                            cmdline += self.zerovm_nexe_xparams
-                        proc = Popen(cmdline, stdout=PIPE,
-                            stderr=STDOUT)
+            with file.mkstemp() as (zerovm_inputmnfst_fd,
+                                    zerovm_inputmnfst_fn):
+                nexe_input_fn = file.data_file
+                zerovm_inputmnfst = (
+                    'Version=13072012\n'
+                    'Nexe=%s\n'
+                    'NexeMax=%s\n'
+                    'SyscallsMax=%s\n'
+                    'NexeEtag=%s\n'
+                    'Timeout=%s\n'
+                    'MemMax=%s\n'
+                    % (
+                        zerovm_nexe_fn,
+                        self.zerovm_maxnexe,
+                        self.zerovm_maxsyscalls,
+                        etag,
+                        self.zerovm_timeout * 1000,
+                        self.zerovm_maxnexemem
+                        ))
 
+#                    for (key, value) in file.metadata.iteritems():
+#                        if key.lower().startswith('x-object-meta-'):
+#                            zerovm_inputmnfst_part2 +=\
+#                            '#x-data-attr       =' + key[14:] + ':'\
+#                            + value + '\n'
+#                    for header in req.headers:
+#                        if header.lower().startswith('x-object-meta-'):
+#                            zerovm_inputmnfst_part2 +=\
+#                            '#x-nexe-attr       =' + header[14:]\
+#                            + ':' + req.headers[header] + '\n'
+
+                zerovm_inputmnfst += 'Channel=%s,/dev/stdin,%s,%s,0,0\n'\
+                % ('/dev/null' if zerovm_execute_only else nexe_input_fn,
+                   self.zerovm_maxiops, self.zerovm_maxinput)
+
+                zerovm_inputmnfst += 'Channel=%s,/dev/stdout,0,0,%s,%s\n'\
+                % (nexe_output_fn if 'stdout' in nexe_std_list else '/dev/null',
+                   self.zerovm_maxiops, self.zerovm_maxoutput)
+
+                zerovm_inputmnfst += 'Channel=%s,/dev/stderr,0,0,%s,%s\n'\
+                % (nexe_error_fn if 'stderr' in nexe_std_list else '/dev/null',
+                   self.zerovm_maxiops, self.zerovm_maxoutput)
+
+                for channel in channels:
+                    zerovm_inputmnfst += 'Channel=%s\n' % channel
+
+                if 'x-nexe-env' in req.headers:
+                    zerovm_inputmnfst += 'Environment=%s\n' \
+                    % req.headers['x-nexe-env']
+
+                if 'x-nexe-command-line' in req.headers:
+                    zerovm_inputmnfst += 'CommandLine=%s\n' \
+                    % req.headers['x-nexe-command-line']
+
+                while zerovm_inputmnfst:
+                    written = os.write(zerovm_inputmnfst_fd,
+                        zerovm_inputmnfst)
+                    zerovm_inputmnfst = zerovm_inputmnfst[written:]
+
+                def ex_zerovm():
+                    cmdline = []
+                    cmdline += self.zerovm_exename
+                    if len(self.zerovm_xparams) > 0:
+                        cmdline += self.zerovm_xparams
+                    cmdline += ['-M%s' % zerovm_inputmnfst_fn]
+                    proc = subprocess.Popen(cmdline, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE)
+
+                    stdout_data = ''
+                    stderr_data = ''
+                    readable = [proc.stdout, proc.stderr]
+                    start = time.time()
+                    while time.time() - start < self.zerovm_timeout:
+                        rlist, wlist, xlist = \
+                        select.select(readable, [], [], start - time.time() + self.zerovm_timeout)
+                        if not rlist:
+                            continue
+                        for stream in rlist:
+                            data = os.read(stream.fileno(), 4096)
+                            if not data:
+                                readable.remove(stream)
+                                continue
+                            if stream == proc.stdout:
+                                stdout_data += data
+                            elif stream == proc.stderr:
+                                stderr_data += data
+                            if stdout_data > self.zerovm_stdout_size \
+                            or stderr_data > self.zerovm_stderr_size:
+                                proc.kill()
+                                return 3, stdout_data, stderr_data
+                        if proc.poll() is not None:
+                            return 0, stdout_data, stderr_data
+                        sleep(0.1)
+                    if proc.poll() is None:
+                        proc.terminate()
                         start = time.time()
-                        while time.time() - start < self.zerovm_timeout:
+                        while time.time() - start\
+                        < self.zerovm_kill_timeout:
                             if proc.poll() is not None:
-                                return (0, 'normal completion:%s'
-                                % proc.communicate()[0])
+                                return 1, stdout_data, stderr_data
                             sleep(0.1)
-                        if proc.poll() is None:
-                            proc.terminate()
-                            start = time.time()
-                            while time.time() - start\
-                            < self.zerovm_kill_timeout:
-                                if proc.poll() is not None:
-                                    return (1, 'terminated on timeout:%s'
-                                    % proc.communicate()[0])
-                                sleep(0.1)
-                            proc.kill()
-                            return (2, 'killed on timeout:%s'
-                            % proc.communicate()[0])
+                        proc.kill()
+                        return 2, stdout_data, stderr_data
 
-                    thrd = self.zerovm_thrdpool.spawn(ex_zerovm)
-                    (exor_retcode, exor_status) = thrd.wait()
-                    if exor_retcode:
-                        raise Exception('ERROR OBJ.QUERY exor_retcode=%s, '\
-                                        'exor_status=%s' % (exor_retcode, exor_status))
-                    os.lseek(zerovm_outputmnfst_fd, 0, os.SEEK_SET)
+                thrd = self.zerovm_thrdpool.spawn(ex_zerovm)
+                (zerovm_retcode, zerovm_stdout, zerovm_stderr) = thrd.wait()
+                if zerovm_retcode:
+                    raise Exception('ERROR OBJ.QUERY retcode=%s, '\
+                                    ' zerovm_stdout=%s'\
+                                    ' zerovm_stderr=%s'\
+                                    % (self.retcode_map[zerovm_retcode], zerovm_stdout, zerovm_stderr))
+                report = zerovm_stdout.splitlines()
+                nexe_retcode = report[0]
+                nexe_etag = report[1]
+                nexe_status = '\n'.join(report[2:])
 
-                    if os.stat(zerovm_inputmnfst_fn).st_size >\
-                       (self.zerovm_maxmnfstline * self.zerovm_maxmnfstlines):
-                        raise Exception("Input manifest must be smaller"
-                                        " than %d." % (self.zerovm_maxmnfstline
-                                                       * self.zerovm_maxmnfstlines))
-                    zerovm_outputmnfst =\
-                    split(os.read(zerovm_outputmnfst_fd,
-                        self.zerovm_maxmnfstline
-                        * self.zerovm_maxmnfstlines), '\n',
-                        self.zerovm_maxmnfstlines)
+                #os.lseek(zerovm_outputmnfst_fd, 0, os.SEEK_SET)
 
-                    def retrieve_mnfst_field(
-                            i,
-                            n,
-                            optional=False,
-                            isint=True,
-                            rgx=None,
-                            ):
-                        if not (zerovm_outputmnfst[i])[0:19] == n:
-                            if optional:
-                                return None
-                            else:
-                                raise Exception('omnfst: expecting %s got %s,'\
-                                                ' retcode=%s, status=>%s' % (n,
-                                                                             (zerovm_outputmnfst[i])[0:19],
-                                                                             exor_retcode, exor_status))
-                        if not zerovm_outputmnfst[i][19] == '=':
-                            raise Exception('omnfst: expecting = at %s got %s'
-                                            ' retcode=%s, status=>%s' % (n,
-                                                                         zerovm_outputmnfst[i][19],
-                                                                         exor_retcode, exor_status))
-                        v = (zerovm_outputmnfst[i])[20:]
-                        if isint:
-                            v = int(v)
-                        if rgx:
-                            if not re.match(rgx, v):
-                                raise Exception('mnfst: %s does not match %s'
-                                % (n, rgx))
-                        return v
+                #if os.stat(zerovm_inputmnfst_fn).st_size >\
+                #   (self.zerovm_maxmnfstline * self.zerovm_maxmnfstlines):
+                #    raise Exception("Input manifest must be smaller"
+                #                    " than %d." % (self.zerovm_maxmnfstline
+                #                                   * self.zerovm_maxmnfstlines))
+                #zerovm_outputmnfst =\
+                #split(os.read(zerovm_outputmnfst_fd,
+                #    self.zerovm_maxmnfstline
+                #    * self.zerovm_maxmnfstlines), '\n',
+                #    self.zerovm_maxmnfstlines)
 
-                    zerovm_retcode = retrieve_mnfst_field(0,
-                        'zerovm_retcode     ')
-                    zerovm_status = retrieve_mnfst_field(1,
-                        'zerovm_status      ', isint=False)
-                    if zerovm_retcode:
-                        raise Exception('ERROR OBJ.QUERY zerovm_retcode=%s,'\
-                                        ' zerovm_status=%s' % (zerovm_retcode,
-                                                               zerovm_status))
-                    etag = retrieve_mnfst_field(2, 'etag               '
-                        , isint=False, rgx=r"([a-fA-F\d]{32})")
-                    nexe_retcode = retrieve_mnfst_field(3,
-                        '#retcode           ', optional=True)
-                    nexe_status = retrieve_mnfst_field(4,
-                        '#status            ', optional=True,
-                        isint=False)
-                    nexe_content_type = retrieve_mnfst_field(5,
-                        '#content-type      ', optional=True,
-                        isint=False)
-                    i = 6
-                    response = Response(app_iter=outputiter,
-                        request=req, conditional_response=True)
-                    while True:
-                        nexe_meta = retrieve_mnfst_field(i,
-                            '#x-data-attr       ', optional=True,
-                            isint=False)
-                        if nexe_meta:
-                            i += 1
-                            (name, val) = split(nexe_meta, ':')
-                            response.headers['X-Object-Meta-' + name] =\
-                            val
-                        else:
-                            break
-                    response.headers['x-query-nexe-retcode'] =\
-                    nexe_retcode
-                    response.headers['x-query-nexe-status'] =\
-                    nexe_status
-                    response.headers['etag'] = etag
-                    response.headers['X-Timestamp'] =\
-                    normalize_timestamp(time.time())
-                    response.content_length =\
-                    os.path.getsize(zerovm_output_fn)
-                    response.headers['Content-Type'] = nexe_content_type
-                    return req.get_response(response)
+#                    def retrieve_mnfst_field(
+#                            i,
+#                            n,
+#                            optional=False,
+#                            isint=True,
+#                            rgx=None,
+#                            ):
+#                        if not (zerovm_outputmnfst[i])[0:19] == n:
+#                            if optional:
+#                                return None
+#                            else:
+#                                raise Exception('omnfst: expecting %s got %s,'\
+#                                                ' retcode=%s, status=>%s' % (n,
+#                                                                             (zerovm_outputmnfst[i])[0:19],
+#                                                                             exor_retcode, exor_status))
+#                        if not zerovm_outputmnfst[i][19] == '=':
+#                            raise Exception('omnfst: expecting = at %s got %s'
+#                                            ' retcode=%s, status=>%s' % (n,
+#                                                                         zerovm_outputmnfst[i][19],
+#                                                                         exor_retcode, exor_status))
+#                        v = (zerovm_outputmnfst[i])[20:]
+#                        if isint:
+#                            v = int(v)
+#                        if rgx:
+#                            if not re.match(rgx, v):
+#                                raise Exception('mnfst: %s does not match %s'
+#                                % (n, rgx))
+#                        return v
+
+#                    zerovm_retcode = retrieve_mnfst_field(0,
+#                        'zerovm_retcode     ')
+#                    zerovm_status = retrieve_mnfst_field(1,
+#                        'zerovm_status      ', isint=False)
+#                    if zerovm_retcode:
+#                        raise Exception('ERROR OBJ.QUERY zerovm_retcode=%s,'\
+#                                        ' zerovm_status=%s' % (zerovm_retcode,
+#                                                               zerovm_status))
+#                    etag = retrieve_mnfst_field(2, 'etag               '
+#                        , isint=False, rgx=r"([a-fA-F\d]{32})")
+#                    nexe_retcode = retrieve_mnfst_field(3,
+#                        '#retcode           ', optional=True)
+#                    nexe_status = retrieve_mnfst_field(4,
+#                        '#status            ', optional=True,
+#                        isint=False)
+#                    nexe_content_type = retrieve_mnfst_field(5,
+#                        '#content-type      ', optional=True,
+#                        isint=False)
+#                    i = 6
+                response = Response(app_iter=outputiter,
+                    request=req, conditional_response=True)
+#                while True:
+#                    nexe_meta = retrieve_mnfst_field(i,
+#                        '#x-data-attr       ', optional=True,
+#                        isint=False)
+#                    if nexe_meta:
+#                        i += 1
+#                        (name, val) = split(nexe_meta, ':')
+#                        response.headers['X-Object-Meta-' + name] =\
+#                        val
+#                    else:
+#                        break
+                response.headers['x-nexe-retcode'] = nexe_retcode
+                response.headers['x-nexe-status'] = nexe_status
+                response.headers['x-nexe-etag'] = nexe_etag
+                response.headers['X-Timestamp'] =\
+                normalize_timestamp(time.time())
+                content_length = 0
+                for fn in fn_list:
+                    content_length += os.path.getsize(fn)
+                response.content_length = content_length
+                response.headers['x-nexe-stdsize'] += ' '.join([str(os.path.getsize(fn)) for fn in fn_list])
+                if 'x-nexe-content-type' in req.headers:
+                    response.headers['Content-Type'] = req.headers['x-nexe-content-type']
+                return req.get_response(response)
 
     def __call__(self, env, start_response):
         """WSGI Application entry point for the Swift Object Server."""

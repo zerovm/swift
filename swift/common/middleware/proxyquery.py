@@ -15,6 +15,7 @@ from swift.common.ring import Ring
 from swift.common.exceptions import ConnectionTimeout, ChunkReadTimeout, \
     ChunkWriteTimeout
 from swift.common.constraints import check_utf8
+from swift.common.db import DatabaseConnectionError, GreenDBConnection
 
 class ProxyQueryMiddleware(object):
     
@@ -160,8 +161,7 @@ class QueryController(Controller):
         conn = connect()
         if not conn:
             raise Exception('Cannot find suitable node to execute code on')
-        # TODO: http-chunking not suppported yet, but the work is in progress
-        chunked = req.headers.get('transfer-encoding') 
+        chunked = req.headers.get('transfer-encoding')
         try:
             req.bytes_transferred = 0
             while True:
@@ -169,15 +169,16 @@ class QueryController(Controller):
                     try:
                         chunk = next(code_source)
                     except StopIteration:
-                        if chunked: #preparation to support chunking
-                            pass
+                        if chunked:
+                            conn.send('0\r\n\r\n')
                         break
                     req.bytes_transferred += len(chunk)
                     if req.bytes_transferred > self.app.zerovm_maxnexe:
                         return HTTPRequestEntityTooLarge(request=req)
                     try:
                         with ChunkWriteTimeout(self.app.node_timeout):
-                            conn.send(chunk)
+                            conn.send('%x\r\n%s\r\n' % (len(chunk), chunk)
+                                if chunked else chunk)
                     except (Exception, ChunkWriteTimeout):
                         raise Exception(conn.node, _('Object'),
                             _('Trying to write to %s') % req.path_info)
