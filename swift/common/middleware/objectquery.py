@@ -1,22 +1,17 @@
 # needed for etag validation using md5
+from contextlib import contextmanager
 import re
 # for capturing zerovm stdout and stderr
 import os
-from subprocess import PIPE
 import time
 import traceback
-
-# needed for spawning zerovm processes
-#from subprocess import Popen, STDOUT, PIPE
 
 # needed to limit the number of simultaneously running zerovms
 from eventlet import GreenPool, sleep
 from eventlet.green import select, subprocess
 from eventlet.timeout import Timeout
-import subprocess
 
 # needed for parsing manifest files returned from zerovm
-from string import split
 from urllib import unquote
 from hashlib import md5
 from webob import Request, Response
@@ -30,10 +25,33 @@ from webob.exc import HTTPBadRequest, HTTPNotFound,\
 
 from swift.common.utils import normalize_timestamp,\
     fallocate, split_path, drop_buffer_cache,\
-    get_logger
+    get_logger, mkdirs
 from swift.obj.server import DiskFile
 from swift.common.constraints import check_mount, check_utf8
 from swift.common.exceptions import DiskFileError, DiskFileNotExist
+
+class TmpDir(object):
+    def __init__(self, path, device, disk_chunk_size=65536):
+        self.tmpdir = os.path.join(path, device, 'tmp')
+        self.disk_chunk_size = disk_chunk_size
+
+    @contextmanager
+    def mkstemp(self):
+        """Contextmanager to make a temporary file."""
+        if not os.path.exists(self.tmpdir):
+            mkdirs(self.tmpdir)
+        fd, tmppath = mkstemp(dir=self.tmpdir)
+        try:
+            yield fd, tmppath
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmppath)
+            except OSError:
+                pass
 
 class ObjectQueryMiddleware(object):
 
@@ -43,14 +61,6 @@ class ObjectQueryMiddleware(object):
             self.logger = logger
         else:
             self.logger = get_logger(conf, log_route='obj-query')
-
-        #self.devices = conf.get('devices', '/srv/node/')
-        #self.mount_check = conf.get('mount_check', 'true').lower() in\
-        #                   ('true', 't', '1', 'on', 'yes', 'y')
-        #self.max_upload_time = int(conf.get('max_upload_time', 86400))
-        #self.disk_chunk_size = int(conf.get('disk_chunk_size', 65536))
-        #self.network_chunk_size = int(conf.get('network_chunk_size', 65536))
-        #self.log_requests = conf.get('log_requests', 't')[:1].lower() == 't'
 
         self.zerovm_exename = set(i.strip() for i in conf.get('zerovm_exename', 'zerovm').split() if i.strip())
         self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '').split() if i.strip())
@@ -103,18 +113,23 @@ class ObjectQueryMiddleware(object):
         # green thread for zerovm execution
         self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
 
-
     def zerovm_query(self, req):
         """Handle HTTP QUERY requests for the Swift Object Server."""
 
-        # TODO: we need a way to execute without an input path
         zerovm_execute_only = False
         try:
-            (device, partition, account, container, obj) =\
-            split_path(unquote(req.path), 5, 5, True)
-        except ValueError, err:
-            return HTTPBadRequest(body=str(err), request=req,
-                content_type='text/plain')
+            (device, partition, account) = \
+                split_path(unquote(req.path), 3, 3)
+            zerovm_execute_only = True
+        except ValueError:
+            pass
+        if not zerovm_execute_only:
+            try:
+                (device, partition, account, container, obj) =\
+                split_path(unquote(req.path), 5, 5, True)
+            except ValueError, err:
+                return HTTPBadRequest(body=str(err), request=req,
+                    content_type='text/plain')
 
         if self.zerovm_thrdpool.size != self.zerovm_maxpool:
             self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
@@ -163,23 +178,31 @@ class ObjectQueryMiddleware(object):
         if not nexe_std_list:
             nexe_std_list = ['stdout']
 
-        file = DiskFile(
-            self.app.devices,
-            device,
-            partition,
-            account,
-            container,
-            obj,
-            self.logger,
-            disk_chunk_size=self.app.disk_chunk_size,
-        )
-        try:
-            input_file_size = file.get_data_file_size()
-        except (DiskFileError, DiskFileNotExist):
-            return HTTPNotFound(request=req)
-        if input_file_size > self.zerovm_maxinput:
-            return HTTPRequestEntityTooLarge(body='Data Object is too large'
-                , request=req, content_type='text/plain')
+        if zerovm_execute_only:
+            file = TmpDir(
+                self.app.devices,
+                device,
+                disk_chunk_size=self.app.disk_chunk_size
+            )
+        else:
+            file = DiskFile(
+                self.app.devices,
+                device,
+                partition,
+                account,
+                container,
+                obj,
+                self.logger,
+                disk_chunk_size=self.app.disk_chunk_size,
+            )
+            try:
+                input_file_size = file.get_data_file_size()
+            except (DiskFileError, DiskFileNotExist):
+                return HTTPNotFound(request=req)
+            if input_file_size > self.zerovm_maxinput:
+                return HTTPRequestEntityTooLarge(body='Data Object is too large'
+                    , request=req, content_type='text/plain')
+
         with file.mkstemp() as (zerovm_nexe_fd, zerovm_nexe_fn):
             if 'content-length' in req.headers:
                 fallocate(zerovm_nexe_fd,
@@ -275,7 +298,6 @@ class ObjectQueryMiddleware(object):
 
             with file.mkstemp() as (zerovm_inputmnfst_fd,
                                     zerovm_inputmnfst_fn):
-                nexe_input_fn = file.data_file
                 zerovm_inputmnfst = (
                     'Version=13072012\n'
                     'Nexe=%s\n'
@@ -293,19 +315,8 @@ class ObjectQueryMiddleware(object):
                         self.zerovm_maxnexemem
                         ))
 
-#                    for (key, value) in file.metadata.iteritems():
-#                        if key.lower().startswith('x-object-meta-'):
-#                            zerovm_inputmnfst_part2 +=\
-#                            '#x-data-attr       =' + key[14:] + ':'\
-#                            + value + '\n'
-#                    for header in req.headers:
-#                        if header.lower().startswith('x-object-meta-'):
-#                            zerovm_inputmnfst_part2 +=\
-#                            '#x-nexe-attr       =' + header[14:]\
-#                            + ':' + req.headers[header] + '\n'
-
                 zerovm_inputmnfst += 'Channel=%s,/dev/stdin,4,%s,%s,0,0\n'\
-                % ('/dev/null' if zerovm_execute_only else nexe_input_fn,
+                % ('/dev/null' if zerovm_execute_only else file.data_file,
                    self.zerovm_maxiops, self.zerovm_maxinput)
 
                 zerovm_inputmnfst += 'Channel=%s,/dev/stdout,5,0,0,%s,%s\n'\
@@ -323,9 +334,18 @@ class ObjectQueryMiddleware(object):
                     zerovm_inputmnfst += 'Environment=%s\n' \
                     % req.headers['x-nexe-env']
 
-                if 'x-nexe-command-line' in req.headers:
+                if 'x-nexe-args' in req.headers:
                     zerovm_inputmnfst += 'CommandLine=%s\n' \
-                    % req.headers['x-nexe-command-line']
+                    % req.headers['x-nexe-args']
+
+                if 'x-node-name' in req.headers:
+                    zerovm_inputmnfst += 'NodeName=%s\n'\
+                    % req.headers['x-node-name']
+                    nexe_name = re.split('\s*,\s*', req.headers['x-node-name'])
+
+                if 'x-name-service' in req.headers:
+                    zerovm_inputmnfst += 'NameService=%s\n'\
+                    % req.headers['x-name-service']
 
                 while zerovm_inputmnfst:
                     written = os.write(zerovm_inputmnfst_fd,
@@ -397,80 +417,8 @@ class ObjectQueryMiddleware(object):
                 nexe_etag = report[1]
                 nexe_status = '\n'.join(report[2:])
 
-                #os.lseek(zerovm_outputmnfst_fd, 0, os.SEEK_SET)
-
-                #if os.stat(zerovm_inputmnfst_fn).st_size >\
-                #   (self.zerovm_maxmnfstline * self.zerovm_maxmnfstlines):
-                #    raise Exception("Input manifest must be smaller"
-                #                    " than %d." % (self.zerovm_maxmnfstline
-                #                                   * self.zerovm_maxmnfstlines))
-                #zerovm_outputmnfst =\
-                #split(os.read(zerovm_outputmnfst_fd,
-                #    self.zerovm_maxmnfstline
-                #    * self.zerovm_maxmnfstlines), '\n',
-                #    self.zerovm_maxmnfstlines)
-
-#                    def retrieve_mnfst_field(
-#                            i,
-#                            n,
-#                            optional=False,
-#                            isint=True,
-#                            rgx=None,
-#                            ):
-#                        if not (zerovm_outputmnfst[i])[0:19] == n:
-#                            if optional:
-#                                return None
-#                            else:
-#                                raise Exception('omnfst: expecting %s got %s,'\
-#                                                ' retcode=%s, status=>%s' % (n,
-#                                                                             (zerovm_outputmnfst[i])[0:19],
-#                                                                             exor_retcode, exor_status))
-#                        if not zerovm_outputmnfst[i][19] == '=':
-#                            raise Exception('omnfst: expecting = at %s got %s'
-#                                            ' retcode=%s, status=>%s' % (n,
-#                                                                         zerovm_outputmnfst[i][19],
-#                                                                         exor_retcode, exor_status))
-#                        v = (zerovm_outputmnfst[i])[20:]
-#                        if isint:
-#                            v = int(v)
-#                        if rgx:
-#                            if not re.match(rgx, v):
-#                                raise Exception('mnfst: %s does not match %s'
-#                                % (n, rgx))
-#                        return v
-
-#                    zerovm_retcode = retrieve_mnfst_field(0,
-#                        'zerovm_retcode     ')
-#                    zerovm_status = retrieve_mnfst_field(1,
-#                        'zerovm_status      ', isint=False)
-#                    if zerovm_retcode:
-#                        raise Exception('ERROR OBJ.QUERY zerovm_retcode=%s,'\
-#                                        ' zerovm_status=%s' % (zerovm_retcode,
-#                                                               zerovm_status))
-#                    etag = retrieve_mnfst_field(2, 'etag               '
-#                        , isint=False, rgx=r"([a-fA-F\d]{32})")
-#                    nexe_retcode = retrieve_mnfst_field(3,
-#                        '#retcode           ', optional=True)
-#                    nexe_status = retrieve_mnfst_field(4,
-#                        '#status            ', optional=True,
-#                        isint=False)
-#                    nexe_content_type = retrieve_mnfst_field(5,
-#                        '#content-type      ', optional=True,
-#                        isint=False)
-#                    i = 6
                 response = Response(app_iter=outputiter,
                     request=req, conditional_response=True)
-#                while True:
-#                    nexe_meta = retrieve_mnfst_field(i,
-#                        '#x-data-attr       ', optional=True,
-#                        isint=False)
-#                    if nexe_meta:
-#                        i += 1
-#                        (name, val) = split(nexe_meta, ':')
-#                        response.headers['X-Object-Meta-' + name] =\
-#                        val
-#                    else:
-#                        break
                 response.headers['x-nexe-retcode'] = nexe_retcode
                 response.headers['x-nexe-status'] = nexe_status
                 response.headers['x-nexe-etag'] = nexe_etag
@@ -483,6 +431,8 @@ class ObjectQueryMiddleware(object):
                 response.headers['x-nexe-stdsize'] = ' '.join([str(os.path.getsize(fn)) for fn in fn_list])
                 if 'x-nexe-content-type' in req.headers:
                     response.headers['Content-Type'] = req.headers['x-nexe-content-type']
+                if nexe_name:
+                    response.headers['x-node-name'] = nexe_name
                 return req.get_response(response)
 
     def __call__(self, env, start_response):
