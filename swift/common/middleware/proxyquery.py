@@ -67,6 +67,57 @@ class SequentialResponseBody(object):
     def get_content_length(self):
         return self.max_transfer
 
+class NameService(object):
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    def start(self, pool, peers):
+        self.sock.bind(('', 0))
+        self.peers = peers
+        self.thread = pool.spawn(self.run)
+        return self.sock.getsockname()[1]
+
+    def run(self):
+        bind_map = {}
+        conn_map = {}
+        peer_map = {}
+        while 1:
+            try:
+                message, address = self.sock.recvfrom(65535)
+                offset = 0
+                alias = struct.unpack_from('!I', message, offset)[0]
+                offset += 4
+                count = struct.unpack_from('!I', message, offset)[0]
+                offset += 4
+                for i in range(count):
+                    h, port = struct.unpack_from('!IH', message, offset)[0:2]
+                    bind_map.setdefault(alias, {})[h] = port
+                    offset += 6
+                conn_map[alias] = ctypes.create_string_buffer(message[offset:])
+                peer_map.setdefault(alias, {})[0] = address[0]
+                peer_map.setdefault(alias, {})[1] = address[1]
+
+                if len(peer_map) == self.peers:
+                    for src in peer_map.iterkeys():
+                        reply = conn_map[src]
+                        offset = 0
+                        count = struct.unpack_from('!I', reply, offset)[0]
+                        offset += 4
+                        for i in range(count):
+                            h = struct.unpack_from('!I', reply, offset)[0]
+                            port = bind_map[h][src]
+                            struct.pack_into('!4sH', reply, offset + 4,
+                                socket.inet_pton(socket.AF_INET, peer_map[src][0]), port)
+                            offset += 10
+                        self.sock.sendto(reply, (peer_map[src][0], peer_map[src][1]))
+            except greenlet.GreenletExit:
+                return
+
+    def stop(self):
+        self.thread.kill()
+        self.sock.close()
 
 class ProxyQueryMiddleware(object):
 
@@ -682,58 +733,11 @@ class ClusterController(Controller):
                 return HTTPBadRequest(request=req,
                     body='Non existing node in connect string for node %s' % node_name)
 
-        def ns_server_bind():
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(('', 0))
-            return s.getsockname()[1], s
-
-        def ns_server_run(sock, peers):
-            bind_map = {}
-            conn_map = {}
-            peer_map = {}
-            while 1:
-                try:
-                    message, address = sock.recvfrom(65535)
-                    offset = 0
-                    alias = struct.unpack_from('!I', message, offset)[0]
-                    offset += 4
-                    count = struct.unpack_from('!I', message, offset)[0]
-                    offset += 4
-                    for i in range(count):
-                        h, port = struct.unpack_from('!IH', message, offset)[0:2]
-                        bind_map.setdefault(alias, {})[h] = port
-                        offset += 6
-                    conn_map[alias] = ctypes.create_string_buffer(message[offset:])
-                    peer_map.setdefault(alias, {})[0] = address[0]
-                    peer_map.setdefault(alias, {})[1] = address[1]
-
-                    if len(peer_map) == peers:
-                        for src in peer_map.iterkeys():
-                            reply = conn_map[src]
-                            offset = 0
-                            count = struct.unpack_from('!I', reply, offset)[0]
-                            offset += 4
-                            for i in range(count):
-                                h = struct.unpack_from('!I', reply, offset)[0]
-                                port = bind_map[h][src]
-                                struct.pack_into('!4sH', reply, offset + 4,
-                                    socket.inet_pton(socket.AF_INET, peer_map[src][0]), port)
-                                offset += 10
-                            sock.sendto(reply, (peer_map[src][0], peer_map[src][1]))
-                except greenlet.GreenletExit:
-                    return
-
-        def ns_server_stop(thr, sock):
-            thr.kill()
-            sock.shutdown(socket.SHUT_RDWR)
-            sock.close()
-
-        ns_port, ns_socket = ns_server_bind()
+        ns_server = NameService()
         if self.app.zerovm_ns_thrdpool.free() <= 0:
             return HTTPServiceUnavailable(body='Cluster slot not available',
                 request=req, content_type='text/plain')
-        ns_thrd = self.app.zerovm_ns_thrdpool.spawn(ns_server_run, ns_socket, len(self.nodes))
+        ns_port = ns_server.start(self.app.zerovm_ns_thrdpool, len(self.nodes))
 
         pile = GreenPile(len(self.nodes))
         for node in self.nodes:
@@ -755,7 +759,7 @@ class ClusterController(Controller):
                 resp_list.append(ZvmResponse(node.name, 503, '', '','','',''))
         final_response = Response(request=req, content_type='application/json')
         final_response.body = json.dumps(resp_list)
-        ns_server_stop(ns_thrd, ns_socket)
+        ns_server.stop()
         return final_response
 
 

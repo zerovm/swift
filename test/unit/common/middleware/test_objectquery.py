@@ -1,9 +1,11 @@
+import logging
 from posix import rmdir
 import unittest
 import os
 import random
 import cPickle as pickle
 from time import time, sleep
+from eventlet import GreenPool
 from webob import Request
 from hashlib import md5
 from tempfile import mkstemp, mkdtemp
@@ -12,14 +14,39 @@ import math
 
 from swift.common import utils
 from swift.common.middleware import objectquery
+from swift.common.middleware import proxyquery
 from swift.common.utils import mkdirs, normalize_timestamp, get_logger
 from swift.obj.server import ObjectController
+
+class FakeLoggingHandler(logging.Handler):
+
+    def __init__(self, *args, **kwargs):
+        self.reset()
+        logging.Handler.__init__(self, *args, **kwargs)
+
+    def emit(self, record):
+        self.messages[record.levelname.lower()].append(record.getMessage())
+
+    def reset(self):
+        self.messages = {
+            'debug': [],
+            'info': [],
+            'warning': [],
+            'error': [],
+            'critical': [],
+            }
 
 
 class FakeApp(ObjectController):
     def __init__(self, conf):
         ObjectController.__init__(self, conf)
         self.bytes_per_sync = 1
+        self.fault = False
+
+    def __call__(self, env, start_response):
+        if self.fault:
+            raise Exception
+        ObjectController.__call__(self,env, start_response)
 
 class OsMock():
     def __init__(self):
@@ -59,7 +86,7 @@ class TestObjectQuery(unittest.TestCase):
         """ Tear down for testing swift.object_server.ObjectController """
         rmtree(os.path.dirname(self.testdir))
 
-    def setup_zerovm_query(self, mock=None, with_headers=False):
+    def setup_zerovm_query(self, mock=None):
         def set_zerovm_mock():
             default_mock = \
 r'''
@@ -404,8 +431,7 @@ exit(0)
                     self.sent += 1
                     return self._nexescript[self.sent - 1]
                 return ''
-
-        req = self.setup_zerovm_query()
+        self.setup_zerovm_query()
         req = Request.blank('/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'POST',
                      'wsgi.input': SlowBody(self._nexescript)},
@@ -442,30 +468,47 @@ exit(0)
         self.assertEquals(resp.status_int, 400)
         self.assert_('Invalid Content-Type' in resp.body)
 
+    def test_QUERY_invalid_path_encoding(self):
+        req = Request.blank('/sda1/p/a/c/o'.encode('utf-16'),
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'Content-Type': 'application/octet-stream',
+                     'x-zerovm-execute': '1.0'})
+        req.body = ('SCRIPT')
+        resp = req.get_response(self.app)
+        self.assertEquals(resp.status_int, 412)
+        self.assert_('Invalid UTF8' in resp.body)
+
+    def test_QUERY_error_upstream(self):
+        self.obj_controller.fault = True
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Content-Type': 'application/octet-stream'})
+        resp = req.get_response(self.app)
+        self.assertEquals(resp.status_int, 500)
+        self.assert_('Traceback' in resp.body)
+
     def test_QUERY_no_content_length(self):
         req = self.zerovm_request()
         resp = req.get_response(self.app)
         self.assertEquals(resp.status_int, 411)
 
-#    def test_QUERY_script_no_etag(self):
-#        self.setup_zerovm_query()
-#        req = self.zerovm_request()
-#        req.body = self._nexescript
-#        resp = req.get_response(self.app)
-#        self.assertEquals(resp.status_int, 200)
-#        self.assertEquals(resp.body, self._sortednumbers)
-#        self.assertEquals(resp.headers['etag'], self._sortednumbers_etag)
-#
-#    def test_QUERY_script_valid_etag(self):
-#        self.setup_zerovm_query()
-#        req = self.zerovm_request()
-#        req.headers['etag'] = self._nexescript_etag
-#        req.body = self._nexescript
-#        resp = req.get_response(self.app)
-#        self.assertEquals(resp.status_int, 200)
-#        self.assertEquals(resp.body, self._sortednumbers)
-#        #self.assertEquals(resp.headers['etag'], self._sortednumbers_etag)
-#
+    def test_QUERY_node_naming(self):
+        self.setup_zerovm_query()
+        req = self.zerovm_request()
+        req.headers['etag'] = self._nexescript_etag
+        req.headers['x-nexe-content-type'] = 'text/plain'
+        req.headers['x-node-name'] = 'nodename42, 1234'
+        ns_server = proxyquery.NameService()
+        pool = GreenPool(2)
+        ns_port = ns_server.start(pool, 2)
+        req.headers['x-name-service'] = 'localhost:' + str(ns_port)
+        req.body = self._nexescript
+        resp = self.app.zerovm_query(req)
+        self.assertEquals(resp.status_int, 200)
+        self.assertEquals(resp.headers['x-node-name'], 'nodename42')
+        ns_server.stop()
+        print str(resp)
+
     def test_QUERY_script_invalid_etag(self):
         self.setup_zerovm_query()
         etag = md5()
@@ -518,6 +561,34 @@ exit(0)
                      'Content-Type': 'application/octet-stream'})
         resp = req.get_response(self.app)
         self.assertEquals(resp.status_int, 499)
+
+    def test_QUERY_zerovm_stderr(self):
+        self.setup_zerovm_query(
+r'''
+import sys
+sys.stderr.write('some shit happened\n')
+''')
+        req = self.zerovm_request()
+        req.body = 'test'
+        resp = self.app.zerovm_query(req)
+        self.assertEquals(resp.status_int, 200)
+        self.setup_zerovm_query(
+r'''
+import sys
+import time
+sys.stdout.write('0\n\nok.\n')
+for i in range(20):
+    time.sleep(0.1)
+    sys.stderr.write(''.zfill(4096))
+''')
+        req = self.zerovm_request()
+        req.body = 'test'
+        try:
+            resp = self.app.zerovm_query(req)
+        except Exception, e:
+            self.assertIn('ERROR OBJ.QUERY retcode=Output too long', str(e))
+            raised = True
+        self.assert_(raised, 'Exception not raised on timeout')
 
     def test_QUERY_zerovm_term_timeouts(self):
         self.setup_zerovm_query(
@@ -637,101 +708,6 @@ time.sleep(10)
             self.app.zerovm_maxqueue = orig_zerovm_maxqueue
             self.app.zerovm_maxpool = orig_zerovm_maxpool
 
-#    def test_QUERY_failing_zerovms(self):
-#        self.setup_zerovm_query()
-#        #orig_params = self.app.zerovm_nexe_xparams
-#        #self.app.zerovm_nexe_xparams = ['fail:', '10']
-#        req = self.zerovm_request()
-#        req.headers['etag'] = self._nexescript_etag
-#        req.headers['x-nexe-args'] = ''
-#        req.body = self._nexescript
-#        raised = False
-#        try:
-#            self.app.zerovm_query(req)
-#        except Exception, e:
-#            self.assertEquals(str(e),
-#                'ERROR OBJ.QUERY zerovm_retcode=10, zerovm_status=fail:')
-#            raised = True
-#        #finally:
-#            #self.app.zerovm_xparams = orig_params
-#        self.assert_(raised, "Exception not raised")
-
-#    def test_QUERY_zerovm_maxmnfstline(self):
-#        def get_zerovm_maxmnfstline():
-#            self.setup_zerovm_query()
-#            req = self.zerovm_request()
-#            req.body = self._nexescript
-#            self.app.zerovm_query(req)
-#            return getattr(self.app, 'zerovm_maxmnfstline')
-#
-#        self.setup_zerovm_query()
-#        orig_line = get_zerovm_maxmnfstline()
-#        setattr(self.app, 'zerovm_maxmnfstline', 0)
-#        req = self.zerovm_request()
-#        req.headers['etag'] = self._nexescript_etag
-#        req.body = self._nexescript
-#
-#        raised = False
-#        try:
-#            self.app.zerovm_query(req)
-#        except Exception, e:
-#            self.assertEquals(str(e), 'Input manifest must be smaller than 0.')
-#            raised = True
-#        finally:
-#            setattr(self.app, 'zerovm_maxmnfstline', orig_line)
-#        self.assert_(raised, "Exception not raised")
-#
-#    def test_QUERY_zerovm_maxmnfstlines(self):
-#        def get_zerovm_maxmnfstlines():
-#            self.setup_zerovm_query()
-#            req = self.zerovm_request()
-#            req.body = self._nexescript
-#            self.app.zerovm_query(req)
-#            return getattr(self.app, 'zerovm_maxmnfstlines')
-#
-#        self.setup_zerovm_query()
-#        orig_lines = get_zerovm_maxmnfstlines()
-#        setattr(self.app, 'zerovm_maxmnfstlines', 0)
-#        req = self.zerovm_request()
-#        req.headers['etag'] = self._nexescript_etag
-#        req.body = self._nexescript
-#
-#        raised = False
-#        try:
-#            self.app.zerovm_query(req)
-#        except Exception, e:
-#            self.assertEquals(str(e), 'Input manifest must be smaller than 0.')
-#            raised = True
-#        finally:
-#            setattr(self.app, 'zerovm_maxmnfstlines', orig_lines)
-#        self.assert_(raised, "Exception not raised")
-
-#    def test_QUERY_malformed_mnfst(self):
-#        def test(err, zvm_mock):
-#            self.setup_zerovm_query(zvm_mock)
-#            req = self.zerovm_request()
-#            req.body = self._nexescript
-#
-#            raised = False
-#            try:
-#                self.app.zerovm_query(req)
-#            except Exception, e:
-#                self.assertEquals(str(e), err)
-#                raised = True
-#            self.assert_(raised, "Exception not raised")
-#
-#        #empty manifest
-#        test('omnfst: expecting zerovm_retcode      got , retcode=0, status=>normal completion:', 'import sys\nsys.exit(0)')
-#
-#        #malformed first line
-#        test('omnfst: expecting = at zerovm_retcode      got   retcode=0, status=>normal completion:param status:ok.\n\nparam retcode:0\n\n0\n', 'import signal\nfrom eventlet import sleep\nfrom sys import argv, exit \nif len(argv) \x3C 2 or len(argv) \x3E 5:\n    raise Exception(\'Incorrect number of arguments\')\nif argv[1] != \'-Y2\':\n    raise Exception(\'Invalid first argument: %s\' % sys.argv[1])\nif argv[2][:2] != \'-M\':\n    raise Exception(\'Invalid second argument: %s\' % sys.argv[2])\nmanifest = argv[2][2:]\ninputmnfst = file(manifest, \'r\').readlines()\nclass Mnfst:\n    pass\nmnfst = Mnfst()\nindex = 0\nstatus = \'ok.\' if len(argv) \x3C 3 else argv[3]\nprint \'param status:\' + str(status) + \'\\n\'\nretcode = 0 if len(argv) \x3C 4 else argv[4]\nprint \'param retcode:\' + str(retcode) + \'\\n\'\ndef retrieve_mnfst_field(n, vv = None, isint=False, rgx=None):\n    global index                  \n    if len(inputmnfst) \x3C index:\n        raise Exception(\'missing  %s\' % n)\n    if not inputmnfst[index][0:19] == n:\n        raise Exception(\'expecting %s got %s\' \n                        % (n, inputmnfst[index][0:19]))       \n    if not inputmnfst[index][19] == \'=\':\n        raise Exception(\'missing \\\'=\\\' at %s got %s\' \n                        % (n, inputmnfst[index][19]))       \n    v = inputmnfst[index][20:-1]\n    if isint:\n        v = int(v)\n    if rgx:\n        import re\n        if not re.match(rgx,v):\n            raise Exception(\'mnfst: %s does not match %s\' % n, rgx)\n    if n[0] == \'?\':\n        n = n[1:]\n    if vv and vv != v:\n        raise Exception(\'for %s expected %s got %s\' % (n, vv, v))\n    index += 1\n    setattr(mnfst, n.strip(), v)\nretrieve_mnfst_field(\'version            \',\'11nov2011\')\nretrieve_mnfst_field(\'zerovm             \')\nretrieve_mnfst_field(\'nexe               \')\nretrieve_mnfst_field(\'maxnexe            \', 256*1048576, True)\nretrieve_mnfst_field(\'input              \')\nretrieve_mnfst_field(\'maxinput           \', 256*1048576, True)\nretrieve_mnfst_field(\'#etag              \')\nretrieve_mnfst_field(\'#content-type      \')\nretrieve_mnfst_field(\'#x-timestamp       \')\nretrieve_mnfst_field(\'input_mnfst        \')\nretrieve_mnfst_field(\'output             \')\nretrieve_mnfst_field(\'maxoutput          \',64*1048576, True)\nretrieve_mnfst_field(\'output_mnfst       \')\nretrieve_mnfst_field(\'maxmnfstline       \', 1024, True)\nretrieve_mnfst_field(\'maxmnfstlines      \', 128, True)\nretrieve_mnfst_field(\'timeout            \', isint=True)\nretrieve_mnfst_field(\'kill_timeout       \', isint=True)\nretrieve_mnfst_field(\'?zerovm_retcode    \', \'required\')\nretrieve_mnfst_field(\'?zerovm_status     \', \'required\')\nretrieve_mnfst_field(\'?etag              \', \'required\')\nretrieve_mnfst_field(\'?#retcode          \', \'optional\')\nretrieve_mnfst_field(\'?#status           \', \'optional\')    \nretrieve_mnfst_field(\'?#content-type     \', \'optional\')\n# todo handle meta-tags\n# retrieve_mnfst_field(\'?#x-data-attr      \', \'optional\')\nimport cPickle\ninf = file(mnfst.input, \'r\')\nouf = file(mnfst.output, \'w\')\nid = cPickle.load(inf)\nod = cPickle.dumps(eval(file(mnfst.nexe, \'r\').read()))\nouf.write(od)\nfrom hashlib import md5\netag = md5()\netag.update(od)\netag = etag.hexdigest()\ninf.close()\nouf.close()\noufm = file(mnfst.output_mnfst,\'w\')\noufm.write(  \n        \'zerovm_retcode                     =%s\\n\'\n        \'zerovm_status      =%s\\n\'\n        \'etag               =%s\\n\'\n        \'#retcode           =%s\\n\'\n        \'#status            =%s\\n\'\n        \'#content-type      =%s\\n\'\n        \'#x-data-attr       =Message:Hi\\n\'\n        \'#x-data-attr       =Base:still 10\\n\'\n        \'#x-data-attr       =AnotherMessage:blahblahblah\\n\'\n         % (retcode, status, etag, retcode, status, \'text\x2Fplain\'))\noufm.close()\nexit(retcode)\n')
-#
-#        #invalid etag
-#        test('mnfst: etag                does not match ([a-fA-F\d]{32})', 'import signal\nfrom eventlet import sleep\nfrom sys import argv \nif len(argv) \x3C 2 or len(argv) \x3E 5:\n    raise Exception(\'Incorrect number of arguments\')\nif argv[1] != \'-Y2\':\n    raise Exception(\'Invalid first argument: %s\' % sys.argv[1])\nif argv[2][:2] != \'-M\':\n    raise Exception(\'Invalid second argument: %s\' % sys.argv[2])\nmanifest = argv[2][2:]\ninputmnfst = file(manifest, \'r\').readlines()\nclass Mnfst:\n    pass\nmnfst = Mnfst()\nindex = 0\nstatus = \'ok.\' if len(argv) \x3C 3 else argv[3]\nprint \'param status:\' + str(status) + \'\\n\'\nretcode = 0 if len(argv) \x3C 4 else argv[4]\nprint \'param retcode:\' + str(retcode) + \'\\n\'\ndef retrieve_mnfst_field(n, vv = None, isint=False, rgx=None):\n    global index                  \n    if len(inputmnfst) \x3C index:\n        raise Exception(\'missing  %s\' % n)\n    if not inputmnfst[index][0:19] == n:\n        raise Exception(\'expecting %s got %s\' \n                        % (n, inputmnfst[index][0:19]))       \n    if not inputmnfst[index][19] == \'=\':\n        raise Exception(\'missing \\\'=\\\' at %s got %s\' \n                        % (n, inputmnfst[index][19]))       \n    v = inputmnfst[index][20:-1]\n    if isint:\n        v = int(v)\n    if rgx:\n        import re\n        if not re.match(rgx,v):\n            raise Exception(\'mnfst: %s does not match %s\' % n, rgx)\n    if n[0] == \'?\':\n        n = n[1:]\n    if vv and vv != v:\n        raise Exception(\'for %s expected %s got %s\' % (n, vv, v))\n    index += 1\n    setattr(mnfst, n.strip(), v)\nretrieve_mnfst_field(\'version            \',\'11nov2011\')\nretrieve_mnfst_field(\'zerovm             \')\nretrieve_mnfst_field(\'nexe               \')\nretrieve_mnfst_field(\'maxnexe            \', 256*1048576, True)\nretrieve_mnfst_field(\'input              \')\nretrieve_mnfst_field(\'maxinput           \', 256*1048576, True)\nretrieve_mnfst_field(\'#etag              \')\nretrieve_mnfst_field(\'#content-type      \')\nretrieve_mnfst_field(\'#x-timestamp       \')\nretrieve_mnfst_field(\'input_mnfst        \')\nretrieve_mnfst_field(\'output             \')\nretrieve_mnfst_field(\'maxoutput          \',64*1048576, True)\nretrieve_mnfst_field(\'output_mnfst       \')\nretrieve_mnfst_field(\'maxmnfstline       \', 1024, True)\nretrieve_mnfst_field(\'maxmnfstlines      \', 128, True)\nretrieve_mnfst_field(\'timeout            \', isint=True)\nretrieve_mnfst_field(\'kill_timeout       \', isint=True)\nretrieve_mnfst_field(\'?zerovm_retcode    \', \'required\')\nretrieve_mnfst_field(\'?zerovm_status     \', \'required\')\nretrieve_mnfst_field(\'?etag              \', \'required\')\nretrieve_mnfst_field(\'?#retcode          \', \'optional\')\nretrieve_mnfst_field(\'?#status           \', \'optional\')    \nretrieve_mnfst_field(\'?#content-type     \', \'optional\')\n# todo handle meta-tags\n# retrieve_mnfst_field(\'?#x-data-attr      \', \'optional\')\nimport cPickle\ninf = file(mnfst.input, \'r\')\nouf = file(mnfst.output, \'w\')\nid = cPickle.load(inf)\nod = cPickle.dumps(eval(file(mnfst.nexe, \'r\').read()))\nouf.write(od)\nfrom hashlib import md5\netag = md5()\netag.update(od)\netag = etag.hexdigest()\ninf.close()\nouf.close()\noufm = file(mnfst.output_mnfst,\'w\')\noufm.write(  \n        \'zerovm_retcode     =%s\\n\'\n        \'zerovm_status      =%s\\n\'\n        \'etag               =%s\\n\'\n        \'#retcode           =%s\\n\'\n        \'#status            =%s\\n\'\n        \'#content-type      =%s\\n\'\n        \'#x-data-attr       =Message:Hi\\n\'\n        \'#x-data-attr       =Base:still 10\\n\'\n        \'#x-data-attr       =AnotherMessage:blahblahblah\\n\'\n         % (retcode, status, \"$$$\", retcode, status, \'text\x2Fplain\'))\noufm.close()\nsys.exit(retcode)\n')
-#
-#        #non zero retcode
-#        test('ERROR OBJ.QUERY zerovm_retcode=99, zerovm_status=ok.', 'import signal\nfrom eventlet import sleep\nfrom sys import argv \nif len(argv) \x3C 2 or len(argv) \x3E 5:\n    raise Exception(\'Incorrect number of arguments\')\nif argv[1] != \'-Y2\':\n    raise Exception(\'Invalid first argument: %s\' % sys.argv[1])\nif argv[2][:2] != \'-M\':\n    raise Exception(\'Invalid second argument: %s\' % sys.argv[2])\nmanifest = argv[2][2:]\ninputmnfst = file(manifest, \'r\').readlines()\nclass Mnfst:\n    pass\nmnfst = Mnfst()\nindex = 0\nstatus = \'ok.\' if len(argv) \x3C 3 else argv[3]\nprint \'param status:\' + str(status) + \'\\n\'\nretcode = 0 if len(argv) \x3C 4 else argv[4]\nprint \'param retcode:\' + str(retcode) + \'\\n\'\ndef retrieve_mnfst_field(n, vv = None, isint=False, rgx=None):\n    global index                  \n    if len(inputmnfst) \x3C index:\n        raise Exception(\'missing  %s\' % n)\n    if not inputmnfst[index][0:19] == n:\n        raise Exception(\'expecting %s got %s\' \n                        % (n, inputmnfst[index][0:19]))       \n    if not inputmnfst[index][19] == \'=\':\n        raise Exception(\'missing \\\'=\\\' at %s got %s\' \n                        % (n, inputmnfst[index][19]))       \n    v = inputmnfst[index][20:-1]\n    if isint:\n        v = int(v)\n    if rgx:\n        import re\n        if not re.match(rgx,v):\n            raise Exception(\'mnfst: %s does not match %s\' % n, rgx)\n    if n[0] == \'?\':\n        n = n[1:]\n    if vv and vv != v:\n        raise Exception(\'for %s expected %s got %s\' % (n, vv, v))\n    index += 1\n    setattr(mnfst, n.strip(), v)\nretrieve_mnfst_field(\'version            \',\'11nov2011\')\nretrieve_mnfst_field(\'zerovm             \')\nretrieve_mnfst_field(\'nexe               \')\nretrieve_mnfst_field(\'maxnexe            \', 256*1048576, True)\nretrieve_mnfst_field(\'input              \')\nretrieve_mnfst_field(\'maxinput           \', 256*1048576, True)\nretrieve_mnfst_field(\'#etag              \')\nretrieve_mnfst_field(\'#content-type      \')\nretrieve_mnfst_field(\'#x-timestamp       \')\nretrieve_mnfst_field(\'input_mnfst        \')\nretrieve_mnfst_field(\'output             \')\nretrieve_mnfst_field(\'maxoutput          \',64*1048576, True)\nretrieve_mnfst_field(\'output_mnfst       \')\nretrieve_mnfst_field(\'maxmnfstline       \', 1024, True)\nretrieve_mnfst_field(\'maxmnfstlines      \', 128, True)\nretrieve_mnfst_field(\'timeout            \', isint=True)\nretrieve_mnfst_field(\'kill_timeout       \', isint=True)\nretrieve_mnfst_field(\'?zerovm_retcode    \', \'required\')\nretrieve_mnfst_field(\'?zerovm_status     \', \'required\')\nretrieve_mnfst_field(\'?etag              \', \'required\')\nretrieve_mnfst_field(\'?#retcode          \', \'optional\')\nretrieve_mnfst_field(\'?#status           \', \'optional\')    \nretrieve_mnfst_field(\'?#content-type     \', \'optional\')\n# todo handle meta-tags\n# retrieve_mnfst_field(\'?#x-data-attr      \', \'optional\')\nimport cPickle\ninf = file(mnfst.input, \'r\')\nouf = file(mnfst.output, \'w\')\nid = cPickle.load(inf)\nod = cPickle.dumps(eval(file(mnfst.nexe, \'r\').read()))\nouf.write(od)\nfrom hashlib import md5\netag = md5()\netag.update(od)\netag = etag.hexdigest()\ninf.close()\nouf.close()\noufm = file(mnfst.output_mnfst,\'w\')\noufm.write(  \n        \'zerovm_retcode     =%s\\n\'\n        \'zerovm_status      =%s\\n\'\n        \'etag               =%s\\n\'\n        \'#retcode           =%s\\n\'\n        \'#status            =%s\\n\'\n        \'#content-type      =%s\\n\'\n        \'#x-data-attr       =Message:Hi\\n\'\n        \'#x-data-attr       =Base:still 10\\n\'\n        \'#x-data-attr       =AnotherMessage:blahblahblah\\n\'\n         % (99, status, etag, retcode, status, \'text\x2Fplain\'))\noufm.close()\nsys.exit(retcode)\n')
-
     def test_QUERY_max_input_size(self):
         self.setup_zerovm_query()
         orig_maxinput = getattr(self.app, 'zerovm_maxinput')
@@ -753,23 +729,6 @@ time.sleep(10)
         resp = req.get_response(self.app)
         self.assertEquals(resp.status_int, 413)
         setattr(self.app, 'zerovm_maxnexe', orig_maxnexe)
-
-#    def test_QUERY_mnfst(self):
-#        zerovm_mock = (
-#            '    \nfrom eventlet import sleep\nfrom sys import argv \nif len(argv) \x3C 2 or len(argv) \x3E 5:\n    raise Exception(\'Incorrect number of arguments\')\nif argv[1] != \'-Y2\':\n    raise Exception(\'Invalid first argument: %s\' % sys.argv[1])\nif argv[2][:2] != \'-M\':\n    raise Exception(\'Invalid second argument: %s\' % sys.argv[2])\nmanifest = argv[2][2:]\ninputmnfst = file(manifest, \'r\').readlines()\nclass Mnfst:\n    pass\nmnfst = Mnfst()\nindex = 0\nstatus = \'ok.\' if len(argv) \x3C 3 else argv[3]\nprint \'param status:\' + str(status) + \'\\n\'\nretcode = 0 if len(argv) \x3C 4 else argv[4]\nprint \'param retcode:\' + str(retcode) + \'\\n\'\ndef retrieve_mnfst_field(n, vv = None, isint=False, rgx=None):\n    global index                  \n    if len(inputmnfst) \x3C index:\n        raise Exception(\'missing  %s\' % n)\n    if not inputmnfst[index][0:19] == n:\n        raise Exception(\'expecting %s got %s\' \n                        % (n, inputmnfst[index][0:19]))       \n    if not inputmnfst[index][19] == \'=\':\n        raise Exception(\'missing \\\'=\\\' at %s got %s\' \n                        % (n, inputmnfst[index][19]))       \n    v = inputmnfst[index][20:-1]\n    if isint:\n        v = int(v)\n    if rgx:\n        import re\n        if not re.match(rgx,v):\n            raise Exception(\'mnfst: %s does not match %s\' % n, rgx)\n    if n[0] == \'?\':\n        n = n[1:]\n    if vv and vv != v:\n        raise Exception(\'for %s expected %s got %s\' % (n, vv, v))\n    index += 1\n    setattr(mnfst, n.strip(), v)\nretrieve_mnfst_field(\'version            \',\'11nov2011\')\nretrieve_mnfst_field(\'zerovm             \')\nretrieve_mnfst_field(\'nexe               \')\nretrieve_mnfst_field(\'maxnexe            \', 256*1048576, True)\nretrieve_mnfst_field(\'input              \')\nretrieve_mnfst_field(\'maxinput           \', 256*1048576, True)\nretrieve_mnfst_field(\'#etag              \')\nretrieve_mnfst_field(\'#content-type      \')\nretrieve_mnfst_field(\'#x-timestamp       \')\nretrieve_mnfst_field(\'#x-data-attr       \',\'Message:Hello\')\nretrieve_mnfst_field(\'#x-data-attr       \',\'Base:10\')\nretrieve_mnfst_field(\'#x-data-attr       \',\'Format:Pickle\')\nnexe_attr = (\"Format:pickle\", \"Name:sorter\", \"Arg1:pickle\", \"Type:python\")\nfor i in range(4):\n    if inputmnfst[index][20:-1] in nexe_attr:\n        retrieve_mnfst_field(\"#x-nexe-attr       \",inputmnfst[index][20:-1])\n    else:\n        raise Exception(\"%s no in %s\" % (inputmnfst[index][20:-1], nexe_attr))\nretrieve_mnfst_field(\'input_mnfst        \')\nretrieve_mnfst_field(\'output             \')\nretrieve_mnfst_field(\'maxoutput          \',64*1048576, True)\nretrieve_mnfst_field(\'output_mnfst       \')\nretrieve_mnfst_field(\'maxmnfstline       \', 1024, True)\nretrieve_mnfst_field(\'maxmnfstlines      \', 128, True)\nretrieve_mnfst_field(\'timeout            \', isint=True)\nretrieve_mnfst_field(\'kill_timeout       \', isint=True)\nretrieve_mnfst_field(\'?zerovm_retcode    \', \'required\')\nretrieve_mnfst_field(\'?zerovm_status     \', \'required\')\nretrieve_mnfst_field(\'?etag              \', \'required\')\nretrieve_mnfst_field(\'?#retcode          \', \'optional\')\nretrieve_mnfst_field(\'?#status           \', \'optional\')    \nretrieve_mnfst_field(\'?#content-type     \', \'optional\')\n# todo handle meta-tags\n# retrieve_mnfst_field(\'?#x-data-attr      \', \'optional\')\nimport cPickle\ninf = file(mnfst.input, \'r\')\nouf = file(mnfst.output, \'w\')\nid = cPickle.load(inf)\nod = cPickle.dumps(eval(file(mnfst.nexe, \'r\').read()))\nouf.write(od)\nfrom hashlib import md5\netag = md5()\netag.update(od)\netag = etag.hexdigest()\ninf.close()\nouf.close()\noufm = file(mnfst.output_mnfst,\'w\')\noufm.write(  \n        \'zerovm_retcode     =%s\\n\'\n        \'zerovm_status      =%s\\n\'\n        \'etag               =%s\\n\'\n        \'#retcode           =%s\\n\'\n        \'#status            =%s\\n\'\n        \'#content-type      =%s\\n\'\n        \'#x-data-attr       =Message:Hi\\n\'\n        \'#x-data-attr       =Base:still 10\\n\'\n        \'#x-data-attr       =AnotherMessage:blahblahblah\\n\'\n         % (retcode, status, etag, retcode, status, \'text\x2Fplain\'))\noufm.close()\nsys.exit(retcode)\n\n')
-#        self.setup_zerovm_query(zerovm_mock, True)
-#        req = Request.blank('/sda1/p/a/c/o',
-#            environ={'REQUEST_METHOD': 'POST'},
-#            headers={'Content-Type': 'application/octet-stream',
-#                     'etag': self._nexescript_etag,
-#                     'x-zerovm-execute': '1.0',
-#                     'X-Object-Meta-Type': 'python',
-#                     'X-Object-Meta-Name': 'sorter',
-#                     'X-Object-Meta-arg1': 'pickle',
-#                     'X-Object-Meta-format': 'pickle'})
-#        req.body = self._nexescript
-#        resp = req.get_response(self.app)
-#        self.assertEquals(resp.status_int, 200)
 
     def test_QUERY_max_chunk_size(self):
         self.setup_zerovm_query()
@@ -794,98 +753,9 @@ time.sleep(10)
         self.assertEquals(resp.status_int, 507)
         setattr(self.obj_controller, 'mount_check', orig_mountcheck)
 
-'''    def test_QUERY_file_iter_OSError(self):
-        class OsMock():
-            def __init__(self):
-                self.closed = False
-                self.unlinked = False
-
-            def close(self, fd):
-                self.closed = True
-                raise OSError
-
-            def unlink(self, fd):
-                self.unlinked = True
-                raise OSError
-
-        # test scenario where file closing fails after data had been downloaded
-        self.setup_zerovm_query()
-        req = self.zerovm_request()
-        req.headers['etag'] = self._nexescript_etag
-        req.body = self._nexescript
-        resp = self.app.zerovm_query(req)
-        orig_os = self.app.os_interface
-        self.app.os_interface = OsMock()
-        respbody = resp.body
-        self.assertEquals(resp.status_int, 200)
-        self.assertEquals(resp.body, self._sortednumbers)
-        #test wheither files where attempted to be closed and deleted
-        self.assertTrue(self.app.os_interface.closed)
-        self.assertTrue(self.app.os_interface.unlinked)
-
-        # test scenario where file allocation fails
-        self.app.os_interface = OsMock()
-        orig_zerovm_maxoutput = self.app.zerovm_maxoutput \
-            if hasattr(self.app, 'zerovm_maxoutput') else None
-        #self.app.zerovm_maxoutput = 1024 * 1024 * 1024 * 1024 * 1024
-        self.app.zerovm_maxoutput = 1024 * 1024 * 1024 * 1024
-        self.setup_zerovm_query()
-        req = self.zerovm_request()
-        req.headers['etag'] = self._nexescript_etag
-        req.body = self._nexescript
-
-        self.assertRaises(OSError, self.app.zerovm_query, req)
-        #test wheither files where attempted to be closed and deleted
-        self.assertTrue(self.app.os_interface.closed)
-        self.assertTrue(self.app.os_interface.unlinked)
-
-        self.app.os_interface = orig_os
-        self.app.zerovm_maxoutput = orig_zerovm_maxoutput'''
-
-'''
-    # this should be the last test
-    def test_QUERY_real_zerovm(self):
-
-        raise SkipTest
-        #This test will work only if ZeroVM is properly installed on the system
-        #at /home/dazo/ZeroVM
-
-        timestamp = normalize_timestamp(time())
-        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                        headers={'X-Timestamp': timestamp,
-                                 'Content-Type': 'application/octet-stream'})
-
-        file = open('/home/dazo/ZeroVM/samples/sort_mapping/input.data', 'rb')
-        data = file.read()
-        req.body = data
-        resp = self.object_controller.PUT(req)
-        self.assertEquals(resp.status_int, 201)
-        req = Request.blank('/sda1/p/a/c/o',
-                        headers={'Content-Type': 'application/octet-stream'})
-        file = open('/home/dazo/ZeroVM/samples/sort_mapping/sort_uint_proper_'
-                    'with_args.c_x86_64.nexe', 'rb')
-        code = file.read()
-        req.body = code
-
-        # call QUERY method
-        resp = req.get_response(self.app)
-
-        #check results
-        self.assertEquals(resp.status_int, 200)
-
-        file = open('/home/dazo/ZeroVM/samples/sort_mapping/output.data', 'rb')
-        res = file.read()
-
-        self.assertEquals(resp.body, res)
-        self.assertEquals(resp.content_length, len(res))
-        self.assertEquals(resp.content_type, 'application/octet-stream')
-        self.assertEquals(resp.headers['content-length'], str(len(res)))
-        self.assertEquals(resp.headers['content-type'],
-                          'application/octet-stream')
-        #TODOLE add etag support to this test
-        #self.assertEquals(resp.headers['etag'], self._sortednumbers_etag)
-        # --skipped, Leon.
-    '''
+    def test_QUERY_filter_factory(self):
+        app = objectquery.filter_factory(self.conf)(FakeApp(self.conf))
+        self.assertIsInstance(app, objectquery.ObjectQueryMiddleware)
 
 if __name__ == '__main__':
     unittest.main()

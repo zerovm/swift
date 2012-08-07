@@ -109,7 +109,7 @@ class ObjectQueryMiddleware(object):
         self.zerovm_stdout_size = 65536
         self.retcode_map = ('OK', 'Error', 'Timed out', 'Killed', 'Output too long')
 
-        self.fault_injection = conf.get('fault_injection', '') # for unit-tests.
+        self.fault_injection = conf.get('fault_injection', ' ') # for unit-tests.
         self.os_interface = os
 
         # green thread for zerovm execution
@@ -413,10 +413,17 @@ class ObjectQueryMiddleware(object):
                                     ' zerovm_stdout=%s'\
                                     ' zerovm_stderr=%s'\
                                     % (self.retcode_map[zerovm_retcode], zerovm_stdout, zerovm_stderr))
+                if zerovm_stderr:
+                    self.logger.warning('zerovm stderr: '+zerovm_stderr)
                 report = zerovm_stdout.splitlines()
-                nexe_retcode = int(report[0])
-                nexe_etag = report[1]
-                nexe_status = '\n'.join(report[2:])
+                if len(report) < 3:
+                    nexe_retcode = 0
+                    nexe_etag = ''
+                    nexe_status = 'Zerovm crashed'
+                else:
+                    nexe_retcode = int(report[0])
+                    nexe_etag = report[1]
+                    nexe_status = '\n'.join(report[2:])
 
                 response = Response(app_iter=outputiter,
                     request=req, conditional_response=True)
