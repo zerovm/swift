@@ -331,7 +331,7 @@ class ClusterController(Controller):
             addr = self.get_local_address(obj_nodes[0])
         req.headers['x-name-service'] = '%s:%d' % (addr, ns_port)
         req.headers['x-nexe-args'] = node.args
-        req.headers['x-nexe-env'] = node.env
+        req.headers['x-nexe-env'] = ','.join(reduce(lambda x, y: x + y, node.env.items()))
 
         def connect():
             for node in obj_nodes:

@@ -31,25 +31,26 @@ from swift.common.constraints import check_mount, check_utf8
 from swift.common.exceptions import DiskFileError, DiskFileNotExist
 
 class TmpDir(object):
-    def __init__(self, path, device, disk_chunk_size=65536):
-        self.tmpdir = os.path.join(path, device, 'tmp')
+    def __init__(self, path, device, disk_chunk_size=65536, os_interface=os):
+        self.os_interface = os_interface
+        self.tmpdir = self.os_interface.path.join(path, device, 'tmp')
         self.disk_chunk_size = disk_chunk_size
 
     @contextmanager
     def mkstemp(self):
         """Contextmanager to make a temporary file."""
-        if not os.path.exists(self.tmpdir):
+        if not self.os_interface.path.exists(self.tmpdir):
             mkdirs(self.tmpdir)
         fd, tmppath = mkstemp(dir=self.tmpdir)
         try:
             yield fd, tmppath
         finally:
             try:
-                os.close(fd)
+                self.os_interface.close(fd)
             except OSError:
                 pass
             try:
-                os.unlink(tmppath)
+                self.os_interface.unlink(tmppath)
             except OSError:
                 pass
 
@@ -62,8 +63,9 @@ class ObjectQueryMiddleware(object):
         else:
             self.logger = get_logger(conf, log_route='obj-query')
 
+        self.zerovm_manifest_ver = conf.get('zerovm_manifest_ver','13072012')
         self.zerovm_exename = set(i.strip() for i in conf.get('zerovm_exename', 'zerovm').split() if i.strip())
-        self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '').split() if i.strip())
+        #self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '').split() if i.strip())
 
         # maximum number of simultaneous running zerovms, others are queued
         self.zerovm_maxpool = int(conf.get('zerovm_maxpool', 2))
@@ -78,10 +80,10 @@ class ObjectQueryMiddleware(object):
         self.zerovm_kill_timeout = int(conf.get('zerovm_kill_timeout', 1))
 
         # maximum length of manifest line (both input and output)
-        self.zerovm_maxmnfstline = int(conf.get('zerovm_maxmnfstline', 1024))
+        #self.zerovm_maxmnfstline = int(conf.get('zerovm_maxmnfstline', 1024))
 
         # maximum number of lines in input and output manifest files
-        self.zerovm_maxmnfstlines = int(conf.get('zerovm_maxmnfstlines', 128))
+        #self.zerovm_maxmnfstlines = int(conf.get('zerovm_maxmnfstlines', 128))
 
         # maximum input data file size
         self.zerovm_maxinput = int(conf.get('zerovm_maxinput', 256 * 1048576))
@@ -105,7 +107,7 @@ class ObjectQueryMiddleware(object):
         # hardcoded, we don't want to crush the server
         self.zerovm_stderr_size = 65536
         self.zerovm_stdout_size = 65536
-        self.retcode_map = ('OK', 'Timed out', 'Killed', 'Output too long')
+        self.retcode_map = ('OK', 'Error', 'Timed out', 'Killed', 'Output too long')
 
         self.fault_injection = conf.get('fault_injection', '') # for unit-tests.
         self.os_interface = os
@@ -154,21 +156,16 @@ class ObjectQueryMiddleware(object):
                 body='Invalid Content-Type',
                 content_type='text/plain')
 
-        def get_multi_header(hdr_count,hdr_prefix):
-            result = []
-            if hdr_count not in req.headers:
-                return result
-            for c in xrange(0,int(req.headers[hdr_count])):
-                channel = hdr_prefix+str(c)
-                if channel not in req.headers:
+        channels = []
+        if 'x-nexe-channels' in req.headers:
+            for c in xrange(0,int(req.headers['x-nexe-channels'])):
+                channel = 'x-nexe-channel-'+str(c)
+                if not channel in req.headers:
                     return HTTPBadRequest(request=req,
                         body='Missing header %s' % channel,
                         content_type='text/plain')
-                result[c] = req.headers[channel]
-            return result
-
+                channels.append(req.headers[channel])
         channel_list = ''
-        channels = get_multi_header('x-nexe-channels','x-nexe-channel-')
         for channel in channels:
             channel_list += 'Channel=%s\n' % channel
 
@@ -182,7 +179,8 @@ class ObjectQueryMiddleware(object):
             file = TmpDir(
                 self.app.devices,
                 device,
-                disk_chunk_size=self.app.disk_chunk_size
+                disk_chunk_size=self.app.disk_chunk_size,
+                os_interface=self.os_interface
             )
         else:
             file = DiskFile(
@@ -218,7 +216,7 @@ class ObjectQueryMiddleware(object):
                     return HTTPRequestTimeout(request=req)
                 etag.update(chunk)
                 while chunk:
-                    written = os.write(zerovm_nexe_fd, chunk)
+                    written = self.os_interface.write(zerovm_nexe_fd, chunk)
                     chunk = chunk[written:]
             if 'content-length' in req.headers\
             and int(req.headers['content-length']) != upload_size:
@@ -236,9 +234,9 @@ class ObjectQueryMiddleware(object):
                     for fd in fd_list:
                         read = 0
                         dropped_cache = 0
-                        os.lseek(fd, 0, os.SEEK_SET)
+                        self.os_interface.lseek(fd, 0, self.os_interface.SEEK_SET)
                         while True:
-                            chunk = os.read(fd, chunk_size)
+                            chunk = self.os_interface.read(fd, chunk_size)
                             if chunk:
                                 read += len(chunk)
                                 if read - dropped_cache > self.zerovm_maxchunksize:
@@ -262,7 +260,8 @@ class ObjectQueryMiddleware(object):
                     except OSError:
                         pass
 
-
+            nexe_output_fd = nexe_output_fn = None
+            nexe_error_fd = nexe_error_fn = None
             try:
                 fd_list = []
                 fn_list = []
@@ -299,7 +298,7 @@ class ObjectQueryMiddleware(object):
             with file.mkstemp() as (zerovm_inputmnfst_fd,
                                     zerovm_inputmnfst_fn):
                 zerovm_inputmnfst = (
-                    'Version=13072012\n'
+                    'Version=%s\n'
                     'Nexe=%s\n'
                     'NexeMax=%s\n'
                     'SyscallsMax=%s\n'
@@ -307,6 +306,7 @@ class ObjectQueryMiddleware(object):
                     'Timeout=%s\n'
                     'MemMax=%s\n'
                     % (
+                        self.zerovm_manifest_ver,
                         zerovm_nexe_fn,
                         self.zerovm_maxnexe,
                         self.zerovm_maxsyscalls,
@@ -315,15 +315,15 @@ class ObjectQueryMiddleware(object):
                         self.zerovm_maxnexemem
                         ))
 
-                zerovm_inputmnfst += 'Channel=%s,/dev/stdin,4,%s,%s,0,0\n'\
+                zerovm_inputmnfst += 'Channel=%s,/dev/stdin,0,%s,%s,0,0\n'\
                 % ('/dev/null' if zerovm_execute_only else file.data_file,
                    self.zerovm_maxiops, self.zerovm_maxinput)
 
-                zerovm_inputmnfst += 'Channel=%s,/dev/stdout,5,0,0,%s,%s\n'\
+                zerovm_inputmnfst += 'Channel=%s,/dev/stdout,0,0,0,%s,%s\n'\
                 % (nexe_output_fn if 'stdout' in nexe_std_list else '/dev/null',
                    self.zerovm_maxiops, self.zerovm_maxoutput)
 
-                zerovm_inputmnfst += 'Channel=%s,/dev/stderr,6,0,0,%s,%s\n'\
+                zerovm_inputmnfst += 'Channel=%s,/dev/stderr,0,0,0,%s,%s\n'\
                 % (nexe_error_fn if 'stderr' in nexe_std_list else '/dev/null',
                    self.zerovm_maxiops, self.zerovm_maxoutput)
 
@@ -338,6 +338,7 @@ class ObjectQueryMiddleware(object):
                     zerovm_inputmnfst += 'CommandLine=%s\n' \
                     % req.headers['x-nexe-args']
 
+                nexe_name = None
                 if 'x-node-name' in req.headers:
                     zerovm_inputmnfst += 'NodeName=%s\n'\
                     % req.headers['x-node-name']
@@ -348,15 +349,15 @@ class ObjectQueryMiddleware(object):
                     % req.headers['x-name-service']
 
                 while zerovm_inputmnfst:
-                    written = os.write(zerovm_inputmnfst_fd,
+                    written = self.os_interface.write(zerovm_inputmnfst_fd,
                         zerovm_inputmnfst)
                     zerovm_inputmnfst = zerovm_inputmnfst[written:]
 
                 def ex_zerovm():
                     cmdline = []
                     cmdline += self.zerovm_exename
-                    if len(self.zerovm_xparams) > 0:
-                        cmdline += self.zerovm_xparams
+                    #if len(self.zerovm_xparams) > 0:
+                    #    cmdline += self.zerovm_xparams
                     cmdline += ['-M%s' % zerovm_inputmnfst_fn]
                     proc = subprocess.Popen(cmdline, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE)
@@ -376,7 +377,7 @@ class ObjectQueryMiddleware(object):
                         if not rlist:
                             continue
                         for stream in rlist:
-                            data = os.read(stream.fileno(), 4096)
+                            data = self.os_interface.read(stream.fileno(), 4096)
                             if not data:
                                 readable.remove(stream)
                                 continue
@@ -387,10 +388,10 @@ class ObjectQueryMiddleware(object):
                             if len(stdout_data) > self.zerovm_stdout_size \
                             or len(stderr_data) > self.zerovm_stderr_size:
                                 proc.kill()
-                                return 3, stdout_data, stderr_data
+                                return 4, stdout_data, stderr_data
                         if proc.poll() is not None:
                             stdout_data, stderr_data = get_output(stdout_data, stderr_data)
-                            return 0, stdout_data, stderr_data
+                            return proc.returncode, stdout_data, stderr_data
                         sleep(0.1)
                     if proc.poll() is None:
                         proc.terminate()
@@ -399,11 +400,11 @@ class ObjectQueryMiddleware(object):
                         < self.zerovm_kill_timeout:
                             if proc.poll() is not None:
                                 stdout_data, stderr_data = get_output(stdout_data, stderr_data)
-                                return 1, stdout_data, stderr_data
+                                return 2, stdout_data, stderr_data
                             sleep(0.1)
                         proc.kill()
                         stdout_data, stderr_data = get_output(stdout_data, stderr_data)
-                        return 2, stdout_data, stderr_data
+                        return 3, stdout_data, stderr_data
 
                 thrd = self.zerovm_thrdpool.spawn(ex_zerovm)
                 (zerovm_retcode, zerovm_stdout, zerovm_stderr) = thrd.wait()
@@ -426,13 +427,13 @@ class ObjectQueryMiddleware(object):
                 normalize_timestamp(time.time())
                 content_length = 0
                 for fn in fn_list:
-                    content_length += os.path.getsize(fn)
+                    content_length += self.os_interface.path.getsize(fn)
                 response.content_length = content_length
-                response.headers['x-nexe-stdsize'] = ' '.join([str(os.path.getsize(fn)) for fn in fn_list])
+                response.headers['x-nexe-stdsize'] = ' '.join([str(self.os_interface.path.getsize(fn)) for fn in fn_list])
                 if 'x-nexe-content-type' in req.headers:
                     response.headers['Content-Type'] = req.headers['x-nexe-content-type']
                 if nexe_name:
-                    response.headers['x-node-name'] = nexe_name
+                    response.headers['x-node-name'] = nexe_name[0]
                 return req.get_response(response)
 
     def __call__(self, env, start_response):
