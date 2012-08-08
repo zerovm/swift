@@ -198,7 +198,7 @@ exit(0)
             else:
                 os.write(fd, default_mock)
             self.app.zerovm_exename = ['python', zerovm_mock]
-            self.app.zerovm_nexe_xparams = ['ok.', '0']
+            #self.app.zerovm_nexe_xparams = ['ok.', '0']
 
         def create_random_numbers(max_num):
             numlist = [i for i in range(max_num)]

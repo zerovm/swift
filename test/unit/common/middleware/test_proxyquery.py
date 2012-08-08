@@ -1,4 +1,11 @@
 from __future__ import with_statement
+import re
+from swiftclient.client import quote
+
+try:
+    import simplejson as json
+except ImportError:
+    import json
 import unittest
 import os
 import cPickle as pickle
@@ -72,13 +79,17 @@ def setup():
                 {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
                  'port': obj2lis.getsockname()[1]}], 30),
         GzipFile(os.path.join(_testdir, 'object.ring.gz'), 'wb'))
-    prosrv = proxyquery.ProxyQueryMiddleware(proxy_server.Application(conf, FakeMemcacheReturnsNone()), conf)
+    prosrv = proxyquery.filter_factory(conf)(
+        proxy_server.Application(conf, memcache=FakeMemcacheReturnsNone())
+    )
     acc1srv = account_server.AccountController(conf)
     acc2srv = account_server.AccountController(conf)
     con1srv = container_server.ContainerController(conf)
     con2srv = container_server.ContainerController(conf)
-    obj1srv = objectquery.ObjectQueryMiddleware(object_server.ObjectController(conf), conf)
-    obj2srv = objectquery.ObjectQueryMiddleware(object_server.ObjectController(conf), conf)
+    obj1srv = objectquery.filter_factory(conf)(object_server.ObjectController(conf))
+    obj2srv = objectquery.filter_factory(conf)(object_server.ObjectController(conf))
+    #obj1srv = objectquery.ObjectQueryMiddleware(object_server.ObjectController(conf), conf)
+    #obj2srv = objectquery.ObjectQueryMiddleware(object_server.ObjectController(conf), conf)
     _test_servers =\
     (prosrv, acc1srv, acc2srv, con1srv, con2srv, obj1srv, obj2srv)
     nl = NullLogger()
@@ -134,18 +145,170 @@ class TestProxyQuery(unittest.TestCase):
         proxy_server.CONTAINER_LISTING_LIMIT = _orig_container_listing_limit
 
     def setup_QUERY(self):
-        def get_zerovm_mock():
-            return ('from sys import argv \nif len(argv) \x3C 2 or len(argv) \x3E 5:\n    raise Exception(\'Incorrect number of arguments\')\nif argv[1] != \'-Y2\':\n    raise Exception(\'Invalid first argument: %s\' % sys.argv[1])\nif argv[2][:2] != \'-M\':\n    raise Exception(\'Invalid second argument: %s\' % sys.argv[2])\nmanifest = argv[2][2:]\nprint \'manifest file:%s\\n\' % manifest \ninputmnfst = file(manifest, \'r\').readlines()\nprint \'manifest:\\n%s\\n\' % inputmnfst\nclass Mnfst:\n    pass\nmnfst = Mnfst()\nindex = 0\nstatus = \'ok.\' if len(argv) \x3C 3 else argv[3]\nprint \'param status:\' + str(status) + \'\\n\'\nretcode = 0 if len(argv) \x3C 4 else argv[4]\nprint \'param retcode:\' + str(retcode) + \'\\n\'\ndef retrieve_mnfst_field(n, vv = None, isint=False, rgx=None):\n    global index                  \n    if len(inputmnfst) \x3C index:\n        raise Exception(\'missing  %s\' % n)\n    if not inputmnfst[index][0:19] == n:\n        raise Exception(\'expecting %s got %s\' \n                        % (n, inputmnfst[index][0:19]))       \n    if not inputmnfst[index][19] == \'=\':\n        raise Exception(\'missing \\\'=\\\' at %s got %s\' \n                        % (n, inputmnfst[index][19]))       \n    v = inputmnfst[index][20:-1]\n    if isint:\n        v = int(v)\n    if rgx:\n        import re\n        if not re.match(rgx,v):\n            raise Exception(\'mnfst: %s does not match %s\' % n, rgx)\n    if n[0] == \'?\':\n        n = n[1:]\n    if vv and vv != v:\n        raise Exception(\'for %s expected %s got %s\' % (n, vv, v))\n    index += 1\n    print n + \'=\' + str(v) + \'\\n\'       \n    setattr(mnfst, n.strip(), v)\nretrieve_mnfst_field(\'version            \',\'11nov2011\')\nretrieve_mnfst_field(\'zerovm             \')\nretrieve_mnfst_field(\'nexe               \')\nretrieve_mnfst_field(\'maxnexe            \', 256*1048576, True)\nretrieve_mnfst_field(\'input              \')\nretrieve_mnfst_field(\'maxinput           \', 256*1048576, True)\nretrieve_mnfst_field(\'#etag              \')\nretrieve_mnfst_field(\'#content-type      \')\nretrieve_mnfst_field(\'#x-timestamp       \')\nretrieve_mnfst_field(\'#x-data-attr       \',\'Message:Hello\')\nretrieve_mnfst_field(\'#x-data-attr       \',\'Base:10\')\nretrieve_''mnfst_field(\'#x-data-attr       \',\'Format:Pickle\')\nnexe_attr = ("Format:pickle", "Name:sorter", "Arg1:pickle", "Type:python")\nfor i in range(4):\n    if inputmnfst[index][20:-1] in nexe_attr:\n        retrieve_mnfst_field("#x-nexe-attr       ",inputmnfst[index][20:-1])\n    else:\n        raise Exception("inputmnfst[index][20:-1] not in (\'Format:pickle\', \'Name:sorter\', \'Arg1:pickle\', \'Type:python\')")\nretrieve_mnfst_field(\'input_mnfst        \')\nretrieve_mnfst_field(\'output             \')\nretrieve_mnfst_field(\'maxoutput          \',64*1048576, True)\nretrieve_mnfst_field(\'output_mnfst       \')\nretrieve_mnfst_field(\'maxmnfstline       \', 1024, True)\nretrieve_mnfst_field(\'maxmnfstlines      \', 128, True)\nretrieve_mnfst_field(\'timeout            \', 5, True)\nretrieve_mnfst_field(\'kill_timeout       \', 1, True)\nretrieve_mnfst_field(\'?zerovm_retcode    \', \'required\')\nretrieve_mnfst_field(\'?zerovm_status     \', \'required\')\nretrieve_mnfst_field(\'?etag              \', \'required\')\nretrieve_mnfst_field(\'?#retcode          \', \'optional\')\nretrieve_mnfst_field(\'?#status           \', \'optional\')    \nretrieve_mnfst_field(\'?#content-type     \', \'optional\')\n# todo handle meta-tags\n# retrieve_mnfst_field(\'?#x-data-attr     \', \'optional\')\nimport cPickle\ninf = file(mnfst.input, \'r\')\nouf = file(mnfst.output, \'w\')\nid = cPickle.load(inf)\nprint \'inputdata:\\n\' + str(id) + \'\\n\'\nod = cPickle.dumps(eval(file(mnfst.nexe, \'r\').read()))\nprint \'outputdata:\\n\' + str(od) + \'\\n\'\nprint(\'\\n\\n%s\\n\\n\'%(str(od)))\nouf.write(od)\nfrom hashlib import md5\netag = md5()\netag.update(od)\netag = etag.hexdigest()\ninf.close()\nouf.close()\noufm = file(mnfst.output_mnfst,\'w\')\noufm.write(  \n        \'zerovm_retcode     =%s\\n\'\n        \'zerovm_status      =%s\\n\'\n        \'etag               =%s\\n\'\n        \'#retcode           =%s\\n\'\n        \'#status            =%s\\n\'\n        \'#content-type      =%s\\n\'\n        \'#x-data-attr      =Message:Hi\\n\'\n        \'#x-data-attr      =Base:still 10\\n\'\n        \'#x-data-attr      =AnotherMessage:blahblahblah\\n\'\n         % (retcode, status, etag, retcode, status, \'text\x2Fplain\'))\noufm.close()\nsys.exit(retcode)')
 
         def set_zerovm_mock():
+            def_mock = \
+r'''
+import socket
+import struct
+from sys import argv, exit
+import re
+import logging
+import cPickle as pickle
+from time import sleep
+
+def errdump(zvm_errcode, nexe_errcode, nexe_etag, status_line):
+    print '%d\n%s\n%s' % (nexe_errcode, nexe_etag, status_line)
+    exit(zvm_errcode)
+
+if len(argv) < 2 or len(argv) > 4:
+    errdump(1,0,'','Incorrect number of arguments')
+if argv[1][:2] != '-M':
+    errdump(1,0,'','Invalid argument: %s' % argv[1])
+manifest = argv[1][2:]
+try:
+    inputmnfst = file(manifest, 'r').read().splitlines()
+except IOError:
+    errdump(1,0,'','Cannot open manifest file: %s' % manifest)
+dl = re.compile("\s*=\s*")
+mnfst_dict = dict()
+for line in inputmnfst:
+    (attr, val) = re.split(dl, line, 1)
+    if attr and attr in mnfst_dict:
+        mnfst_dict[attr] += ',' + val
+    else:
+        mnfst_dict[attr] = val
+
+class Mnfst:
+    pass
+
+mnfst = Mnfst()
+index = 0
+status = 'ok.' if len(argv) < 3 else argv[2]
+retcode = 0 if len(argv) < 4 else argv[3]
+
+def retrieve_mnfst_field(n, eq=None, min=None, max=None, isint=False, optional=False):
+    if n not in mnfst_dict:
+        if optional:
+            return
+        errdump(1,0,'','Manifest key missing "%s"' % n)
+    v = mnfst_dict[n]
+    if isint:
+        v = int(v)
+        if min and v < min:
+            errdump(1,0,'','%s = %d is less than expected: %d' % (n,v,min))
+        if max and v > max:
+            errdump(1,0,'','%s = %d is more than expected: %d' % (n,v,max))
+    if eq and v != eq:
+        errdump(1,0,'','%s = %s and expected %s' % (n,v,eq))
+    setattr(mnfst, n.strip(), v)
+
+
+retrieve_mnfst_field('Version', '13072012')
+retrieve_mnfst_field('Nexe')
+retrieve_mnfst_field('NexeMax', isint=True)
+retrieve_mnfst_field('SyscallsMax', min=1, isint=True)
+retrieve_mnfst_field('NexeEtag', optional=True)
+retrieve_mnfst_field('Timeout', min=1, isint=True)
+retrieve_mnfst_field('MemMax', min=32*1048576, max=4096*1048576, isint=True)
+retrieve_mnfst_field('Environment', optional=True)
+retrieve_mnfst_field('CommandLine', optional=True)
+retrieve_mnfst_field('Channel')
+retrieve_mnfst_field('NodeName', optional=True)
+retrieve_mnfst_field('NameService', optional=True)
+
+channel_list = re.split('\s*,\s*',mnfst.Channel)
+if len(channel_list) % 7 != 0:
+    errdump(1,0,mnfst.NexeEtag,'wrong channel config: %s' % mnfst.Channel)
+dev_list = channel_list[1::7]
+bind_data = ''
+bind_count = 0
+connect_data = ''
+connect_count = 0
+con_map = {}
+bind_map = {}
+alias = int(re.split('\s*,\s*', mnfst.NodeName)[1])
+for i in xrange(0,len(dev_list)):
+    device = dev_list[i]
+    fname = channel_list[i*7]
+    if device == '/dev/stdin' or device == '/dev/input':
+        mnfst.input = fname
+    elif device == '/dev/stdout' or device == '/dev/output':
+        mnfst.output = fname
+    elif device == '/dev/stderr':
+        mnfst.err = fname
+    elif '/dev/in/' in device or '/dev/out/' in device:
+        node_name = device.split('/')[3]
+        proto, host, port = fname.split(':')
+        host = int(host)
+        if port == '0':
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(('', 0))
+            s.listen(1)
+            port = s.getsockname()[1]
+            bind_map[host] = {'name':device,'port':port,'proto':proto, 'sock':s}
+            bind_data += struct.pack('!IH', host, int(port))
+            bind_count += 1
+        else:
+            connect_data += struct.pack('!IIH', host, 0, 0)
+            connect_count += 1
+            con_map[host] = device
+request = struct.pack('!I', alias) +\
+          struct.pack('!I', bind_count) + bind_data + struct.pack('!I', connect_count) + connect_data
+ns_host, ns_port = mnfst.NameService.split(':')
+ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ns.connect((ns_host, int(ns_port)))
+ns.sendto(request, (ns_host, int(ns_port)))
+ns_host = ns.getpeername()[0]
+ns_port = ns.getpeername()[1]
+while 1:
+    reply, addr = ns.recvfrom(65535)
+    if addr[0] == ns_host and addr[1] == ns_port:
+        offset = 0
+        count = struct.unpack_from('!I', reply, offset)[0]
+        offset += 4
+        for i in range(count):
+            h, host, port = struct.unpack_from('!I4sH', reply, offset)[0:3]
+            offset += 10
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((socket.inet_ntop(socket.AF_INET, host), port))
+            sleep(0.2)
+            con_map[h] = [con_map[h], 'tcp://%s:%d'
+                % (socket.inet_ntop(socket.AF_INET, host), port)]
+        break
+try:
+    inf = file(mnfst.input, 'r')
+    ouf = file(mnfst.output, 'w')
+    err = file(mnfst.err, 'w')
+    id = pickle.load(inf)
+except EOFError:
+    id = []
+except Exception:
+    errdump(1,0,mnfst.NexeEtag,'Std files I/O error')
+
+od = ''
+try:
+    od = pickle.dumps(eval(file(mnfst.Nexe, 'r').read()))
+except Exception, e:
+    err.write(e.message+'\n')
+
+ouf.write(od)
+for t in con_map.itervalues():
+    err.write('%s, %s\n' % (t[1], t[0]))
+inf.close()
+ouf.close()
+err.write('\nfinished\n')
+err.close()
+errdump(0, retcode, mnfst.NexeEtag, status)
+'''
             (_prosrv, _acc1srv, _acc2srv, _con1srv,
              _con2srv, _obj1srv, _obj2srv) = _test_servers
             fd, zerovm_mock = mkstemp()
-            os.write(fd, get_zerovm_mock())
+            os.write(fd, def_mock)
             _obj1srv.zerovm_exename = ['python', zerovm_mock]
-            _obj1srv.zerovm_nexe_xparams = ['ok.', '0']
+            #_obj1srv.zerovm_nexe_xparams = ['ok.', '0']
             _obj2srv.zerovm_exename = ['python', zerovm_mock]
-            _obj2srv.zerovm_nexe_xparams = ['ok.', '0']
+            #_obj2srv.zerovm_nexe_xparams = ['ok.', '0']
 
         def get_random_numbers():
             import random
@@ -170,19 +333,16 @@ class TestProxyQuery(unittest.TestCase):
             exp = 'HTTP/1.1 202'
             self.assertEquals(headers[:len(exp)], exp)
 
-        def create_object(prolis):
+        def create_object(prolis, url, obj):
             sock = connect_tcp(('localhost', prolis.getsockname()[1]))
             fd = sock.makefile()
-            fd.write('PUT /v1/a/c/o HTTP/1.1\r\n'
+            fd.write('PUT %s HTTP/1.1\r\n'
                      'Host: localhost\r\n'
                      'Connection: close\r\n'
                      'X-Storage-Token: t\r\n'
                      'Content-Length: %s\r\n'
                      'Content-Type: application/octet-stream\r\n'
-                     'X-Object-Meta-Message: Hello\r\n'
-                     'X-Object-Meta-Base: 10\r\n'
-                     'X-Object-Meta-Format: Pickle\r\n'
-                     '\r\n%s' % (str(len(self._randomnumbers)),  self._randomnumbers))
+                     '\r\n%s' % (url, str(len(obj)),  obj))
             fd.flush()
             headers = readuntil2crlfs(fd)
             exp = 'HTTP/1.1 201'
@@ -200,227 +360,73 @@ class TestProxyQuery(unittest.TestCase):
         self._nexescript_etag = md5()
         self._nexescript_etag.update(self._nexescript)
         self._nexescript_etag = self._nexescript_etag.hexdigest()
+        self._cluster_conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stdin','path':'/c/o'},
+                        {'device':'stdout','path':'/c/o2'}
+                ]
+            }
+        ]
+        self._json_config = json.dumps(self._cluster_conf)
+        self._json_resp = '[{"status": "200 OK", "body": "(lp1\\nI0\\naI1\\naI2\\naI3\\naI4\\naI5\\naI6\\naI7\\naI8\\naI9\\na.", "name": "sort", "nexe_etag": "07405c77e6bdc4533612831e02bed9fb", "nexe_status": "ok.", "nexe_retcode": "0"}]'
+        self._json_stored_resp = '[{"status": "201 Created", "body": "201 Created\\n\\n\\n\\n   ", "name": "sort", "nexe_etag": "07405c77e6bdc4533612831e02bed9fb", "nexe_status": "ok.", "nexe_retcode": "0"}]'
+        self._stderr = '\nfinished\n'
         set_zerovm_mock()
 
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = _test_sockets
         create_container(prolis)
-        create_object(prolis)
+        create_object(prolis, '/v1/a/c/o', self._randomnumbers)
+        create_object(prolis, '/v1/a/c/exe', self._nexescript)
 
     def zerovm_request(self):
-        req = Request.blank('/v1/a/c/o',
+        req = Request.blank('/v1/a',
             environ={'REQUEST_METHOD': 'POST'},
-            headers={'Content-Type': 'application/octet-stream',
+            headers={'Content-Type': 'application/json',
                      'x-zerovm-execute': '1.0'})
         return req
 
-    def test_QUERY_real_zerovm(self):
+#    def test_QUERY_request_bytes_transferred_attr(self):
+#        with save_globals():
+#            proxyquery.http_connect =\
+#            fake_http_connect(200, 200, 201, 201, 201, body='1234567890')
+#            controller = proxyquery.ClusterController(self.proxy_app, 'a')
+#            req = Request.blank('/v1/a', environ={'REQUEST_METHOD': 'POST'},
+#                headers={'Content-Length': '10',
+#                         'x-zerovm-execute': '1.0'},
+#                body='1234567890')
+#            self.proxy_app.update_request(req)
+#            res = controller.zerovm_query(req)
+#            res.body
+#            self.assertEquals(res.status_int, 200)
+#            self.assert_(hasattr(req, 'bytes_transferred'))
+#            self.assertEquals(req.bytes_transferred, 10)
+#            self.assert_(hasattr(res, 'bytes_transferred'))
+#            self.assertEquals(res.bytes_transferred, 10)
 
-        raise SkipTest
-        #This test will work only if ZeroVM is properly installed on the system
-        #at /home/dazo/ZeroVM
-
-        (prolis, acc1lis, acc2lis, con2lis, con2lis, obj1lis, obj2lis) =\
-        _test_sockets
-
-        #create container
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/c HTTP/1.1\r\nHost: localhost\r\n'
-                 'Connection: close\r\nX-Storage-Token: t\r\n'
-                 'Content-Length: 0\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 202'
-        self.assertEquals(headers[:len(exp)], exp)
-
-        # create data object
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        file = open('/home/dazo/ZeroVM/samples/sort_mapping/input.data', 'rb')
-        data = file.read()
-        fd.write('PUT /v1/a/c/o HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Length: %s\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 'X-Object-Meta-Message: Hello\r\n'
-                 'X-Object-Meta-Base: 10\r\n'
-                 'X-Object-Meta-Format: Pickle\r\n'
-                 '\r\n' % str(len(data)))
-        fd.write(data)
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEquals(headers[:len(exp)], exp)
-
-        # query
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        file = open('/home/dazo/ZeroVM/samples/sort_mapping/sort_uint_proper_'
-                    'with_args.c_x86_64.nexe', 'rb')
-        code = file.read()
-        fd.write('QUERY /v1/a/c/o HTTP/1.1\r\nHost: '
-                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
-                 't\r\nContent-Length: %s\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n' % str(len(code)))
-        fd.write(code)
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 200'
-        self.assertEquals(headers[:len(exp)], exp)
-        res = fd.read()
-        file = open('/home/dazo/ZeroVM/samples/sort_mapping/output.data', 'rb')
-        expres = file.read()
-        self.assertEquals(res, expres)
-        headerslines = headers.splitlines()
-        headers = {}
-        for line in headerslines:
-            colon = line.find(":")
-            headers[line[:colon].lower()] = line[colon+1:].strip()
-        self.assertEquals(headers['content-length'], str(len(expres)))
-        self.assertEquals(headers['content-type'], 'application/octet-stream')
-        # TODOLE take care of etags passing, receiving and checking
-
-    def test_QUERY_request_bytes_transferred_attr(self):
-        with save_globals():
-            proxyquery.http_connect =\
-            fake_http_connect(200, 200, 201, 201, 201, body='1234567890')
-            controller = proxyquery.QueryController(self.proxy_app, 'a', 'c', 'o')
-            req = Request.blank('/v1/a/c/o', environ={'REQUEST_METHOD': 'POST'},
-                headers={'Content-Length': '10',
-                         'x-zerovm-execute': '1.0'},
-                body='1234567890')
-            self.proxy_app.update_request(req)
-            res = controller.zerovm_query(req)
-            res.body
-            self.assertEquals(res.status_int, 200)
-            self.assert_(hasattr(req, 'bytes_transferred'))
-            self.assertEquals(req.bytes_transferred, 10)
-            self.assert_(hasattr(res, 'bytes_transferred'))
-            self.assertEquals(res.bytes_transferred, 10)
-
-    def test_QUERY_sort(self):
+    def test_QUERY_sort_store_stdout(self):
         self.setup_QUERY()
+        json_conf = json.dumps(self._cluster_conf)
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) =\
         _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
-        fd.write('POST /v1/a/c/o HTTP/1.1\r\nHost: '
+        fd.write('POST /v1/a HTTP/1.1\r\nHost: '
                  'localhost\r\nConnection: close\r\nX-Storage-Token: '
                  't\r\nContent-Length: %s\r\n'
-                 'Content-Type: application/octet-stream\r\n'
+                 'Content-Type: application/json\r\n'
                  'x-zerovm-execute: 1.0\r\n'
-                 'etag: %s\r\n'
-                 'X-Object-Meta-Type: python\r\n'
-                 'X-Object-Meta-Name: sorter\r\n'
-                 'X-Object-Meta-arg1: pickle\r\n'
-                 'X-Object-Meta-format: pickle\r\n'
-                 '\r\n%s' % (str(len(self._nexescript)),
-                             self._nexescript_etag, self._nexescript))
+                 '\r\n%s' % (str(len(json_conf)),
+                             json_conf))
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 200'
         self.assertEquals(headers[:len(exp)], exp)
         res = fd.read()
-        self.assertEquals(res, self._sortednumbers)
+        self.assertEquals(res, self._json_stored_resp)
 
-    def test_QUERY_sort_with_load_from(self):
-        self.setup_QUERY()
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) =\
-        _test_sockets
-        # create code object
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/c/co HTTP/1.1\r\n'
-                 'Host: '
-                 'localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Length: %s\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 'X-Object-Meta-Format: pickle\r\n'
-                 'X-Object-Meta-Name: sorter\r\n'
-                 'X-Object-Meta-Arg1: pickle\r\n'
-                 'X-Object-Meta-Type: python\r\n'
-                 'etag: %s\r\n'
-                 '\r\n%s' % (str(len(self._nexescript)),
-                             self._nexescript_etag, self._nexescript))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEquals(headers[:len(exp)], exp)
-        #run the query
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('POST /v1/a/c/o HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Length: 0\r\n'
-                 'x-zerovm-execute: 1.0\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 'X-Load-From: c/co\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 200'
-        self.assertEquals(headers[:len(exp)], exp)
-        res = fd.read()
-        self.assertEquals(res, self._sortednumbers)
-        # Test invalid path inside "X-Load-From" http header.
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('POST /v1/a/c/o HTTP/1.1\r\n'
-                 'Host: '
-                 'localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Length: %s\r\n'
-                 'x-zerovm-execute: 1.0\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 'etag: %s\r\n'
-                 'X-Load-From: blah-blah-blah\r\n'
-                 'X-Object-Meta-Type: python\r\n'
-                 'X-Object-Meta-Name: sorter\r\n'
-                 'X-Object-Meta-arg1: pickle\r\n'
-                 'X-Object-Meta-format: pickle\r\n'
-                 '\r\n%s' % (str(len(self._nexescript)),
-                             self._nexescript_etag, self._nexescript))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 412'
-        self.assertEquals(headers[:len(exp)], exp)
-
-    def test_QUERY_sort_with_store_to(self):
-        self.setup_QUERY()
-        (prolis, acc1lis, acc2lis, con2lis, con2lis, obj1lis, obj2lis) =\
-        _test_sockets
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('POST /v1/a/c/o HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Length: %s\r\n'
-                 'x-zerovm-execute: 1.0\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 'X-Store-To: c/o2\r\n'
-                 'etag: %s\r\n'
-                 'X-Object-Meta-Format: pickle\r\n'
-                 'X-Object-Meta-Name: sorter\r\n'
-                 'X-Object-Meta-Arg1: pickle\r\n'
-                 'X-Object-Meta-Type: python\r\n'
-                 '\r\n%s' % (str(len(self._nexescript)),
-                             self._nexescript_etag, self._nexescript))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEquals(headers[:len(exp)], exp)
-        res = fd.read()
-        self.assertEquals(res, '201 Created\n\n\n\n   ')
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a/c/o2 HTTP/1.1\r\n'
@@ -437,99 +443,29 @@ class TestProxyQuery(unittest.TestCase):
         res = fd.read()
         self.assertEquals(res, self._sortednumbers)
 
+    def test_QUERY_sort_store_stdout_stderr(self):
         self.setup_QUERY()
-        (prolis, acc1lis, acc2lis, con2lis, con2lis, obj1lis, obj2lis) =\
+        conf = self._cluster_conf
+        conf[0]['file_list'].append({'device':'stderr','path':'/c/o3'})
+        conf = json.dumps(conf)
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) =\
         _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
-        fd.write('POST /v1/a/c/o HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Length: %s\r\n'
-                 'x-zerovm-execute: 1.0\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 'X-Store-To: invalid'
-                 'etag: %s\r\n'
-                 'X-Object-Meta-Format: pickle\r\n'
-                 'X-Object-Meta-Name: sorter\r\n'
-                 'X-Object-Meta-Arg1: pickle\r\n'
-                 'X-Object-Meta-Type: python\r\n'
-                 '\r\n%s' % (str(len(self._nexescript)),
-                             self._nexescript_etag, self._nexescript))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 412'
-        self.assertEquals(headers[:len(exp)], exp)
-        res = fd.read()
-        self.assertEquals(res, 'X-Store-To header must be of the form<container name>/<object name>')
-
-
-        self.setup_QUERY()
-        (prolis, acc1lis, acc2lis, con2lis, con2lis, obj1lis, obj2lis) =\
-        _test_sockets
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('POST /v1/a/c/o HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Length: %s\r\n'
-                 'x-zerovm-execute: 1.0\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 'X-Store-To: invalid/invalid/invalid/o2\r\n'
-                 'etag: %s\r\n'
-                 'X-Object-Meta-Format: pickle\r\n'
-                 'X-Object-Meta-Name: sorter\r\n'
-                 'X-Object-Meta-Arg1: pickle\r\n'
-                 'X-Object-Meta-Type: python\r\n'
-                 '\r\n%s' % (str(len(self._nexescript)),
-                             self._nexescript_etag, self._nexescript))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 404'
-        self.assertEquals(headers[:len(exp)], exp)
-        res = fd.read()
-        self.assertEquals(res, '404 Not Found\n\nThe resource could not be found.\n\n   ')
-
-    def test_QUERY_sort_with_load_from_and_store_to(self):
-        self.setup_QUERY()
-        (prolis, acc1lis, acc2lis, con2lis, con2lis, obj1lis, obj2lis) =\
-        _test_sockets
-        # create code object
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/c/co HTTP/1.1\r\nHost: '
+        fd.write('POST /v1/a HTTP/1.1\r\nHost: '
                  'localhost\r\nConnection: close\r\nX-Storage-Token: '
-                 't\r\nContent-Length: %s\r\nContent-Type: application/octet-'
-                 'stream\r\n'
-                 'etag: %s\r\n'
-                 '\r\n%s' % (str(len(self._nexescript)),
-                             self._nexescript_etag, self._nexescript))
+                 't\r\nContent-Length: %s\r\n'
+                 'Content-Type: application/json\r\n'
+                 'x-zerovm-execute: 1.0\r\n'
+                 '\r\n%s' % (str(len(conf)), conf)
+        )
         fd.flush()
         headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEquals(headers[:len(exp)], exp)
-        #run the query
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('QUERY /v1/a/c/o HTTP/1.1\r\nHost: '
-                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
-                 't\r\nContent-Length: 0\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 'X-Object-Meta-Format: pickle\r\n'
-                 'X-Object-Meta-Name: sorter\r\n'
-                 'X-Object-Meta-Arg1: pickle\r\n'
-                 'X-Object-Meta-Type: python\r\n'
-                 'X-Load-From: c/co\r\n'
-                 'X-Store-To: c/o2\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
+        exp = 'HTTP/1.1 200'
         self.assertEquals(headers[:len(exp)], exp)
         res = fd.read()
-        self.assertEquals(res, '201 Created\n\n\n\n   ')
+        self.assertEquals(res, self._json_stored_resp)
+
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a/c/o2 HTTP/1.1\r\n'
@@ -545,6 +481,151 @@ class TestProxyQuery(unittest.TestCase):
         self.assertEquals(headers[:len(exp)], exp)
         res = fd.read()
         self.assertEquals(res, self._sortednumbers)
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('GET /v1/a/c/o3 HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 'Content-Length: 0\r\n'
+                 '\r\n')
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 200'
+        self.assertEquals(headers[:len(exp)], exp)
+        res = fd.read()
+        self.assertEquals(res, self._stderr)
+
+    def test_QUERY_sort_immediate_stdout(self):
+        self.setup_QUERY()
+        conf = self._cluster_conf
+        del conf[0]['file_list'][1]['path']
+        conf = json.dumps(conf)
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) =\
+        _test_sockets
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('POST /v1/a HTTP/1.1\r\nHost: '
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: %s\r\n'
+                 'Content-Type: application/json\r\n'
+                 'x-zerovm-execute: 1.0\r\n'
+                 '\r\n%s' % (str(len(conf)),conf)
+        )
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 200'
+        self.assertEquals(headers[:len(exp)], exp)
+        res = fd.read()
+        self.assertEquals(res, self._json_resp)
+
+    def test_QUERY_sort_immediate_stdout_stderr(self):
+        self.setup_QUERY()
+        conf = self._cluster_conf
+        del conf[0]['file_list'][1]['path']
+        conf[0]['file_list'].append({'device':'stderr'})
+        conf = json.dumps(conf)
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) =\
+        _test_sockets
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('POST /v1/a HTTP/1.1\r\nHost: '
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: %s\r\n'
+                 'Content-Type: application/json\r\n'
+                 'x-zerovm-execute: 1.0\r\n'
+                 '\r\n%s' % (str(len(conf)),conf)
+        )
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 200'
+        self.assertEquals(headers[:len(exp)], exp)
+        res = fd.read()
+        resp = '[{"status": "200 OK", "body":' \
+               ' "(lp1\\nI0\\naI1\\naI2\\naI3\\naI4\\naI5\\naI6\\naI7\\naI8\\naI9\\na.' \
+               '\\nfinished\\n", "name": "sort", "nexe_etag": "07405c77e6bdc4533612831e02bed9fb", ' \
+               '"nexe_status": "ok.", "nexe_retcode": "0"}]'
+        self.assertEquals(res, resp)
+
+    def test_QUERY_network_resolve(self):
+        self.setup_QUERY()
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stderr','path':'/c/o2'}
+                ],
+                'connect':['merge']
+            },
+                {
+                'name':'merge',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stderr','path':'/c/o3'}
+                ],
+                'connect':['sort']
+            }
+        ]
+        jconf = json.dumps(conf)
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) =\
+        _test_sockets
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('POST /v1/a HTTP/1.1\r\nHost: '
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: %s\r\n'
+                 'Content-Type: application/json\r\n'
+                 'x-zerovm-execute: 1.0\r\n'
+                 '\r\n%s' % (str(len(jconf)),jconf)
+        )
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 200'
+        self.assertEquals(headers[:len(exp)], exp)
+        res = fd.read()
+        resp = '[{"status": "201 Created", "body": "201 Created\\n\\n\\n\\n   ", ' \
+        '"name": "sort", "nexe_etag": "07405c77e6bdc4533612831e02bed9fb", "nexe_status": "ok.", ' \
+        '"nexe_retcode": "0"}, {"status": "201 Created", "body": "201 Created\\n\\n\\n\\n   ", ' \
+        '"name": "merge", "nexe_etag": "07405c77e6bdc4533612831e02bed9fb", "nexe_status": "ok.", ' \
+        '"nexe_retcode": "0"}]'
+        self.assertEquals(res, resp)
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('GET /v1/a/c/o2 HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 'Content-Length: 0\r\n'
+                 '\r\n')
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 200'
+        self.assertEquals(headers[:len(exp)], exp)
+        res = fd.read()
+        self.assertIn('finished', res)
+        self.assert_(re.match('tcp://127.0.0.1:\d+, /dev/out/%s' % conf[0]['connect'][0],res))
+
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('GET /v1/a/c/o3 HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 'Content-Length: 0\r\n'
+                 '\r\n')
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 200'
+        self.assertEquals(headers[:len(exp)], exp)
+        res = fd.read()
+        self.assertIn('finished', res)
+        self.assert_(re.match('tcp://127.0.0.1:\d+, /dev/out/%s' % conf[1]['connect'][0],res))
 
     def test_QUERY_calls_authorize(self):
         called = [False]
