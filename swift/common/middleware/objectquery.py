@@ -68,7 +68,7 @@ class ObjectQueryMiddleware(object):
         #self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '').split() if i.strip())
 
         # maximum number of simultaneous running zerovms, others are queued
-        self.zerovm_maxpool = int(conf.get('zerovm_maxpool', 2))
+        self.zerovm_maxpool = int(conf.get('zerovm_maxpool', 10))
 
         # maximum length of queue of request awaiting zerovm executions
         self.zerovm_maxqueue = int(conf.get('zerovm_maxqueue', 3))
@@ -352,7 +352,7 @@ class ObjectQueryMiddleware(object):
                     written = self.os_interface.write(zerovm_inputmnfst_fd,
                         zerovm_inputmnfst)
                     zerovm_inputmnfst = zerovm_inputmnfst[written:]
-
+                print zerovm_inputmnfst
                 def ex_zerovm():
                     cmdline = []
                     cmdline += self.zerovm_exename
