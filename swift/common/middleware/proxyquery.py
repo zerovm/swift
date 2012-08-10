@@ -108,9 +108,9 @@ class NameService(object):
                         for i in range(count):
                             h = struct.unpack_from('!I', reply, offset)[0]
                             port = bind_map[h][src]
-                            struct.pack_into('!4sH', reply, offset + 4,
+                            struct.pack_into('!4sH', reply, offset,
                                 socket.inet_pton(socket.AF_INET, peer_map[src][0]), port)
-                            offset += 10
+                            offset += 6
                         self.sock.sendto(reply, (peer_map[src][0], peer_map[src][1]))
             except greenlet.GreenletExit:
                 return
@@ -461,7 +461,7 @@ class ClusterController(Controller):
                 server_response = conn.getresponse()
         except (Exception, Timeout):
             self.exception_occurred(conn.node, _('Object'),
-                _('Trying to get final status of PUT to %s')
+                _('Trying to get final status of POST to %s')
                 % req.path_info)
             return Response(status='499 Client Disconnect')
         if server_response.status != 200:
@@ -562,7 +562,11 @@ class ClusterController(Controller):
                 node_name = node.get('name')
                 if not node_name:
                     return HTTPBadRequest(request=req, body='Must specify node name')
-                nexe_path = node.get('exec').get('path')
+                nexe = node.get('exec')
+                if not nexe:
+                    return HTTPBadRequest(request=req,
+                        body='Must specify exec stanza for %s' % node_name)
+                nexe_path = nexe.get('path')
                 if not nexe_path:
                     return HTTPBadRequest(request=req,
                         body='Must specify executable path for %s' % node_name)
@@ -584,7 +588,7 @@ class ClusterController(Controller):
                         if not access & ACCESS_WRITABLE or access & ACCESS_CDR:
                             if len(read_list) > 0:
                                 return HTTPBadRequest(request=req,
-                                    body='Not more than one readable file per node %s' % node_name)
+                                    body='More than one readable file in %s' % node_name)
                             read_list.append(f)
                         elif access & ACCESS_WRITABLE:
                             write_list.append(f)
@@ -602,17 +606,20 @@ class ClusterController(Controller):
                             try:
                                 container, object = split_path(path, 1, 2, True)
                             except ValueError:
-                                return HTTPBadRequest(request=req, body='Invalid path %s' % path)
+                                return HTTPBadRequest(request=req,
+                                    body='Invalid path %s in %s' % (path, node_name))
                             if '*' in container:
-                                container = container.replace('*', '.*')
+                                container = re.escape(container).replace('\\*', '.*')
                                 mask = re.compile(container)
                                 try:
                                     containers = self.list_account(req, self.account_name, mask)
                                 except Exception:
-                                    return HTTPBadRequest(request=req, body='Error querying object server')
+                                    return HTTPBadRequest(request=req,
+                                        body='Error querying object server for account %s'
+                                        % self.account_name)
                                 if object:
                                     if '*' in object:
-                                        object = object.replace('*', '.*')
+                                        object = re.escape(object).replace('\\*', '.*')
                                     mask = re.compile(object)
                                 else:
                                     mask = None
@@ -621,11 +628,12 @@ class ClusterController(Controller):
                                         obj_list = self.list_container(req, self.account_name, c, mask)
                                     except Exception:
                                         return HTTPBadRequest(request=req,
-                                            body='Error querying object server')
+                                            body='Error querying object server '
+                                                 'for container %s' % c)
                                     for obj in obj_list:
                                         list.append('/' + c + '/' + obj)
                             else:
-                                object = object.replace('*', '.*')
+                                object = re.escape(object).replace('\\*', '.*')
                                 mask = re.compile(object)
                                 for obj in self.list_container(req, self.account_name, container, mask):
                                     list.append('/' + container + '/' + obj)
@@ -657,8 +665,14 @@ class ClusterController(Controller):
                         path = f.get('path')
                         if path and '*' in path:
                             if read_group:
-                                read_mask = read_list[0].path
-                                read_mask = read_mask.replace('*', '(.*)')
+                                read_mask = read_list[0].get('path')
+                                read_count = read_mask.count('*')
+                                write_count = path.count('*')
+                                if read_count != write_count:
+                                    return HTTPBadRequest(request=req,
+                                        body='Wildcards in input %s cannot be resolved into output %s'
+                                        % (read_mask, path))
+                                read_mask = re.escape(read_mask).replace('\\*', '(.*)')
                                 read_mask = re.compile(read_mask)
                                 for i in range(1, node_count + 1):
                                     new_name = self.create_name(node_name, i)
@@ -666,8 +680,8 @@ class ClusterController(Controller):
                                     new_node = self.nodes.get(new_name)
                                     read_path = new_node.channels[0].path
                                     m = read_mask.match(read_path)
-                                    repl = m.group(1)
-                                    new_path = new_path.replace('*', repl)
+                                    for j in range(1, m.lastindex + 1):
+                                        new_path = new_path.replace('*', m.group(j), 1)
                                     new_node.add_channel(device, access, path=new_path)
                             else:
                                 for i in range(1, node_count + 1):
@@ -684,7 +698,9 @@ class ClusterController(Controller):
                         elif path:
                             if node_count > 1:
                                 return HTTPBadRequest(request=req,
-                                    body='Single path %s for multiple node definition: %s, please use wildcard' % (path, node_name))
+                                    body='Single path %s for multiple node '
+                                         'definition: %s, please use wildcard'
+                                    % (path, node_name))
                             new_node = self.nodes.get(node_name)
                             if not new_node:
                                 new_node = ZvmNode(nid, node_name, nexe_path,

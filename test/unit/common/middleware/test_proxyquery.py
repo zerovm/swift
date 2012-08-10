@@ -1,5 +1,7 @@
 from __future__ import with_statement
 import re
+import struct
+from eventlet.green import socket
 from swiftclient.client import quote
 import random
 
@@ -20,7 +22,7 @@ from shutil import rmtree
 from nose import SkipTest
 from httplib import HTTPException
 from webob.exc import HTTPNotFound, HTTPUnauthorized
-from eventlet import sleep, spawn, Timeout, util, wsgi, listen
+from eventlet import sleep, spawn, Timeout, util, wsgi, listen, GreenPool
 from gzip import GzipFile
 from contextlib import contextmanager
 
@@ -277,7 +279,7 @@ class TestProxyQuery(unittest.TestCase):
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
-        self.assertEquals(headers[:len(exp)], exp)
+        self.assertEqual(headers[:len(exp)], exp)
 
     def get_random_numbers(self, min_num=0, max_num=10):
         numlist = [i for i in range(min_num, max_num)]
@@ -375,7 +377,7 @@ bind_data = ''
 bind_count = 0
 connect_data = ''
 connect_count = 0
-con_map = {}
+con_list = []
 bind_map = {}
 alias = int(re.split('\s*,\s*', mnfst.NodeName)[1])
 for i in xrange(0,len(dev_list)):
@@ -400,9 +402,9 @@ for i in xrange(0,len(dev_list)):
             bind_data += struct.pack('!IH', host, int(port))
             bind_count += 1
         else:
-            connect_data += struct.pack('!IIH', host, 0, 0)
+            connect_data += struct.pack('!IH', host, 0)
             connect_count += 1
-            con_map[host] = device
+            con_list.append(device)
 request = struct.pack('!I', alias) +\
           struct.pack('!I', bind_count) + bind_data + struct.pack('!I', connect_count) + connect_data
 ns_host, ns_port = mnfst.NameService.split(':')
@@ -418,11 +420,11 @@ while 1:
         count = struct.unpack_from('!I', reply, offset)[0]
         offset += 4
         for i in range(count):
-            h, host, port = struct.unpack_from('!I4sH', reply, offset)[0:3]
-            offset += 10
+            host, port = struct.unpack_from('!4sH', reply, offset)[0:2]
+            offset += 6
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((socket.inet_ntop(socket.AF_INET, host), port))
-            con_map[h] = [con_map[h], 'tcp://%s:%d'
+            con_list[i] = [con_list[i], 'tcp://%s:%d'
                 % (socket.inet_ntop(socket.AF_INET, host), port)]
         break
 if bind_map:
@@ -444,7 +446,7 @@ except Exception, e:
     err.write(e.message+'\n')
 
 ouf.write(od)
-for t in con_map.itervalues():
+for t in con_list:
     err.write('%s, %s\n' % (t[1], t[0]))
 inf.close()
 ouf.close()
@@ -473,6 +475,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         self.create_container(prolis, '/v1/a/c_in1')
         self.create_container(prolis, '/v1/a/c_in2')
         self.create_container(prolis, '/v1/a/c_out1')
+        self.create_container(prolis, '/v1/a/c_out2')
         self.create_object(prolis, '/v1/a/c/o', self._randomnumbers)
         self.create_object(prolis, '/v1/a/c/exe', self._nexescript)
 
@@ -497,6 +500,62 @@ errdump(0, retcode, mnfst.NexeEtag, status)
             headers={'Content-Type': 'application/octet-stream'})
         return req
 
+    def test_QUERY_name_service(self):
+        ns_server = proxyquery.NameService()
+        pool = GreenPool()
+        peers = 3
+        ns_port = ns_server.start(pool, peers)
+        map = {}
+        sleep(0.1)
+        def mock_client(ns_port, conf, id):
+            bind_data = ''
+            connect_data = ''
+            bind_map = {}
+            connect_list = []
+            for h in conf[0]:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(('', 0))
+                s.listen(1)
+                port = s.getsockname()[1]
+                bind_map[h] = {'port':port,'sock':s}
+                bind_data += struct.pack('!IH', h, int(port))
+                map['%d->%d' % (h, id)] = int(port)
+            for h in conf[1]:
+                connect_list.append(h)
+                connect_data += struct.pack('!IH', h, 0)
+            request = struct.pack('!I', id) +\
+                      struct.pack('!I', len(conf[0])) + bind_data +\
+                      struct.pack('!I', len(conf[1])) + connect_data
+            ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            ns.connect(('localhost', int(ns_port)))
+            ns.sendto(request, ('localhost', int(ns_port)))
+            ns_host = ns.getpeername()[0]
+            ns_port = ns.getpeername()[1]
+            while 1:
+                reply, addr = ns.recvfrom(65535)
+                if addr[0] == ns_host and addr[1] == ns_port:
+                    offset = 0
+                    count = struct.unpack_from('!I', reply, offset)[0]
+                    offset += 4
+                    for i in range(count):
+                        host, port = struct.unpack_from('!4sH', reply, offset)[0:3]
+                        offset += 6
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.connect((socket.inet_ntop(socket.AF_INET, host), port))
+                        self.assertEqual(map['%d->%d' %(id,connect_list[i])], port)
+                    break
+            sleep(0.2)
+        dev1 = [[2, 3],[2, 3]]
+        dev2 = [[1, 3],[1, 3]]
+        dev3 = [[2, 1],[2, 1]]
+        th1 = pool.spawn(mock_client, ns_port, dev1, 1)
+        th2 = pool.spawn(mock_client, ns_port, dev2, 2)
+        th3 = pool.spawn(mock_client, ns_port, dev3, 3)
+        th1.wait()
+        th2.wait()
+        th3.wait()
+        ns_server.stop()
+
     def test_QUERY_sort_store_stdout(self):
         self.setup_QUERY()
         conf = [
@@ -514,7 +573,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.zerovm_request()
         req.body = conf
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         resp = [
                 {
                 'status': '201 Created',
@@ -525,12 +584,12 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 'nexe_retcode': 0
             }
         ]
-        self.assertEquals(res.body, json.dumps(resp))
+        self.assertEqual(res.body, json.dumps(resp))
 
         req = self.object_request('/v1/a/c/o2')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
-        self.assertEquals(res.body, self.get_sorted_numbers())
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers())
 
     def test_QUERY_sort_store_stdout_stderr(self):
         self.setup_QUERY()
@@ -550,7 +609,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.zerovm_request()
         req.body = conf
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         resp = [
                 {
                 'status': '201 Created',
@@ -561,17 +620,17 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 'nexe_retcode': 0
             }
         ]
-        self.assertEquals(res.body, json.dumps(resp))
+        self.assertEqual(res.body, json.dumps(resp))
 
         req = self.object_request('/v1/a/c/o2')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
-        self.assertEquals(res.body, self.get_sorted_numbers())
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers())
 
         req = self.object_request('/v1/a/c/o3')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
-        self.assertEquals(res.body, '\nfinished\n')
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, '\nfinished\n')
 
     def test_QUERY_immediate_stdout(self):
         self.setup_QUERY()
@@ -590,7 +649,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.zerovm_request()
         req.body = conf
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         resp = [
                 {
                 'status': '200 OK',
@@ -601,8 +660,8 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 'nexe_retcode': 0
             }
         ]
-        self.assertEquals(res.body, json.dumps(resp))
-        self.assertEquals(res.headers['content-type'], 'application/json')
+        self.assertEqual(res.body, json.dumps(resp))
+        self.assertEqual(res.headers['content-type'], 'application/json')
 
     def test_QUERY_sort_immediate_stdout_stderr(self):
         self.setup_QUERY()
@@ -622,7 +681,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.zerovm_request()
         req.body = conf
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         resp = [
                 {
                 'status': '200 OK',
@@ -633,7 +692,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 'nexe_retcode': 0
             }
         ]
-        self.assertEquals(res.body, json.dumps(resp))
+        self.assertEqual(res.body, json.dumps(resp))
 
     def test_QUERY_sort_store_stdout_immediate_stderr(self):
         self.setup_QUERY()
@@ -653,7 +712,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.zerovm_request()
         req.body = conf
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         resp = [
                 {
                 'status': '200 OK',
@@ -664,11 +723,11 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 'nexe_retcode': 0
             }
         ]
-        self.assertEquals(res.body, json.dumps(resp))
+        self.assertEqual(res.body, json.dumps(resp))
         req = self.object_request('/v1/a/c/o2')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
-        self.assertEquals(res.body, self.get_sorted_numbers())
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers())
 
     def test_QUERY_network_resolve(self):
         self.setup_QUERY()
@@ -695,7 +754,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.zerovm_request()
         req.body = jconf
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         resp = [
                 {
                 'status': '201 Created',
@@ -714,17 +773,17 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 'nexe_retcode': 0
             }
         ]
-        self.assertEquals(res.body, json.dumps(resp))
+        self.assertEqual(res.body, json.dumps(resp))
 
         req = self.object_request('/v1/a/c/o2')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         self.assertIn('finished', res.body)
         self.assert_(re.match('tcp://127.0.0.1:\d+, /dev/out/%s' % conf[0]['connect'][0],res.body))
 
         req = self.object_request('/v1/a/c/o3')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         self.assertIn('finished', res.body)
         self.assert_(re.match('tcp://127.0.0.1:\d+, /dev/out/%s' % conf[1]['connect'][0],res.body))
 
@@ -754,7 +813,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.zerovm_request()
         req.body = jconf
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         resp = [
                 {
                 'status': '201 Created',
@@ -797,40 +856,40 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 'nexe_retcode': 0
             }
         ]
-        self.assertEquals(res.body, json.dumps(resp))
+        self.assertEqual(res.body, json.dumps(resp))
 
         req = self.object_request('/v1/a/c_out1/sort-1.stderr')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
-        self.assertEquals(
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(
             sorted(re.findall('tcp://127.0.0.1:\d+, /dev/out/([^\s]+)', res.body)),
             ['merge-1', 'merge-2', 'sort-2', 'sort-3']
         )
         req = self.object_request('/v1/a/c_out1/sort-2.stderr')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
-        self.assertEquals(
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(
             sorted(re.findall('tcp://127.0.0.1:\d+, /dev/out/([^\s]+)', res.body)),
             ['merge-1', 'merge-2', 'sort-1', 'sort-3']
         )
         req = self.object_request('/v1/a/c_out1/sort-3.stderr')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
-        self.assertEquals(
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(
             sorted(re.findall('tcp://127.0.0.1:\d+, /dev/out/([^\s]+)', res.body)),
             ['merge-1', 'merge-2', 'sort-1', 'sort-2']
         )
         req = self.object_request('/v1/a/c_out1/merge-1.stderr')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
-        self.assertEquals(
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(
             sorted(re.findall('tcp://127.0.0.1:\d+, /dev/out/([^\s]+)', res.body)),
             []
         )
         req = self.object_request('/v1/a/c_out1/merge-2.stderr')
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
-        self.assertEquals(
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(
             sorted(re.findall('tcp://127.0.0.1:\d+, /dev/out/([^\s]+)', res.body)),
             []
         )
@@ -853,7 +912,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.zerovm_request()
         req.body = jconf
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         result = [
                 {
                 'status': '200 OK',
@@ -872,7 +931,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 'nexe_retcode': 0
             }
         ]
-        self.assertEquals(json.dumps(result), res.body)
+        self.assertEqual(json.dumps(result), res.body)
 
     def test_QUERY_read_container_wildcard(self):
         self.setup_QUERY()
@@ -891,7 +950,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.zerovm_request()
         req.body = jconf
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         result = [
                 {
                 'status': '200 OK',
@@ -942,7 +1001,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 'nexe_retcode': 0
             },
         ]
-        self.assertEquals(json.dumps(result), res.body)
+        self.assertEqual(json.dumps(result), res.body)
 
     def test_QUERY_read_container_and_obj_wildcard(self):
         self.setup_QUERY()
@@ -961,7 +1020,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.zerovm_request()
         req.body = jconf
         res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 200)
+        self.assertEqual(res.status_int, 200)
         result = [
                 {
                 'status': '200 OK',
@@ -996,7 +1055,169 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 'nexe_retcode': 0
             }
         ]
-        self.assertEquals(json.dumps(result), res.body)
+        self.assertEqual(json.dumps(result), res.body)
+
+    def test_QUERY_group_transform(self):
+        self.setup_QUERY()
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stdin','path':'/c_in1/in*'},
+                        {'device':'stdout','path':'/c_out1/out*'}
+                ]
+            }
+        ]
+        jconf = json.dumps(conf)
+        prosrv = _test_servers[0]
+        req = self.zerovm_request()
+        req.body = jconf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        resp = [
+                {
+                'status': '201 Created',
+                'body': '201 Created\n\n\n\n   ',
+                'name': 'sort-1',
+                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
+                'nexe_status': 'ok.',
+                'nexe_retcode': 0
+            },
+                {
+                'status': '201 Created',
+                'body': '201 Created\n\n\n\n   ',
+                'name': 'sort-2',
+                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
+                'nexe_status': 'ok.',
+                'nexe_retcode': 0
+            }
+        ]
+        self.assertEqual(json.dumps(resp), res.body)
+        req = self.object_request('/v1/a/c_out1/output1')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(0, 10))
+        req = self.object_request('/v1/a/c_out1/output2')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(10, 20))
+
+    def test_QUERY_write_wildcard(self):
+        self.setup_QUERY()
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stdout','path':'/c_out1/out.*'},
+                ],
+                'count':2
+            }
+        ]
+        jconf = json.dumps(conf)
+        prosrv = _test_servers[0]
+        req = self.zerovm_request()
+        req.body = jconf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        resp = [
+                {
+                'status': '201 Created',
+                'body': '201 Created\n\n\n\n   ',
+                'name': 'sort-1',
+                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
+                'nexe_status': 'ok.',
+                'nexe_retcode': 0
+            },
+                {
+                'status': '201 Created',
+                'body': '201 Created\n\n\n\n   ',
+                'name': 'sort-2',
+                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
+                'nexe_status': 'ok.',
+                'nexe_retcode': 0
+            }
+        ]
+        self.assertEqual(json.dumps(resp), res.body)
+        req = self.object_request('/v1/a/c_out1/out.sort-1')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(0, 0))
+        req = self.object_request('/v1/a/c_out1/out.sort-2')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(0, 0))
+
+    def test_QUERY_group_transform_multiple(self):
+        self.setup_QUERY()
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stdin','path':'/c_in*/in*'},
+                        {'device':'stdout','path':'/c_out*/out*'}
+                ]
+            }
+        ]
+        jconf = json.dumps(conf)
+        prosrv = _test_servers[0]
+        req = self.zerovm_request()
+        req.body = jconf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        resp = [
+                {
+                'status': '201 Created',
+                'body': '201 Created\n\n\n\n   ',
+                'name': 'sort-1',
+                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
+                'nexe_status': 'ok.',
+                'nexe_retcode': 0
+            },
+                {
+                'status': '201 Created',
+                'body': '201 Created\n\n\n\n   ',
+                'name': 'sort-2',
+                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
+                'nexe_status': 'ok.',
+                'nexe_retcode': 0
+            },
+                {
+                'status': '201 Created',
+                'body': '201 Created\n\n\n\n   ',
+                'name': 'sort-3',
+                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
+                'nexe_status': 'ok.',
+                'nexe_retcode': 0
+            },
+                {
+                'status': '201 Created',
+                'body': '201 Created\n\n\n\n   ',
+                'name': 'sort-4',
+                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
+                'nexe_status': 'ok.',
+                'nexe_retcode': 0
+            }
+        ]
+        self.assertEqual(json.dumps(resp), res.body)
+        req = self.object_request('/v1/a/c_out1/output1')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(0, 10))
+        req = self.object_request('/v1/a/c_out1/output2')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(10, 20))
+        req = self.object_request('/v1/a/c_out2/output1')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(20, 30))
+        req = self.object_request('/v1/a/c_out2/output2')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(30, 40))
 
     def test_QUERY_calls_authorize(self):
         called = [False]
@@ -1022,8 +1243,8 @@ errdump(0, retcode, mnfst.NexeEtag, status)
             req.body = '12345'
             req.content_length = 10
             res = req.get_response(prosrv)
-            self.assertEquals(req.bytes_transferred, 5)
-            self.assertEquals(res.status, '499 Client Disconnect')
+            self.assertEqual(req.bytes_transferred, 5)
+            self.assertEqual(res.status, '499 Client Disconnect')
 
     def test_QUERY_request_timed_out(self):
         class SlowFile():
@@ -1040,7 +1261,163 @@ errdump(0, retcode, mnfst.NexeEtag, status)
             req = self.zerovm_request()
             req.body_file = SlowFile()
             res = req.get_response(prosrv)
-        self.assertEquals(res.status_int, 408)
+        self.assertEqual(res.status_int, 408)
+
+    def test_QUERY_invalid_etag(self):
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stdin','path':'/c/o'},
+                        {'device':'stdout'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        prosrv = _test_servers[0]
+        req = self.zerovm_request()
+        req.body = conf
+        req.headers['etag'] = '1111'
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 422)
+
+    def test_QUERY_missing_required_fields(self):
+        conf = [
+                {
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stdin','path':'/c/o'},
+                        {'device':'stdout'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        prosrv = _test_servers[0]
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 400)
+        self.assertEqual(res.body, 'Must specify node name')
+        conf = [
+                {
+                'name':'sort',
+                'file_list':[
+                        {'device':'stdin','path':'/c/o'},
+                        {'device':'stdout'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 400)
+        self.assertEqual(res.body, 'Must specify exec stanza for sort')
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'test':1},
+                'file_list':[
+                        {'device':'stdin','path':'/c/o'},
+                        {'device':'stdout'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 400)
+        self.assertEqual(res.body, 'Must specify executable path for sort')
+
+    def test_QUERY_invalid_device_config(self):
+        prosrv = _test_servers[0]
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'path':'/c/o'},
+                        {'device':'stdout'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 400)
+        self.assertEqual(res.body, 'Must specify device for file in sort')
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stdtest'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 400)
+        self.assertEqual(res.body, 'Unknown device stdtest in sort')
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stdin', 'path':'/c/in'},
+                        {'device':'image', 'path':'/c/img'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 400)
+        self.assertEqual(res.body, 'More than one readable file in sort')
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                        {'device':'stdin', 'path':'*'},
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 400)
+        self.assertEqual(res.body, 'Invalid path * in sort')
+
+    def test_QUERY_account_server_error(self):
+        with save_globals():
+            proxy_server.http_connect =\
+            fake_http_connect(500, 500, 500, 500, 500)
+            proxyquery.http_connect = \
+            fake_http_connect(500, 500, 500, 500, 500)
+            prosrv = _test_servers[0]
+            conf = [
+                    {
+                    'name':'sort',
+                    'exec':{'path':'/c/exe'},
+                    'file_list':[
+                            {'device':'stdin', 'path':'/c*'}
+                    ]
+                }
+            ]
+            conf = json.dumps(conf)
+            req = self.zerovm_request()
+            req.body = conf
+            res = req.get_response(prosrv)
+            self.assertEqual(res.status_int, 400)
+            self.assertEqual(res.body, 'Error querying object server for account a')
 
     def test_QUERY_response_client_disconnect_attr(self):
         raise SkipTest
@@ -1061,7 +1438,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                     if ix > 1:
                         break
                 res.app_iter.close()
-                self.assertEquals(res.bytes_transferred, 5)
+                self.assertEqual(res.bytes_transferred, 5)
                 self.assert_(hasattr(res, 'client_disconnect'))
                 self.assert_(res.client_disconnect)
             finally:
@@ -1092,7 +1469,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
-        self.assertEquals(headers[:len(exp)], exp)
+        self.assertEqual(headers[:len(exp)], exp)
         #run the query
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
@@ -1107,7 +1484,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 404'
-        self.assertEquals(headers[:len(exp)], exp)
+        self.assertEqual(headers[:len(exp)], exp)
 
     def test_QUERY_chunked_lobjects(self):
         raise SkipTest
@@ -1122,7 +1499,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
-        self.assertEquals(headers[:len(exp)], exp)
+        self.assertEqual(headers[:len(exp)], exp)
         # Create the object segments
         segment_etags = []
         for segment in xrange(5):
@@ -1134,7 +1511,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
             fd.flush()
             headers = readuntil2crlfs(fd)
             exp = 'HTTP/1.1 201'
-            self.assertEquals(headers[:len(exp)], exp)
+            self.assertEqual(headers[:len(exp)], exp)
             segment_etags.append(md5('1234 ').hexdigest())
             # Create the object manifest file
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
@@ -1147,7 +1524,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
-        self.assertEquals(headers[:len(exp)], exp)
+        self.assertEqual(headers[:len(exp)], exp)
         # Ensure retrieving the manifest file gets the whole object
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
@@ -1157,14 +1534,14 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 200'
-        self.assertEquals(headers[:len(exp)], exp)
+        self.assertEqual(headers[:len(exp)], exp)
         self.assert_('X-Object-Manifest: segmented2/name/' in headers)
         self.assert_('Content-Type: text/jibberish' in headers)
         self.assert_('Foo: barbaz' in headers)
         expected_etag = md5(''.join(segment_etags)).hexdigest()
         self.assert_('Etag: "%s"' % expected_etag in headers)
         body = fd.read()
-        self.assertEquals(body, '1234 1234 1234 1234 1234 ')
+        self.assertEqual(body, '1234 1234 1234 1234 1234 ')
         # Do it again but exceeding the container listing limit
         proxy_server.CONTAINER_LISTING_LIMIT = 2
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
@@ -1175,13 +1552,13 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 200'
-        self.assertEquals(headers[:len(exp)], exp)
+        self.assertEqual(headers[:len(exp)], exp)
         self.assert_('X-Object-Manifest: segmented2/name/' in headers)
         self.assert_('Content-Type: text/jibberish' in headers)
         body = fd.read()
         # A bit fragile of a test; as it makes the assumption that all
         # will be sent in a single chunk.
-        self.assertEquals(body,
+        self.assertEqual(body,
             '19\r\n1234 1234 1234 1234 1234 \r\n0\r\n\r\n')
         # Make a copy of the manifested object, which should
         # error since the number of segments exceeds
@@ -1195,7 +1572,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 413'
-        self.assertEquals(headers[:len(exp)], exp)
+        self.assertEqual(headers[:len(exp)], exp)
         body = fd.read()
 
     def test_QUERY_chunked(self):
@@ -1245,7 +1622,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
             self.proxy_app.memcache.store = {}
             self.proxy_app.update_request(req)
             res = controller.zerovm_query(req)
-            self.assertEquals(res.status_int, 200)
+            self.assertEqual(res.status_int, 200)
 
     def test_QUERY_zerovm_maxnexe(self):
         raise SkipTest
@@ -1261,7 +1638,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
             controller.zerovm_maxnexe = 0
             res = controller.QUERY(req)
             res.body
-            self.assertEquals(res.status_int, 413)
+            self.assertEqual(res.status_int, 413)
 
     def test_QUERY_connection_getexpect_timeout(self):
         raise SkipTest
@@ -1362,7 +1739,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 body='1234567890')
             self.app.update_request(req)
             resp = controller.QUERY(req)
-            self.assertEquals(resp.status, '408 Request Timeout')
+            self.assertEqual(resp.status, '408 Request Timeout')
 
     def test_QUERY_connection_send_fail(self):
         raise SkipTest
@@ -1408,7 +1785,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
             self.app.update_request(req)
             res = controller.QUERY(req)
             res.body
-            self.assertEquals(res.status_int, 499)
+            self.assertEqual(res.status_int, 499)
 
     def test_QUERY_file_iter_fail(self):
         raise SkipTest
@@ -1516,7 +1893,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                 body='1234567890')
             self.app.update_request(req)
             resp = controller.QUERY(req)
-            self.assertEquals(resp.status, '499 Client Disconnect')
+            self.assertEqual(resp.status, '499 Client Disconnect')
 
     def test_QUERY_connection_getresponse2_timeout(self):
         raise SkipTest
@@ -1621,7 +1998,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         self.app.update_request(req)
         res = controller.QUERY(req)
         expected = str(expected)
-        self.assertEquals(res.status[:len(expected)], expected)
+        self.assertEqual(res.status[:len(expected)], expected)
     test_status_map((200, 200, 201, 201, -1), 201)
     test_status_map((200, 200, 201, 201, -2), 201)  # expect timeout
     test_status_map((200, 200, 201, 201, -3), 201)  # error limited
@@ -1678,7 +2055,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         self.app.update_request(req)
         res = controller.QUERY(req)
         expected = str(expected)
-        self.assertEquals(res.status[:len(expected)], expected)
+        self.assertEqual(res.status[:len(expected)], expected)
     test_status_map((200, 200, 201, -1, 201), 201)
     test_status_map((200, 200, 201, -1, -1), 503)
     test_status_map((200, 200, 503, 503, -1), 503)
@@ -1692,7 +2069,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         'Content-Type': 'foo/bar'})
     self.app.update_request(req)
     res = controller.QUERY(req)
-    self.assertEquals(res.status_int, 413)
+    self.assertEqual(res.status_int, 413)
     def test_QUERY_getresponse_exceptions(self):
 
     def mock_http_connect(*code_iter, **kwargs):
@@ -1738,7 +2115,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         self.app.update_request(req)
         res = controller.QUERY(req)
         expected = str(expected)
-        self.assertEquals(res.status[:len(str(expected))],
+        self.assertEqual(res.status[:len(str(expected))],
                           str(expected))
     test_status_map((200, 200, 201, 201, -1), 201)
     test_status_map((200, 200, 201, -1, -1), 503)
@@ -1780,7 +2157,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fake_http_connect(200, 200, 201, 201, 201)
         #                 acct cont obj  obj  obj
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
+    self.assertEqual(resp.status_int, 201)
     self.app.client_timeout = 0.1
     req = Request.blank('/a/c/o',
         environ={'REQUEST_METHOD': 'PUT', 'wsgi.input': SlowBody()},
@@ -1790,7 +2167,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fake_http_connect(201, 201, 201)
         #                 obj  obj  obj
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 408)
+    self.assertEqual(resp.status_int, 408)
     def test_QUERY_client_disconnect(self):
     with save_globals():
     self.app.account_ring.get_nodes('account')
@@ -1824,7 +2201,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fake_http_connect(200, 200, 201, 201, 201)
         #                 acct cont obj  obj  obj
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 499)
+    self.assertEqual(resp.status_int, 499)
     def test_QUERY_node_read_timeout(self):
     with save_globals():
     self.app.account_ring.get_nodes('account')
@@ -1887,7 +2264,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
     proxy_server.http_connect = \
         fake_http_connect(200, 200, 201, 201, 201, slow=True)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
+    self.assertEqual(resp.status_int, 201)
     self.app.node_timeout = 0.1
     proxy_server.http_connect = \
         fake_http_connect(201, 201, 201, slow=True)
@@ -1897,7 +2274,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         body='    ')
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 503)
+    self.assertEqual(resp.status_int, 503)
     def test_QUERY_iter_nodes(self):
     with save_globals():
     try:
@@ -1910,7 +2287,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         for node in controller.iter_nodes(partition, nodes,
                                           self.app.object_ring):
             collected_nodes.append(node)
-        self.assertEquals(len(collected_nodes), 5)
+        self.assertEqual(len(collected_nodes), 5)
 
         self.app.object_ring.max_more_nodes = 20
         controller = proxy_server.ObjectController(self.app, 'account',
@@ -1921,7 +2298,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         for node in controller.iter_nodes(partition, nodes,
                                           self.app.object_ring):
             collected_nodes.append(node)
-        self.assertEquals(len(collected_nodes), 9)
+        self.assertEqual(len(collected_nodes), 9)
     finally:
         self.app.object_ring.max_more_nodes = 0
     def test_QUERY_proxy_passes_content_type(self):
@@ -1932,17 +2309,17 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                                                'container', 'object')
     proxy_server.http_connect = fake_http_connect(200, 200, 200)
     resp = controller.GET(req)
-    self.assertEquals(resp.status_int, 200)
-    self.assertEquals(resp.content_type, 'x-application/test')
+    self.assertEqual(resp.status_int, 200)
+    self.assertEqual(resp.content_type, 'x-application/test')
     proxy_server.http_connect = fake_http_connect(200, 200, 200)
     resp = controller.GET(req)
-    self.assertEquals(resp.status_int, 200)
-    self.assertEquals(resp.content_length, 0)
+    self.assertEqual(resp.status_int, 200)
+    self.assertEqual(resp.content_length, 0)
     proxy_server.http_connect = \
         fake_http_connect(200, 200, 200, slow=True)
     resp = controller.GET(req)
-    self.assertEquals(resp.status_int, 200)
-    self.assertEquals(resp.content_length, 4)
+    self.assertEqual(resp.status_int, 200)
+    self.assertEqual(resp.content_length, 4)
     def test_QUERY_proxy_passes_content_length(self):
     with save_globals():
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'HEAD'})
@@ -1951,24 +2328,24 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                                                'container', 'object')
     proxy_server.http_connect = fake_http_connect(200, 200, 200)
     resp = controller.HEAD(req)
-    self.assertEquals(resp.status_int, 200)
-    self.assertEquals(resp.content_length, 0)
+    self.assertEqual(resp.status_int, 200)
+    self.assertEqual(resp.content_length, 0)
     proxy_server.http_connect = \
         fake_http_connect(200, 200, 200, slow=True)
     resp = controller.HEAD(req)
-    self.assertEquals(resp.status_int, 200)
-    self.assertEquals(resp.content_length, 4)
+    self.assertEqual(resp.status_int, 200)
+    self.assertEqual(resp.content_length, 4)
     def test_QUERY_error_limiting(self):
     with save_globals():
     proxy_server.shuffle = lambda l: None
     controller = proxy_server.ObjectController(self.app, 'account',
                                                'container', 'object')
     self.assert_status_map(controller.HEAD, (503, 200, 200), 200)
-    self.assertEquals(controller.app.object_ring.devs[0]['errors'], 2)
+    self.assertEqual(controller.app.object_ring.devs[0]['errors'], 2)
     self.assert_('last_error' in controller.app.object_ring.devs[0])
     for _junk in xrange(self.app.error_suppression_limit):
         self.assert_status_map(controller.HEAD, (503, 503, 503), 503)
-    self.assertEquals(controller.app.object_ring.devs[0]['errors'],
+    self.assertEqual(controller.app.object_ring.devs[0]['errors'],
                       self.app.error_suppression_limit + 1)
     self.assert_status_map(controller.HEAD, (200, 200, 200), 503)
     self.assert_('last_error' in controller.app.object_ring.devs[0])
@@ -1998,49 +2375,49 @@ errdump(0, retcode, mnfst.NexeEtag, status)
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'DELETE'})
     self.app.update_request(req)
     resp = getattr(controller, 'DELETE')(req)
-    self.assertEquals(resp.status_int, 200)
+    self.assertEqual(resp.status_int, 200)
 
     proxy_server.http_connect = \
         fake_http_connect(404, 404, 404)
         #                 acct acct acct
     resp = getattr(controller, 'DELETE')(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
 
     proxy_server.http_connect = \
         fake_http_connect(503, 404, 404)
         #                 acct acct acct
     resp = getattr(controller, 'DELETE')(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
 
     proxy_server.http_connect = \
         fake_http_connect(503, 503, 404)
         #                 acct acct acct
     resp = getattr(controller, 'DELETE')(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
 
     proxy_server.http_connect = \
         fake_http_connect(503, 503, 503)
         #                 acct acct acct
     resp = getattr(controller, 'DELETE')(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
 
     proxy_server.http_connect = \
         fake_http_connect(200, 200, 204, 204, 204)
         #                 acct cont obj  obj  obj
     resp = getattr(controller, 'DELETE')(req)
-    self.assertEquals(resp.status_int, 204)
+    self.assertEqual(resp.status_int, 204)
 
     proxy_server.http_connect = \
         fake_http_connect(200, 404, 404, 404)
         #                 acct cont cont cont
     resp = getattr(controller, 'DELETE')(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
 
     proxy_server.http_connect = \
         fake_http_connect(200, 503, 503, 503)
         #                 acct cont cont cont
     resp = getattr(controller, 'DELETE')(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
 
     for dev in self.app.account_ring.devs.values():
         dev['errors'] = self.app.error_suppression_limit + 1
@@ -2050,7 +2427,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #                 acct [isn't actually called since everything
         #                       is error limited]
     resp = getattr(controller, 'DELETE')(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
 
     for dev in self.app.account_ring.devs.values():
         dev['errors'] = 0
@@ -2062,7 +2439,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #                 acct cont [isn't actually called since
         #                            everything is error limited]
     resp = getattr(controller, 'DELETE')(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
     def test_QUERY_PUT_POST_requires_container_exist(self):
     with save_globals():
     self.app.object_post_as_copy = False
@@ -2075,7 +2452,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'})
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
 
     proxy_server.http_connect = \
         fake_http_connect(200, 404, 404, 404, 200, 200)
@@ -2083,7 +2460,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                         headers={'Content-Type': 'text/plain'})
     self.app.update_request(req)
     resp = controller.POST(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
     def test_QUERY_PUT_POST_as_copy_requires_container_exist(self):
     with save_globals():
     self.app.memcache = FakeMemcacheReturnsNone()
@@ -2094,7 +2471,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'})
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
 
     proxy_server.http_connect = \
         fake_http_connect(200, 404, 404, 404, 200, 200, 200, 200, 200,
@@ -2103,7 +2480,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                         headers={'Content-Type': 'text/plain'})
     self.app.update_request(req)
     resp = controller.POST(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
     def test_QUERY_bad_metadata(self):
     with save_globals():
     controller = proxy_server.ObjectController(self.app, 'account',
@@ -2115,7 +2492,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                         headers={'Content-Length': '0'})
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
+    self.assertEqual(resp.status_int, 201)
 
     proxy_server.http_connect = fake_http_connect(201, 201, 201)
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2124,7 +2501,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                     MAX_META_NAME_LENGTH): 'v'})
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
+    self.assertEqual(resp.status_int, 201)
     proxy_server.http_connect = fake_http_connect(201, 201, 201)
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
         headers={'Content-Length': '0',
@@ -2132,7 +2509,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                     (MAX_META_NAME_LENGTH + 1)): 'v'})
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 400)
+    self.assertEqual(resp.status_int, 400)
 
     proxy_server.http_connect = fake_http_connect(201, 201, 201)
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2141,7 +2518,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                     MAX_META_VALUE_LENGTH})
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
+    self.assertEqual(resp.status_int, 201)
     proxy_server.http_connect = fake_http_connect(201, 201, 201)
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
         headers={'Content-Length': '0',
@@ -2149,7 +2526,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                     (MAX_META_VALUE_LENGTH + 1)})
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 400)
+    self.assertEqual(resp.status_int, 400)
 
     proxy_server.http_connect = fake_http_connect(201, 201, 201)
     headers = {'Content-Length': '0'}
@@ -2159,7 +2536,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                         headers=headers)
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
+    self.assertEqual(resp.status_int, 201)
     proxy_server.http_connect = fake_http_connect(201, 201, 201)
     headers = {'Content-Length': '0'}
     for x in xrange(MAX_META_COUNT + 1):
@@ -2168,7 +2545,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                         headers=headers)
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 400)
+    self.assertEqual(resp.status_int, 400)
 
     proxy_server.http_connect = fake_http_connect(201, 201, 201)
     headers = {'Content-Length': '0'}
@@ -2187,7 +2564,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                         headers=headers)
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
+    self.assertEqual(resp.status_int, 201)
     proxy_server.http_connect = fake_http_connect(201, 201, 201)
     headers['X-Object-Meta-a'] = \
         'a' * (MAX_META_OVERALL_SIZE - size)
@@ -2195,7 +2572,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                         headers=headers)
     self.app.update_request(req)
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 400)
+    self.assertEqual(resp.status_int, 400)
     def test_QUERY_copy_from(self):
     with save_globals():
     controller = proxy_server.ObjectController(self.app, 'account',
@@ -2208,7 +2585,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         fake_http_connect(200, 200, 201, 201, 201)
         #                 acct cont obj  obj  obj
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
+    self.assertEqual(resp.status_int, 201)
 
     # basic copy
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2222,8 +2599,8 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #   obj
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
-    self.assertEquals(resp.headers['x-copied-from'], 'c/o')
+    self.assertEqual(resp.status_int, 201)
+    self.assertEqual(resp.headers['x-copied-from'], 'c/o')
 
     # non-zero content length
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2235,7 +2612,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #                 acct cont acct cont objc objc objc
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 400)
+    self.assertEqual(resp.status_int, 400)
 
     # extra source path parsing
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2249,8 +2626,8 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #   obj
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
-    self.assertEquals(resp.headers['x-copied-from'], 'c/o/o2')
+    self.assertEqual(resp.status_int, 201)
+    self.assertEqual(resp.headers['x-copied-from'], 'c/o/o2')
 
     # space in soure path
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2264,8 +2641,8 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #   obj
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
-    self.assertEquals(resp.headers['x-copied-from'], 'c/o%20o2')
+    self.assertEqual(resp.status_int, 201)
+    self.assertEqual(resp.headers['x-copied-from'], 'c/o%20o2')
 
     # repeat tests with leading /
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2279,8 +2656,8 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #   obj
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
-    self.assertEquals(resp.headers['x-copied-from'], 'c/o')
+    self.assertEqual(resp.status_int, 201)
+    self.assertEqual(resp.headers['x-copied-from'], 'c/o')
 
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                         headers={'Content-Length': '0',
@@ -2293,8 +2670,8 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #   obj
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
-    self.assertEquals(resp.headers['x-copied-from'], 'c/o/o2')
+    self.assertEqual(resp.status_int, 201)
+    self.assertEqual(resp.headers['x-copied-from'], 'c/o/o2')
 
     # negative tests
 
@@ -2305,7 +2682,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
     self.app.update_request(req)
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int // 100, 4)  # client error
+    self.assertEqual(resp.status_int // 100, 4)  # client error
 
     # server error
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2317,7 +2694,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #                 acct cont objc objc objc
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 503)
+    self.assertEqual(resp.status_int, 503)
 
     # not found
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2329,7 +2706,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #                 acct cont objc objc objc
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 404)
+    self.assertEqual(resp.status_int, 404)
 
     # some missing containers
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2341,7 +2718,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #                 acct cont objc objc objc obj  obj  obj
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
+    self.assertEqual(resp.status_int, 201)
 
     # test object meta data
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2354,10 +2731,10 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         #                 acct cont objc objc objc obj  obj  obj
     self.app.memcache.store = {}
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int, 201)
-    self.assertEquals(resp.headers.get('x-object-meta-test'),
+    self.assertEqual(resp.status_int, 201)
+    self.assertEqual(resp.headers.get('x-object-meta-test'),
                       'testing')
-    self.assertEquals(resp.headers.get('x-object-meta-ours'), 'okay')
+    self.assertEqual(resp.headers.get('x-object-meta-ours'), 'okay')
     def test_QUERY_client_ip_logging(self):
     # test that the client ip field in the log gets populated with the
     # ip instead of being blank
@@ -2383,7 +2760,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
     fd.flush()
     headers = readuntil2crlfs(fd)
     exp = 'HTTP/1.1 200'
-    self.assertEquals(headers[:len(exp)], exp)
+    self.assertEqual(headers[:len(exp)], exp)
     exp = '127.0.0.1 127.0.0.1'
     self.assert_(exp in prosrv.logger.msg)
     def test_QUERY_mismatched_etags(self):
@@ -2400,7 +2777,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                '68b329da9893e34099c7d8ad5cb9c940',
                '68b329da9893e34099c7d8ad5cb9c941'])
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int // 100, 5)  # server error
+    self.assertEqual(resp.status_int // 100, 5)  # server error
 
     # req supplies etag, object servers return 422 - mismatch
     req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -2415,7 +2792,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
                None,
                None])
     resp = controller.PUT(req)
-    self.assertEquals(resp.status_int // 100, 4)  # client error
+    self.assertEqual(resp.status_int // 100, 4)  # client error
     def test_QUERY_copy_zero_bytes_transferred_attr(self):
     with save_globals():
     proxy_server.http_connect = \
@@ -2429,7 +2806,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
     self.app.update_request(req)
     res = controller.PUT(req)
     self.assert_(hasattr(req, 'bytes_transferred'))
-    self.assertEquals(req.bytes_transferred, 0)
+    self.assertEqual(req.bytes_transferred, 0)
     def test_QUERY_response_bytes_transferred_attr(self):
     with save_globals():
     proxy_server.http_connect = \
@@ -2441,5 +2818,5 @@ errdump(0, retcode, mnfst.NexeEtag, status)
     res = controller.GET(req)
     res.body
     self.assert_(hasattr(res, 'bytes_transferred'))
-    self.assertEquals(res.bytes_transferred, 10)
+    self.assertEqual(res.bytes_transferred, 10)
     '''

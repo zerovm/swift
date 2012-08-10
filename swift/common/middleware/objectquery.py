@@ -352,7 +352,7 @@ class ObjectQueryMiddleware(object):
                     written = self.os_interface.write(zerovm_inputmnfst_fd,
                         zerovm_inputmnfst)
                     zerovm_inputmnfst = zerovm_inputmnfst[written:]
-                print zerovm_inputmnfst
+
                 def ex_zerovm():
                     cmdline = []
                     cmdline += self.zerovm_exename
