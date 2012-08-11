@@ -165,9 +165,25 @@ class DiskFile(object):
             if self.fp.tell() == 0:
                 self.started_at_0 = True
                 self.iter_etag = md5()
+            to_read = None
+            if 'Content-Length' in self.metadata:
+                to_read = int(self.metadata['Content-Length']) - self.fp.tell()
             while True:
                 chunk = self.fp.read(self.disk_chunk_size)
                 if chunk:
+                    if to_read is not None:
+                        to_read -= len(chunk)
+                        if to_read < 0:
+                            if self.iter_etag:
+                                self.iter_etag.update(chunk[:to_read])
+                            yield chunk[:to_read]
+                            if self.iter_hook:
+                                self.iter_hook()
+                            self.read_to_eof = True
+                            self.drop_cache(self.fp.fileno(), dropped_cache,
+                                read + len(chunk) +
+                                to_read - dropped_cache)
+                            break
                     if self.iter_etag:
                         self.iter_etag.update(chunk)
                     read += len(chunk)
@@ -336,11 +352,14 @@ class DiskFile(object):
             file_size = 0
             if self.data_file:
                 file_size = os.path.getsize(self.data_file)
+                metadata_size = None
                 if 'Content-Length' in self.metadata:
                     metadata_size = int(self.metadata['Content-Length'])
-                    if file_size != metadata_size:
+                    if file_size < metadata_size:
                         raise DiskFileError('Content-Length of %s does not '
                           'match file size of %s' % (metadata_size, file_size))
+                if metadata_size:
+                    return metadata_size
                 return file_size
         except OSError, err:
             if err.errno != errno.ENOENT:
