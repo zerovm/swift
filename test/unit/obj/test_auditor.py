@@ -86,7 +86,7 @@ class TestAuditor(unittest.TestCase):
             self.auditor.object_audit(
                 os.path.join(self.disk_file.datadir, timestamp + '.data'),
                 'sda', '0')
-            self.assertEquals(self.auditor.quarantines, pre_quarantines + 1)
+            self.assertEquals(self.auditor.quarantines, pre_quarantines)
 
     def test_object_audit_diff_data(self):
         self.auditor = auditor.AuditorWorker(self.conf)
@@ -181,11 +181,11 @@ class TestAuditor(unittest.TestCase):
             metadata = {
                 'ETag': etag,
                 'X-Timestamp': timestamp,
-                'Content-Length': str(os.fstat(fd).st_size),
+                'Content-Length': str(os.fstat(fd).st_size - 1),
             }
             self.disk_file.put(fd, tmppath, metadata)
             self.disk_file.close()
-            os.write(fd, 'extra_data')
+            #os.write(fd, 'extra_data')
         self.auditor.audit_all_objects()
         self.assertEquals(self.auditor.quarantines, pre_quarantines + 1)
 
@@ -218,11 +218,11 @@ class TestAuditor(unittest.TestCase):
             metadata = {
                 'ETag': etag,
                 'X-Timestamp': timestamp,
-                'Content-Length': str(os.fstat(fd).st_size),
+                'Content-Length': str(os.fstat(fd).st_size - 1),
             }
             self.disk_file.put(fd, tmppath, metadata)
             self.disk_file.close()
-            os.write(fd, 'extra_data')
+            #os.write(fd, 'extra_data')
         self.auditor.audit_all_objects()
         self.assertEquals(self.auditor.quarantines, pre_quarantines + 1)
 
