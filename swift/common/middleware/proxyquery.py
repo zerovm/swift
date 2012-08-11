@@ -114,6 +114,8 @@ class NameService(object):
                         self.sock.sendto(reply, (peer_map[src][0], peer_map[src][1]))
             except greenlet.GreenletExit:
                 return
+            except Exception:
+                pass
 
     def stop(self):
         self.thread.kill()
