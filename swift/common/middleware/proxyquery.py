@@ -8,7 +8,7 @@ import time
 from hashlib import md5
 from eventlet import GreenPile, GreenPool
 import greenlet
-from swift.common.client import quote
+from swiftclient.client import quote
 
 try:
     import simplejson as json

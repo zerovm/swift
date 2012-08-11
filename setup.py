@@ -96,7 +96,7 @@ setup(
             'proxy_logging=swift.common.middleware.proxy_logging:'
                 'filter_factory',
             'proxy_query=swift.common.middleware.proxyquery:filter_factory',
-            'object_query=swift.common.middleware.object_query:filter_factory'
+            'object_query=swift.common.middleware.objectquery:filter_factory'
             ],
         },
     )
