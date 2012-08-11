@@ -176,7 +176,7 @@ class TestDiskFile(unittest.TestCase):
                 metadata['ETag'] = etag
                 object_server.write_metadata(fd, metadata)
             if invalid_type == 'Content-Length':
-                metadata['Content-Length'] = fsize - 1
+                metadata['Content-Length'] = fsize + 1
                 object_server.write_metadata(fd, metadata)
 
         df = object_server.DiskFile(self.testdir, 'sda1', '0', 'a', 'c',
