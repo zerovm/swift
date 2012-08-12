@@ -39,6 +39,7 @@ from swift.common.utils import mkdirs, normalize_timestamp, public, \
     storage_directory, hash_path, renamer, fallocate, \
     split_path, drop_buffer_cache, get_logger, write_pickle, \
     TRUE_VALUES, validate_device_partition
+from swift.common import resumable_md5 as rmd5
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_object_creation, check_mount, \
     check_float, check_utf8
@@ -279,6 +280,17 @@ class DiskFile(object):
                 pass
             try:
                 os.unlink(tmppath)
+            except OSError:
+                pass
+
+    @contextmanager
+    def get_appendable_file(self):
+        appendable_fd = open(self.data_file, 'ab')
+        try:
+            yield appendable_fd, self.data_file
+        finally:
+            try:
+                os.close(appendable_fd)
             except OSError:
                 pass
 
@@ -600,12 +612,18 @@ class ObjectController(object):
                         obj, self.logger, disk_chunk_size=self.disk_chunk_size)
         orig_timestamp = file.metadata.get('X-Timestamp')
         upload_expiration = time.time() + self.max_upload_time
-        etag = md5()
+        etag = rmd5.md5()
         upload_size = 0
         last_sync = 0
-        with file.mkstemp() as (fd, tmppath):
+        writable_file = file.mkstemp
+        old_size = 0
+        if 'x-append-data' in request.headers:
+            writable_file = file.get_appendable_file
+            old_size = file.get_data_file_size()
+            etag = etag.set_state(file.metadata.get('Md5-State', rmd5.md5()))
+        with writable_file() as (fd, tmppath):
             if 'content-length' in request.headers:
-                fallocate(fd, int(request.headers['content-length']))
+                fallocate(fd, int(request.headers['content-length']) + old_size)
             reader = request.environ['wsgi.input'].read
             for chunk in iter(lambda: reader(self.network_chunk_size), ''):
                 upload_size += len(chunk)
@@ -626,6 +644,7 @@ class ObjectController(object):
             if 'content-length' in request.headers and \
                     int(request.headers['content-length']) != upload_size:
                 return HTTPClientDisconnect(request=request)
+            rmd5_state = etag.get_state()
             etag = etag.hexdigest()
             if 'etag' in request.headers and \
                             request.headers['etag'].lower() != etag:
@@ -635,6 +654,7 @@ class ObjectController(object):
                 'Content-Type': request.headers['content-type'],
                 'ETag': etag,
                 'Content-Length': str(os.fstat(fd).st_size),
+                'Md5-State': rmd5_state
             }
             metadata.update(val for val in request.headers.iteritems()
                     if val[0].lower().startswith('x-object-meta-') and

@@ -27,6 +27,7 @@ from tempfile import mkdtemp
 from hashlib import md5
 
 from eventlet import sleep, spawn, wsgi, listen, Timeout
+from swift.obj.server import read_metadata
 from webob import Request
 from test.unit import FakeLogger
 from test.unit import _getxattr as getxattr
@@ -600,13 +601,14 @@ class TestObjectController(unittest.TestCase):
             timestamp + '.data')
         self.assert_(os.path.isfile(objfile))
         self.assertEquals(open(objfile).read(), 'VERIFY')
-        self.assertEquals(pickle.loads(getxattr(objfile,
-                            object_server.METADATA_KEY)),
+        self.assertEquals(read_metadata(objfile),
                           {'X-Timestamp': timestamp,
                            'Content-Length': '6',
                            'ETag': '0b4c12d7e0a73840c1c4f148fda3b037',
                            'Content-Type': 'application/octet-stream',
-                           'name': '/a/c/o'})
+                           'name': '/a/c/o',
+                           'Md5-State': [48L, (1732584193L, 4023233417L,
+                                               2562383102L, 271733878L), 'VERIFY']})
 
     def test_PUT_overwrite(self):
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -631,14 +633,15 @@ class TestObjectController(unittest.TestCase):
             timestamp + '.data')
         self.assert_(os.path.isfile(objfile))
         self.assertEquals(open(objfile).read(), 'VERIFY TWO')
-        self.assertEquals(pickle.loads(getxattr(objfile,
-                            object_server.METADATA_KEY)),
+        self.assertEquals(read_metadata(objfile),
                           {'X-Timestamp': timestamp,
                            'Content-Length': '10',
                            'ETag': 'b381a4c5dab1eaa1eb9711fa647cd039',
                            'Content-Type': 'text/plain',
                            'name': '/a/c/o',
-                           'Content-Encoding': 'gzip'})
+                           'Content-Encoding': 'gzip',
+                            'Md5-State': [80L, (1732584193L, 4023233417L,
+                                                2562383102L, 271733878L),'VERIFY TWO']})
 
     def test_PUT_no_etag(self):
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -674,15 +677,16 @@ class TestObjectController(unittest.TestCase):
             timestamp + '.data')
         self.assert_(os.path.isfile(objfile))
         self.assertEquals(open(objfile).read(), 'VERIFY THREE')
-        self.assertEquals(pickle.loads(getxattr(objfile,
-        object_server.METADATA_KEY)),
+        self.assertEquals(read_metadata(objfile),
                           {'X-Timestamp': timestamp,
                            'Content-Length': '12',
                            'ETag': 'b114ab7b90d9ccac4bd5d99cc7ebb568',
                            'Content-Type': 'text/plain',
                            'name': '/a/c/o',
                            'X-Object-Meta-1': 'One',
-                           'X-Object-Meta-Two': 'Two'})
+                           'X-Object-Meta-Two': 'Two',
+                            'Md5-State': [96L,(1732584193L, 4023233417L,
+                                               2562383102L, 271733878L), 'VERIFY THREE']})
 
     def test_PUT_container_connection(self):
 
@@ -1512,11 +1516,11 @@ class TestObjectController(unittest.TestCase):
             storage_directory(object_server.DATADIR, 'p', hash_path('a', 'c',
             'o')), timestamp + '.data')
         self.assert_(os.path.isfile(objfile))
-        self.assertEquals(pickle.loads(getxattr(objfile,
-            object_server.METADATA_KEY)), {'X-Timestamp': timestamp,
+        self.assertEquals(read_metadata(objfile), {'X-Timestamp': timestamp,
             'Content-Length': '0', 'Content-Type': 'text/plain', 'name':
             '/a/c/o', 'X-Object-Manifest': 'c/o/', 'ETag':
-            'd41d8cd98f00b204e9800998ecf8427e'})
+            'd41d8cd98f00b204e9800998ecf8427e',
+            'Md5-State': [0L, (1732584193L, 4023233417L, 2562383102L, 271733878L), '']})
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
         resp = self.object_controller.GET(req)
         self.assertEquals(resp.status_int, 200)
