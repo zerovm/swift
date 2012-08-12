@@ -610,6 +610,53 @@ class TestObjectController(unittest.TestCase):
                            'Md5-State': [48L, (1732584193L, 4023233417L,
                                                2562383102L, 271733878L), 'VERIFY']})
 
+    def test_PUT_simple_append(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream'})
+        req.body = 'VERIFY'
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+        objfile = os.path.join(self.testdir, 'sda1',
+            storage_directory(object_server.DATADIR, 'p',
+                hash_path('a', 'c', 'o')),
+            timestamp + '.data')
+        self.assert_(os.path.isfile(objfile))
+        self.assertEquals(open(objfile).read(), 'VERIFY')
+        self.assertEquals(read_metadata(objfile),
+                {'X-Timestamp': timestamp,
+                 'Content-Length': '6',
+                 'ETag': '0b4c12d7e0a73840c1c4f148fda3b037',
+                 'Content-Type': 'application/octet-stream',
+                 'name': '/a/c/o',
+                 'Md5-State': [48L, (1732584193L, 4023233417L,
+                                     2562383102L, 271733878L), 'VERIFY']})
+
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp,
+                     'Content-Length': '5',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Append-Data': 1})
+        req.body = ' MORE'
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+        objfile = os.path.join(self.testdir, 'sda1',
+            storage_directory(object_server.DATADIR, 'p',
+                hash_path('a', 'c', 'o')),
+            timestamp + '.data')
+        self.assertEquals(open(objfile).read(), 'VERIFY MORE')
+        self.assertEquals(read_metadata(objfile),
+                {'X-Timestamp': timestamp,
+                 'Content-Length': '11',
+                 'ETag': 'b00eb050e3ed7f91dfe595c0f0051dd5',
+                 'Content-Type': 'application/octet-stream',
+                 'name': '/a/c/o',
+                 'Md5-State': [88L, (1732584193L, 4023233417L,
+                                     2562383102L, 271733878L), 'VERIFY MORE']})
+
     def test_PUT_overwrite(self):
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                 headers={'X-Timestamp': normalize_timestamp(time()),

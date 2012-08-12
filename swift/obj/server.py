@@ -285,12 +285,14 @@ class DiskFile(object):
 
     @contextmanager
     def get_appendable_file(self):
-        appendable_fd = open(self.data_file, 'ab')
+        appendable_fd = open(self.data_file, 'a+b')
+        if 'Content-Length' in self.metadata:
+            appendable_fd.seek(int(self.metadata['Content-Length']))
         try:
-            yield appendable_fd, self.data_file
+            yield appendable_fd.fileno(), self.data_file
         finally:
             try:
-                os.close(appendable_fd)
+                appendable_fd.close()
             except OSError:
                 pass
 
@@ -620,7 +622,8 @@ class ObjectController(object):
         if 'x-append-data' in request.headers:
             writable_file = file.get_appendable_file
             old_size = file.get_data_file_size()
-            etag = etag.set_state(file.metadata.get('Md5-State', rmd5.md5()))
+            if 'Md5-State' in file.metadata:
+                etag.set_state(file.metadata['Md5-State'])
         with writable_file() as (fd, tmppath):
             if 'content-length' in request.headers:
                 fallocate(fd, int(request.headers['content-length']) + old_size)
