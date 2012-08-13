@@ -17,8 +17,10 @@
 
 from __future__ import with_statement
 import cPickle as pickle
+import ctypes
 import errno
 import os
+import struct
 import time
 import traceback
 from datetime import datetime
@@ -38,7 +40,7 @@ from eventlet import sleep, Timeout, tpool
 from swift.common.utils import mkdirs, normalize_timestamp, public, \
     storage_directory, hash_path, renamer, fallocate, \
     split_path, drop_buffer_cache, get_logger, write_pickle, \
-    TRUE_VALUES, validate_device_partition
+    TRUE_VALUES, validate_device_partition, lock_file
 from swift.common import resumable_md5 as rmd5
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_object_creation, check_mount, \
@@ -55,6 +57,9 @@ DATADIR = 'objects'
 ASYNCDIR = 'async_pending'
 PICKLE_PROTOCOL = 2
 METADATA_KEY = 'user.swift.metadata'
+REVSDATA_KEY = 'user.swift.revsdata'
+REVSDATA_STRIDE = 32
+REVSDATA_ITEM_SIZE = 112
 MAX_OBJECT_NAME_LENGTH = 1024
 # keep these lower-case
 DISALLOWED_HEADERS = set('content-length content-type deleted etag'.split())
@@ -93,6 +98,51 @@ def write_metadata(fd, metadata):
         metastr = metastr[254:]
         key += 1
 
+def read_revsdata(fd, rev_num):
+    """
+    Helper function to read append revisions data for particular object revision
+
+    :param fd: file descriptor to load data from
+    :param rev_num: revision number to get
+    :returns: list of revision dictionaries,
+        empty list for non-existing revisions
+
+    We load revision data in bulks of REVSDATA_STRIDE revisions at once
+    """
+    revsdata = ''
+    key = rev_num // REVSDATA_STRIDE
+    try:
+        revsdata = getxattr(fd, '%s%s' % (REVSDATA_KEY, (key or '')))
+    except IOError:
+        pass
+    result = []
+    while revsdata:
+        state = [0,0,0,0]
+        size, count, state[0], state[1], state[2], state[3], buffer = \
+            struct.unpack_from('!6Q64s', revsdata)[0:7]
+        md5 = rmd5.md5()
+        md5.set_state([count, state, buffer])
+        result.append({'size':size, 'md5':md5})
+        revsdata = revsdata[REVSDATA_ITEM_SIZE:]
+    return result
+
+def write_revsdata(fd, rev_num, revsdata):
+    """
+    Helper function to write append revisions data into object file attributes
+
+    :param fd: file descriptor to write data to
+    :param rev_num: revision number to write
+    :param revsdata: list of revision data to write
+    """
+    key = rev_num // REVSDATA_STRIDE
+    data = ctypes.create_string_buffer(len(revsdata) * REVSDATA_ITEM_SIZE)
+    offset = 0
+    for item in revsdata:
+        count, state, buffer = item['md5'].get_state()
+        struct.pack_into('!6Q64s', data, offset, item['size'],
+            count, state[0], state[1], state[2], state[3], buffer)
+        offset += REVSDATA_ITEM_SIZE
+    setxattr(fd, '%s%s' % (REVSDATA_KEY, key or ''), data)
 
 class DiskFile(object):
     """
@@ -130,6 +180,9 @@ class DiskFile(object):
         self.read_to_eof = False
         self.quarantined_dir = None
         self.keep_cache = False
+        # we do a lazy open for revision data to reduce disk access
+        self.revision_data = None
+        self.revision_key = None
         if not os.path.exists(self.datadir):
             return
         files = sorted(os.listdir(self.datadir), reverse=True)
@@ -283,20 +336,15 @@ class DiskFile(object):
             except OSError:
                 pass
 
-    @contextmanager
     def get_appendable_file(self):
-        appendable_fd = open(self.data_file, 'a+b')
-        if 'Content-Length' in self.metadata:
-            appendable_fd.seek(int(self.metadata['Content-Length']))
-        try:
-            yield appendable_fd.fileno(), self.data_file
-        finally:
-            try:
-                appendable_fd.close()
-            except OSError:
-                pass
+        """
+        Contextmanager to get a file descriptor for append
 
-    def put(self, fd, tmppath, metadata, extension='.data'):
+        :returns: locked writable data file descriptor
+        """
+        return lock_file(self.data_file, unlink=False)
+
+    def put(self, fd, tmppath, metadata, revision=None, extension='.data'):
         """
         Finalize writing the file on disk, and renames it from the temp file to
         the real location.  This should be called after the data has been
@@ -305,16 +353,37 @@ class DiskFile(object):
         :params fd: file descriptor of the temp file
         :param tmppath: path to the temporary file being used
         :param metadata: dictionary of metadata to be written
+        :param revision: revision data to be written
         :param extension: extension to be used when making the file
         """
         metadata['name'] = self.name
         timestamp = normalize_timestamp(metadata['X-Timestamp'])
+        if revision is not None:
+            self.add_revision(fd, revision, metadata)
         write_metadata(fd, metadata)
         if 'Content-Length' in metadata:
             self.drop_cache(fd, 0, int(metadata['Content-Length']))
         tpool.execute(os.fsync, fd)
         invalidate_hash(os.path.dirname(self.datadir))
         renamer(tmppath, os.path.join(self.datadir, timestamp + extension))
+        self.metadata = metadata
+
+    def append(self, fd, metadata, revision):
+        """
+        Finalize appending file on disk, will write the revision information
+        to the revision extended attribute
+        writes metadata to the metadata attributes
+
+        :params fd: file descriptor of the data file we appended to
+        :param metadata: dictionary of metadata to be written
+        :param revision: new revision data to be added
+        """
+        metadata['name'] = self.name
+        if 'Content-Length' in metadata:
+            self.drop_cache(fd, 0, int(metadata['Content-Length']))
+        tpool.execute(os.fsync, fd)
+        self.add_revision(fd, revision, metadata)
+        write_metadata(fd, metadata)
         self.metadata = metadata
 
     def unlinkold(self, timestamp):
@@ -355,7 +424,7 @@ class DiskFile(object):
     def get_data_file_size(self):
         """
         Returns the os.path.getsize for the file.  Raises an exception if this
-        file does not match the Content-Length stored in the metadata. Or if
+        file is smaller than Content-Length stored in the metadata. Or if
         self.data_file does not exist.
 
         :returns: file size as an int
@@ -379,6 +448,45 @@ class DiskFile(object):
             if err.errno != errno.ENOENT:
                 raise
         raise DiskFileNotExist('Data File does not exist.')
+
+    def get_revision(self, fd, rev_num):
+        """
+        Get the requested revision dictionary,
+        it will load the revision information from disk if needed
+
+        :param fd: file descriptor to load data from
+        :param rev_num: revision number to load and get,
+            if < 0 the latest existing revision is loaded
+        :returns: revision dictionary for the revision number,
+            returns None if such revision does not exist yet
+        """
+        if rev_num < 0: #get latest revision
+            rev_num = int(self.metadata['Revision'])
+        key = rev_num // REVSDATA_STRIDE
+        if self.revision_key != key:
+                self.revision_data = read_revsdata(fd, rev_num)
+                self.revision_key = key
+        try:
+            result = self.revision_data[rev_num % REVSDATA_STRIDE]
+        except IndexError:
+            return None
+        return result
+
+    def add_revision(self, fd, rev, metadata):
+        """
+        Add new revision data to the file attributes and write it to disk
+
+        :param fd: file descriptor to use
+        :param rev: revision dictionary to add
+        :param metadata: metadata to update with the new revision number
+        """
+        rev_num = 0
+        if 'Revision' in metadata:
+            rev_num = int(metadata['Revision']) + 1
+        _junk = self.get_revision(fd, rev_num)
+        self.revision_data.insert(rev_num % REVSDATA_STRIDE, rev)
+        write_revsdata(fd, rev_num, self.revision_data)
+        metadata['Revision'] = str(rev_num)
 
 
 class ObjectController(object):
@@ -547,7 +655,7 @@ class ObjectController(object):
             return HTTPInsufficientStorage(drive=device, request=request)
         file = DiskFile(self.devices, device, partition, account, container,
                         obj, self.logger, disk_chunk_size=self.disk_chunk_size)
-
+        orig_timestamp = file.metadata.get('X-Timestamp')
         if 'X-Delete-At' in file.metadata and \
                 int(file.metadata['X-Delete-At']) <= time.time():
             self.logger.timing_since('POST.timing', start_time)
@@ -561,24 +669,109 @@ class ObjectController(object):
         except (DiskFileError, DiskFileNotExist):
             file.quarantine()
             return HTTPNotFound(request=request)
-        metadata = {'X-Timestamp': request.headers['x-timestamp']}
-        metadata.update(val for val in request.headers.iteritems()
-                if val[0].lower().startswith('x-object-meta-'))
-        for header_key in self.allowed_headers:
-            if header_key in request.headers:
-                header_caps = header_key.title()
-                metadata[header_caps] = request.headers[header_key]
-        old_delete_at = int(file.metadata.get('X-Delete-At') or 0)
-        if old_delete_at != new_delete_at:
-            if new_delete_at:
-                self.delete_at_update('PUT', new_delete_at, account, container,
-                                      obj, request.headers, device)
-            if old_delete_at:
-                self.delete_at_update('DELETE', old_delete_at, account,
-                                      container, obj, request.headers, device)
-        with file.mkstemp() as (fd, tmppath):
-            file.put(fd, tmppath, metadata, extension='.meta')
-        self.logger.timing_since('POST.timing', start_time)
+        if 'x-append-data' in request.headers:
+            try:
+                rev_num = int(request.headers['x-append-data'])
+            except ValueError:
+                return HTTPUnprocessableEntity(request=request)
+            current_rev = int(file.metadata['Revision'])
+            if 0 < rev_num < current_rev:
+                return HTTPBadRequest(body='Revision too old', request=request,
+                    content_type='text/plain')
+            if 0 < rev_num > current_rev:
+                return HTTPBadRequest(body='Revision too new', request=request,
+                    content_type='text/plain')
+            upload_expiration = time.time() + self.max_upload_time
+            upload_size = 0
+            last_sync = 0
+            with file.get_appendable_file() as obj_file:
+                fd = obj_file.fileno()
+                os.lseek(fd, file.get_data_file_size(), os.SEEK_SET)
+                old_rev = file.get_revision(fd, rev_num)
+                new_md5 = rmd5.md5()
+                etag = rmd5.md5()
+                new_md5.set_state(old_rev['md5'].get_state())
+                if 'content-length' in request.headers:
+                    fallocate(fd, int(request.headers['content-length']) + file_size)
+                reader = request.environ['wsgi.input'].read
+                for chunk in iter(lambda: reader(self.network_chunk_size), ''):
+                    upload_size += len(chunk)
+                    if time.time() > upload_expiration:
+                        self.logger.increment('POST.timeouts')
+                        return HTTPRequestTimeout(request=request)
+                    etag.update(chunk)
+                    new_md5.update(chunk)
+                    while chunk:
+                        written = os.write(fd, chunk)
+                        chunk = chunk[written:]
+                        # For large files sync every 512MB (by default) written
+                    if upload_size - last_sync >= self.bytes_per_sync:
+                        tpool.execute(os.fdatasync, fd)
+                        drop_buffer_cache(fd, last_sync, upload_size - last_sync)
+                        last_sync = upload_size
+                    sleep()
+
+                if 'content-length' in request.headers and\
+                   int(request.headers['content-length']) != upload_size:
+                    return HTTPClientDisconnect(request=request)
+                new_rev = {
+                    'md5': new_md5,
+                    'size': os.fstat(fd).st_size
+                }
+                etag = etag.hexdigest()
+                if 'etag' in request.headers and\
+                   request.headers['etag'].lower() != etag:
+                    return HTTPUnprocessableEntity(request=request)
+                etag = rmd5.md5()
+                etag.set_state(new_md5.get_state())
+                metadata = {
+                    'X-Timestamp': orig_timestamp,
+                    'Content-Type': file.metadata['Content-Type'],
+                    'ETag': etag.hexdigest(),
+                    'Content-Length': str(new_rev['size']),
+                    'Revision': str(current_rev)
+                    }
+                for header_key in self.allowed_headers:
+                    if header_key in request.headers:
+                        header_caps = header_key.title()
+                        metadata[header_caps] = request.headers[header_key]
+                old_delete_at = int(file.metadata.get('X-Delete-At') or 0)
+                if old_delete_at != new_delete_at:
+                    if new_delete_at:
+                        self.delete_at_update('PUT', new_delete_at, account,
+                            container, obj, request.headers, device)
+                    if old_delete_at:
+                        self.delete_at_update('DELETE', old_delete_at, account,
+                            container, obj, request.headers, device)
+                file.append(fd, metadata, new_rev)
+            if orig_timestamp < request.headers['x-timestamp']:
+                self.container_update('PUT', account, container, obj,
+                    request.headers,
+                        {'x-size': file.metadata['Content-Length'],
+                         'x-content-type': file.metadata['Content-Type'],
+                         'x-timestamp': file.metadata['X-Timestamp'],
+                         'x-etag': file.metadata['ETag'],
+                         'x-trans-id': request.headers.get('x-trans-id', '-')},
+                    device)
+        else:
+            metadata = {'X-Timestamp': request.headers['x-timestamp']}
+            metadata.update(val for val in request.headers.iteritems()
+                    if val[0].lower().startswith('x-object-meta-'))
+            for header_key in self.allowed_headers:
+                if header_key in request.headers:
+                    header_caps = header_key.title()
+                    metadata[header_caps] = request.headers[header_key]
+            old_delete_at = int(file.metadata.get('X-Delete-At') or 0)
+            if old_delete_at != new_delete_at:
+                if new_delete_at:
+                    self.delete_at_update('PUT', new_delete_at, account, container,
+                                          obj, request.headers, device)
+                if old_delete_at:
+                    self.delete_at_update('DELETE', old_delete_at, account,
+                                          container, obj, request.headers, device)
+            with file.mkstemp() as (fd, tmppath):
+                file.put(fd, tmppath, metadata, extension='.meta')
+            self.logger.timing_since('POST.timing', start_time)
         return response_class(request=request)
 
     @public
@@ -617,16 +810,9 @@ class ObjectController(object):
         etag = rmd5.md5()
         upload_size = 0
         last_sync = 0
-        writable_file = file.mkstemp
-        old_size = 0
-        if 'x-append-data' in request.headers:
-            writable_file = file.get_appendable_file
-            old_size = file.get_data_file_size()
-            if 'Md5-State' in file.metadata:
-                etag.set_state(file.metadata['Md5-State'])
-        with writable_file() as (fd, tmppath):
+        with file.mkstemp() as (fd, tmppath):
             if 'content-length' in request.headers:
-                fallocate(fd, int(request.headers['content-length']) + old_size)
+                fallocate(fd, int(request.headers['content-length']))
             reader = request.environ['wsgi.input'].read
             for chunk in iter(lambda: reader(self.network_chunk_size), ''):
                 upload_size += len(chunk)
@@ -647,7 +833,11 @@ class ObjectController(object):
             if 'content-length' in request.headers and \
                     int(request.headers['content-length']) != upload_size:
                 return HTTPClientDisconnect(request=request)
-            rmd5_state = etag.get_state()
+            rev = {
+                'md5': rmd5.md5(),
+                'size': os.fstat(fd).st_size
+                }
+            rev['md5'].set_state(etag.get_state())
             etag = etag.hexdigest()
             if 'etag' in request.headers and \
                             request.headers['etag'].lower() != etag:
@@ -656,8 +846,7 @@ class ObjectController(object):
                 'X-Timestamp': request.headers['x-timestamp'],
                 'Content-Type': request.headers['content-type'],
                 'ETag': etag,
-                'Content-Length': str(os.fstat(fd).st_size),
-                'Md5-State': rmd5_state
+                'Content-Length': str(rev['size']),
             }
             metadata.update(val for val in request.headers.iteritems()
                     if val[0].lower().startswith('x-object-meta-') and
@@ -674,7 +863,7 @@ class ObjectController(object):
                 if old_delete_at:
                     self.delete_at_update('DELETE', old_delete_at, account,
                         container, obj, request.headers, device)
-            file.put(fd, tmppath, metadata)
+            file.put(fd, tmppath, metadata, rev)
         file.unlinkold(metadata['X-Timestamp'])
         if not orig_timestamp or \
                 orig_timestamp < request.headers['x-timestamp']:
