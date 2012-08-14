@@ -62,7 +62,7 @@ REVSDATA_STRIDE = 32
 REVSDATA_ITEM_SIZE = 112
 MAX_OBJECT_NAME_LENGTH = 1024
 # keep these lower-case
-DISALLOWED_HEADERS = set('content-length content-type deleted etag'.split())
+DISALLOWED_HEADERS = set('content-length content-type deleted etag x-revision'.split())
 
 
 def read_metadata(fd):
@@ -273,6 +273,22 @@ class DiskFile(object):
                     break
             yield chunk
 
+    def app_iter_revision(self, rev_num):
+        """
+        Returns iterator over the data for the specific file revision
+
+        :param rev_num: revision number to get
+        """
+        rev = self.get_revision(self.fp, rev_num)
+        length = rev['size']
+        for chunk in self:
+            length -= len(chunk)
+            if length < 0:
+                yield chunk[:length]
+                break
+            yield chunk
+
+
     def _handle_close_quarantine(self):
         """Check if file needs to be quarantined"""
         try:
@@ -358,7 +374,9 @@ class DiskFile(object):
         """
         metadata['name'] = self.name
         timestamp = normalize_timestamp(metadata['X-Timestamp'])
-        if revision is not None:
+        if extension == '.data':
+            if revision is None:
+                raise Exception('Revision is required for data files')
             self.add_revision(fd, revision, metadata)
         write_metadata(fd, metadata)
         if 'Content-Length' in metadata:
@@ -379,11 +397,15 @@ class DiskFile(object):
         :param revision: new revision data to be added
         """
         metadata['name'] = self.name
+        timestamp = normalize_timestamp(metadata['X-Timestamp'])
         if 'Content-Length' in metadata:
             self.drop_cache(fd, 0, int(metadata['Content-Length']))
         tpool.execute(os.fsync, fd)
         self.add_revision(fd, revision, metadata)
         write_metadata(fd, metadata)
+        new_name = os.path.join(self.datadir, timestamp + '.data')
+        renamer(self.data_file, new_name)
+        self.data_file = new_name
         self.metadata = metadata
 
     def unlinkold(self, timestamp):
@@ -461,7 +483,7 @@ class DiskFile(object):
             returns None if such revision does not exist yet
         """
         if rev_num < 0: #get latest revision
-            rev_num = int(self.metadata['Revision'])
+            rev_num = int(self.metadata['X-Revision'])
         key = rev_num // REVSDATA_STRIDE
         if self.revision_key != key:
                 self.revision_data = read_revsdata(fd, rev_num)
@@ -481,12 +503,12 @@ class DiskFile(object):
         :param metadata: metadata to update with the new revision number
         """
         rev_num = 0
-        if 'Revision' in metadata:
-            rev_num = int(metadata['Revision']) + 1
+        if 'X-Revision' in metadata:
+            rev_num = int(metadata['X-Revision']) + 1
         _junk = self.get_revision(fd, rev_num)
         self.revision_data.insert(rev_num % REVSDATA_STRIDE, rev)
         write_revsdata(fd, rev_num, self.revision_data)
-        metadata['Revision'] = str(rev_num)
+        metadata['X-Revision'] = str(rev_num)
 
 
 class ObjectController(object):
@@ -669,12 +691,12 @@ class ObjectController(object):
         except (DiskFileError, DiskFileNotExist):
             file.quarantine()
             return HTTPNotFound(request=request)
-        if 'x-append-data' in request.headers:
+        if 'x-append-to' in request.headers:
             try:
-                rev_num = int(request.headers['x-append-data'])
+                rev_num = int(request.headers['x-append-to'])
             except ValueError:
                 return HTTPUnprocessableEntity(request=request)
-            current_rev = int(file.metadata['Revision'])
+            current_rev = int(file.metadata['X-Revision'])
             if 0 < rev_num < current_rev:
                 return HTTPBadRequest(body='Revision too old', request=request,
                     content_type='text/plain')
@@ -688,9 +710,8 @@ class ObjectController(object):
                 fd = obj_file.fileno()
                 os.lseek(fd, file.get_data_file_size(), os.SEEK_SET)
                 old_rev = file.get_revision(fd, rev_num)
-                new_md5 = rmd5.md5()
+                new_md5 = rmd5.md5(state=old_rev['md5'].get_state())
                 etag = rmd5.md5()
-                new_md5.set_state(old_rev['md5'].get_state())
                 if 'content-length' in request.headers:
                     fallocate(fd, int(request.headers['content-length']) + file_size)
                 reader = request.environ['wsgi.input'].read
@@ -722,14 +743,13 @@ class ObjectController(object):
                 if 'etag' in request.headers and\
                    request.headers['etag'].lower() != etag:
                     return HTTPUnprocessableEntity(request=request)
-                etag = rmd5.md5()
-                etag.set_state(new_md5.get_state())
+                etag = rmd5.md5(state=new_md5.get_state())
                 metadata = {
-                    'X-Timestamp': orig_timestamp,
+                    'X-Timestamp': request.headers['x-timestamp'],
                     'Content-Type': file.metadata['Content-Type'],
                     'ETag': etag.hexdigest(),
                     'Content-Length': str(new_rev['size']),
-                    'Revision': str(current_rev)
+                    'X-Revision': str(current_rev)
                     }
                 for header_key in self.allowed_headers:
                     if header_key in request.headers:
@@ -744,6 +764,7 @@ class ObjectController(object):
                         self.delete_at_update('DELETE', old_delete_at, account,
                             container, obj, request.headers, device)
                 file.append(fd, metadata, new_rev)
+            file.unlinkold(metadata['X-Timestamp'])
             if orig_timestamp < request.headers['x-timestamp']:
                 self.container_update('PUT', account, container, obj,
                     request.headers,
@@ -912,15 +933,26 @@ class ObjectController(object):
             file.quarantine()
             self.logger.timing_since('GET.timing', start_time)
             return HTTPNotFound(request=request)
+        etag = file.metadata['ETag']
+        app_iter = file
+        if 'x-revision' in request.headers:
+            rev_num = int(request.headers['x-revision'])
+            if rev_num > int(file.metadata['X-Revision']):
+                return HTTPNotFound(request=request)
+            if rev_num >= 0:
+                rev = file.get_revision(file.fp, rev_num)
+                etag = rmd5.md5(state=rev['md5'].get_state()).hexdigest()
+                file_size = rev['size']
+                app_iter = file.app_iter_revision(rev_num)
         if request.headers.get('if-match') not in (None, '*') and \
-                file.metadata['ETag'] not in request.if_match:
+                etag not in request.if_match:
             file.close()
             self.logger.timing_since('GET.timing', start_time)
             return HTTPPreconditionFailed(request=request)
         if request.headers.get('if-none-match') is not None:
-            if file.metadata['ETag'] in request.if_none_match:
+            if etag in request.if_none_match:
                 resp = HTTPNotModified(request=request)
-                resp.etag = file.metadata['ETag']
+                resp.etag = etag
                 file.close()
                 self.logger.timing_since('GET.timing', start_time)
                 return resp
@@ -948,7 +980,7 @@ class ObjectController(object):
             file.close()
             self.logger.timing_since('GET.timing', start_time)
             return HTTPNotModified(request=request)
-        response = Response(app_iter=file,
+        response = Response(app_iter=app_iter,
                         request=request, conditional_response=True)
         response.headers['Content-Type'] = file.metadata.get('Content-Type',
                 'application/octet-stream')
@@ -956,7 +988,7 @@ class ObjectController(object):
             if key.lower().startswith('x-object-meta-') or \
                     key.lower() in self.allowed_headers:
                 response.headers[key] = value
-        response.etag = file.metadata['ETag']
+        response.etag = etag
         response.last_modified = float(file.metadata['X-Timestamp'])
         response.content_length = file_size
         if response.content_length < self.keep_cache_size and \
@@ -967,6 +999,7 @@ class ObjectController(object):
         if 'Content-Encoding' in file.metadata:
             response.content_encoding = file.metadata['Content-Encoding']
         response.headers['X-Timestamp'] = file.metadata['X-Timestamp']
+        response.headers['X-Revision'] = file.metadata['X-Revision']
         self.logger.timing_since('GET.timing', start_time)
         return request.get_response(response)
 
@@ -993,6 +1026,14 @@ class ObjectController(object):
                 int(file.metadata['X-Delete-At']) <= time.time()):
             self.logger.timing_since('HEAD.timing', start_time)
             return HTTPNotFound(request=request)
+        rev_num = -1
+        rev = None
+        if 'x-revision' in request.headers:
+            rev_num = int(request.headers['x-revision'])
+            if rev_num > int(file.metadata['X-Revision']):
+                return HTTPNotFound(request=request)
+            if rev_num >= 0:
+                rev = file.get_revision(file.fp, rev_num)
         try:
             file_size = file.get_data_file_size()
         except (DiskFileError, DiskFileNotExist):
@@ -1006,14 +1047,19 @@ class ObjectController(object):
             if key.lower().startswith('x-object-meta-') or \
                     key.lower() in self.allowed_headers:
                 response.headers[key] = value
-        response.etag = file.metadata['ETag']
+        if rev_num < 0:
+            response.etag = file.metadata['ETag']
+            response.content_length = file_size
+        else:
+            etag = rmd5.md5(state=rev['md5'].get_state())
+            response.etag = etag.hexdigest()
+            response.content_length = str(rev['size'])
         response.last_modified = float(file.metadata['X-Timestamp'])
         # Needed for container sync feature
         response.headers['X-Timestamp'] = file.metadata['X-Timestamp']
-        response.content_length = file_size
+        response.headers['X-Revision'] = file.metadata['X-Revision']
         if 'Content-Encoding' in file.metadata:
             response.content_encoding = file.metadata['Content-Encoding']
-        response.headers['X-Timestamp'] = file.metadata['X-Timestamp']
         self.logger.timing_since('HEAD.timing', start_time)
         return response
 

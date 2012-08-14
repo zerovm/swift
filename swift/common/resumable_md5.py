@@ -87,13 +87,15 @@ def II(a, b, c, d, x, s, ac):
 
 
 class md5:
-    def __init__(self, initial=None):
+    def __init__(self, initial=None, state=None):
         self.count = 0L
         self.state = (0x67452301L,
                       0xefcdab89L,
                       0x98badcfeL,
                       0x10325476L,)
         self.buffer = ""
+        if state:
+            self.set_state(state)
         if initial:
             self.update(initial)
 
