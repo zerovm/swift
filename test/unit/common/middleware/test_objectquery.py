@@ -1,5 +1,6 @@
 import logging
 from posix import rmdir
+import struct
 import unittest
 import os
 import random
@@ -143,7 +144,7 @@ def retrieve_mnfst_field(n, eq=None, min=None, max=None, isint=False, optional=F
     setattr(mnfst, n.strip(), v)
 
 
-retrieve_mnfst_field('Version', '13072012')
+retrieve_mnfst_field('Version', '09082012')
 retrieve_mnfst_field('Nexe')
 retrieve_mnfst_field('NexeMax', isint=True)
 retrieve_mnfst_field('SyscallsMax', min=1, isint=True)
@@ -200,30 +201,11 @@ exit(0)
             self.app.zerovm_exename = ['python', zerovm_mock]
             #self.app.zerovm_nexe_xparams = ['ok.', '0']
 
-        def create_random_numbers(max_num):
-            numlist = [i for i in range(max_num)]
-            for i in range(max_num):
-                randindex1 = random.randrange(max_num)
-                randindex2 = random.randrange(max_num)
-                numlist[randindex1], numlist[randindex2] =\
-                numlist[randindex2], numlist[randindex1]
-            return pickle.dumps(numlist, protocol=0)
-
-        def create_object(body):
-            timestamp = normalize_timestamp(time())
-            headers = {'X-Timestamp': timestamp,
-                       'Content-Type': 'application/octet-stream'}
-            req = Request.blank('/sda1/p/a/c/o',
-                environ={'REQUEST_METHOD': 'PUT'}, headers=headers)
-            req.body = body
-            resp = req.get_response(self.app)
-            self.assertEquals(resp.status_int, 201)
-
         set_zerovm_mock()
-        randomnumbers = create_random_numbers(10)
-        create_object(randomnumbers)
+        randomnumbers = self.create_random_numbers(10)
+        self.create_object(randomnumbers)
         self._nexescript = 'sorted(id)'
-        self._sortednumbers = '(lp1\nI0\naI1\naI2\naI3\naI4\naI5\naI6\naI7\naI8\naI9\na.'
+        self._sortednumbers = self.get_sorted_numbers()
         self._randomnumbers_etag = md5()
         self._randomnumbers_etag.update(randomnumbers)
         self._randomnumbers_etag = self._randomnumbers_etag.hexdigest()
@@ -239,12 +221,83 @@ exit(0)
         self._emptyresult_etag.update(self._emptyresult)
         self._emptyresult_etag = self._emptyresult_etag.hexdigest()
 
+    def create_random_numbers(self, max_num, proto='pickle'):
+        numlist = [i for i in range(max_num)]
+        for i in range(max_num):
+            randindex1 = random.randrange(max_num)
+            randindex2 = random.randrange(max_num)
+            numlist[randindex1], numlist[randindex2] =\
+            numlist[randindex2], numlist[randindex1]
+        if proto == 'binary':
+            return struct.pack('%sI' % len(numlist), *numlist)
+        else:
+            return pickle.dumps(numlist, protocol=0)
+
+    def get_sorted_numbers(self, min_num=0, max_num=10, proto='pickle'):
+        numlist = [i for i in range(min_num,max_num)]
+        if proto == 'binary':
+            return struct.pack('%sI' % len(numlist), *numlist)
+        else:
+            return pickle.dumps(numlist, protocol=0)
+
+    def create_object(self, body, path='/sda1/p/a/c/o'):
+        timestamp = normalize_timestamp(time())
+        headers = {'X-Timestamp': timestamp,
+                   'Content-Type': 'application/octet-stream'}
+        req = Request.blank(path,
+            environ={'REQUEST_METHOD': 'PUT'}, headers=headers)
+        req.body = body
+        resp = req.get_response(self.app)
+        self.assertEquals(resp.status_int, 201)
+
     def zerovm_request(self):
         req = Request.blank('/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'POST'},
             headers={'Content-Type': 'application/octet-stream',
                      'x-zerovm-execute': '1.0'})
         return req
+
+    def test_QUERY_realzvm(self):
+        self.setup_zerovm_query()
+        self.app.zerovm_exename = ['./zerovm']
+        randomnum = self.create_random_numbers(1024 * 1024 / 4, proto='binary')
+        self.create_object(randomnum, path='/sda1/p/a/c/o_binary')
+        req = Request.blank('/sda1/p/a/c/o_binary',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'Content-Type': 'application/octet-stream',
+                     'x-zerovm-execute': '1.0',
+                     'x-nexe-args': '%d' % (1024 * 1024)})
+        fd = open('sort.nexe')
+        real_nexe = fd.read()
+        fd.close()
+        etag = md5(real_nexe)
+        etag = etag.hexdigest()
+        req.headers['etag'] = etag
+        req.headers['x-nexe-content-type'] = 'text/plain'
+        req.body = real_nexe
+        resp = self.app.zerovm_query(req)
+        #resp = req.get_response(self.app)
+
+        sortednum = self.get_sorted_numbers(min_num=0, max_num=1024 * 1024 / 4, proto='binary')
+        self.assertEquals(resp.status_int, 200)
+        fd = open('resp.sorted', 'w')
+        fd.write(resp.body)
+        fd.close()
+        fd = open('my.sorted', 'w')
+        fd.write(sortednum)
+        fd.close()
+        self.assertEquals(resp.body, sortednum)
+        self.assertEquals(resp.content_length, len(sortednum))
+        self.assertEquals(resp.content_type, 'text/plain')
+        self.assertEquals(resp.headers['content-length'],
+            str(len(sortednum)))
+        self.assertEquals(resp.headers['content-type'], 'text/plain')
+        self.assertEquals(resp.headers['x-nexe-etag'], 'disabled')
+        self.assertEquals(resp.headers['x-nexe-retcode'], 0)
+        self.assertEquals(resp.headers['x-nexe-status'], 'ok')
+        #timestamp = normalize_timestamp(time())
+        #self.assertEquals(math.floor(float(resp.headers['X-Timestamp'])),
+        #    math.floor(float(timestamp)))
 
     def test_QUERY_sort(self):
         self.setup_zerovm_query()

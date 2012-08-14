@@ -356,7 +356,7 @@ def retrieve_mnfst_field(n, eq=None, min=None, max=None, isint=False, optional=F
     setattr(mnfst, n.strip(), v)
 
 
-retrieve_mnfst_field('Version', '13072012')
+retrieve_mnfst_field('Version', '09082012')
 retrieve_mnfst_field('Nexe')
 retrieve_mnfst_field('NexeMax', isint=True)
 retrieve_mnfst_field('SyscallsMax', min=1, isint=True)
@@ -393,7 +393,7 @@ for i in xrange(0,len(dev_list)):
         node_name = device.split('/')[3]
         proto, host, port = fname.split(':')
         host = int(host)
-        if port == '0':
+        if '/dev/in/' in device:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.bind(('', 0))
             s.listen(1)
@@ -407,7 +407,7 @@ for i in xrange(0,len(dev_list)):
             con_list.append(device)
 request = struct.pack('!I', alias) +\
           struct.pack('!I', bind_count) + bind_data + struct.pack('!I', connect_count) + connect_data
-ns_host, ns_port = mnfst.NameService.split(':')
+ns_proto, ns_host, ns_port = mnfst.NameService.split(':')
 ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 ns.connect((ns_host, int(ns_port)))
 ns.sendto(request, (ns_host, int(ns_port)))

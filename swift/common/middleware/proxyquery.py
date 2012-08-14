@@ -394,7 +394,7 @@ class ClusterController(Controller):
                 addr = self.get_local_address(n)
                 if addr:
                     break
-        req.headers['x-name-service'] = '%s:%d' % (addr, ns_port)
+        req.headers['x-name-service'] = 'udp:%s:%d' % (addr, ns_port)
         if node.args:
             req.headers['x-nexe-args'] = node.args
         if node.env:

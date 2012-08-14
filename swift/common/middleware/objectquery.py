@@ -63,7 +63,7 @@ class ObjectQueryMiddleware(object):
         else:
             self.logger = get_logger(conf, log_route='obj-query')
 
-        self.zerovm_manifest_ver = conf.get('zerovm_manifest_ver','13072012')
+        self.zerovm_manifest_ver = conf.get('zerovm_manifest_ver','09082012')
         self.zerovm_exename = set(i.strip() for i in conf.get('zerovm_exename', 'zerovm').split() if i.strip())
         #self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '').split() if i.strip())
 
@@ -311,7 +311,7 @@ class ObjectQueryMiddleware(object):
                         self.zerovm_maxnexe,
                         self.zerovm_maxsyscalls,
                         etag,
-                        self.zerovm_timeout * 1000,
+                        self.zerovm_timeout,
                         self.zerovm_maxnexemem
                         ))
 
@@ -391,7 +391,10 @@ class ObjectQueryMiddleware(object):
                                 return 4, stdout_data, stderr_data
                         if proc.poll() is not None:
                             stdout_data, stderr_data = get_output(stdout_data, stderr_data)
-                            return proc.returncode, stdout_data, stderr_data
+                            ret = 0
+                            if proc.returncode:
+                                ret = 1
+                            return ret, stdout_data, stderr_data
                         sleep(0.1)
                     if proc.poll() is None:
                         proc.terminate()
