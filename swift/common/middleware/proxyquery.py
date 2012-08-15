@@ -6,7 +6,7 @@ import traceback
 from eventlet.green import socket
 import time
 from hashlib import md5
-from eventlet import GreenPile, GreenPool
+from eventlet import GreenPile, GreenPool, sleep
 import greenlet
 from swiftclient.client import quote
 
@@ -440,6 +440,7 @@ class ClusterController(Controller):
                         with ChunkWriteTimeout(self.app.node_timeout):
                             conn.send('%x\r\n%s\r\n' % (len(chunk), chunk)
                             if chunked else chunk)
+                            sleep()
                     except (Exception, ChunkWriteTimeout):
                         raise Exception(conn.node, _('Object'),
                             _('Trying to write to %s') % req.path_info)
@@ -488,6 +489,7 @@ class ClusterController(Controller):
                     if not chunk:
                         break
                     yield chunk
+                    sleep()
                     #client_response.bytes_transferred += len(chunk)
             except GeneratorExit:
                 client_response.client_disconnect = True
@@ -559,7 +561,7 @@ class ClusterController(Controller):
 
         try:
             cluster_config = json.loads(cluster_config)
-            nid = 0
+            nid = 1
             for node in cluster_config:
                 node_name = node.get('name')
                 if not node_name:

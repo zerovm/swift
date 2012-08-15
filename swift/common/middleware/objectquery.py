@@ -133,8 +133,8 @@ class ObjectQueryMiddleware(object):
                 return HTTPBadRequest(body=str(err), request=req,
                     content_type='text/plain')
 
-        if self.zerovm_thrdpool.size != self.zerovm_maxpool:
-            self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
+        #if self.zerovm_thrdpool.size != self.zerovm_maxpool:
+        #    self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
         if self.zerovm_thrdpool.free() <= 0\
         and self.zerovm_thrdpool.waiting() >= self.zerovm_maxqueue:
             return HTTPServiceUnavailable(body='Slot not available',
@@ -218,6 +218,7 @@ class ObjectQueryMiddleware(object):
                 while chunk:
                     written = self.os_interface.write(zerovm_nexe_fd, chunk)
                     chunk = chunk[written:]
+                    sleep()
             if 'content-length' in req.headers\
             and int(req.headers['content-length']) != upload_size:
                 return Response(status='499 Client Disconnect')
@@ -244,6 +245,7 @@ class ObjectQueryMiddleware(object):
                                         read - dropped_cache)
                                     dropped_cache = read
                                 yield chunk
+                                sleep()
                             else:
                                 drop_buffer_cache(fd, dropped_cache, read
                                 - dropped_cache)
