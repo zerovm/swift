@@ -325,6 +325,12 @@ class ClusterController(Controller):
         return result
 
     def make_request(self, node, request, ns_port):
+        nexe_headers = {
+            'x-node-name': node.name,
+            'x-nexe-status': 'ZeroVM did not run',
+            'x-nexe-retcode' : 0,
+            'x-nexe-etag': ''
+        }
         path_info = request.path_info
         top_path = node.channels[0].path
         if top_path \
@@ -343,6 +349,7 @@ class ClusterController(Controller):
         acct, src_container_name, src_obj_name = split_path(load_from, 1, 3, True)
         source_resp = ObjectController(self.app, acct, src_container_name, src_obj_name).GET(source_req)
         if source_resp.status_int >= 300:
+            source_resp.headers = nexe_headers
             return source_resp
         code_source = source_resp.app_iter
         shuffle(obj_nodes)
@@ -355,7 +362,7 @@ class ClusterController(Controller):
             # which currently only happens because there are more than
             # CONTAINER_LISTING_LIMIT segments in a segmented object. In
             # this case, we're going to refuse request.
-            return HTTPRequestEntityTooLarge(request=req)
+            return HTTPRequestEntityTooLarge(request=req, headers=nexe_headers)
         req.etag = source_resp.etag
         req.headers['Content-Type'] =\
             source_resp.headers['Content-Type']
@@ -421,7 +428,10 @@ class ClusterController(Controller):
                     continue
         conn = connect()
         if not conn:
-            raise Exception('Cannot find suitable node to execute code on')
+            self.app.logger.exception(
+                _('ERROR Cannot find suitable node to execute code on'))
+            return HTTPServiceUnavailable(body='Cannot find suitable node to execute code on', headers=nexe_headers)
+
         chunked = req.headers.get('transfer-encoding')
         try:
             req.bytes_transferred = 0
@@ -435,7 +445,7 @@ class ClusterController(Controller):
                         break
                     req.bytes_transferred += len(chunk)
                     if req.bytes_transferred > self.app.zerovm_maxnexe:
-                        return HTTPRequestEntityTooLarge(request=req)
+                        return HTTPRequestEntityTooLarge(request=req, headers=nexe_headers)
                     try:
                         with ChunkWriteTimeout(self.app.node_timeout):
                             conn.send('%x\r\n%s\r\n' % (len(chunk), chunk)
@@ -448,17 +458,17 @@ class ClusterController(Controller):
         except ChunkReadTimeout, err:
             self.app.logger.warn(
                 _('ERROR Client read timeout (%ss)'), err.seconds)
-            return HTTPRequestTimeout(request=req)
+            return HTTPRequestTimeout(request=req, headers=nexe_headers)
         except Exception:
             req.client_disconnect = True
             self.app.logger.exception(
                 _('ERROR Exception causing client disconnect'))
-            return Response(status='499 Client Disconnect')
+            return Response(status='499 Client Disconnect', headers=nexe_headers)
         if req.content_length and req.bytes_transferred < req.content_length:
             req.client_disconnect = True
             self.app.logger.warn(
                 _('Client disconnected without sending enough data'))
-            return Response(status='499 Client Disconnect')
+            return Response(status='499 Client Disconnect', headers=nexe_headers)
         try:
             with Timeout(self.app.node_timeout):
                 server_response = conn.getresponse()
@@ -466,10 +476,12 @@ class ClusterController(Controller):
             self.exception_occurred(conn.node, _('Object'),
                 _('Trying to get final status of POST to %s')
                 % req.path_info)
-            return Response(status='499 Client Disconnect')
+            return Response(status='499 Client Disconnect', headers=nexe_headers)
         if server_response.status != 200:
-            raise Exception('Error querying object server %s %s'
-            % (server_response.status, server_response.read()))
+            resp = Response(status='%d %s' % (server_response.status, server_response.reason),
+                body=server_response.read())
+            update_headers(resp, nexe_headers)
+            return resp
 
         std_size = server_response.getheader('x-nexe-stdsize')
         if not std_size:
@@ -513,6 +525,7 @@ class ClusterController(Controller):
                 dest_resp = \
                     ObjectController(self.app, acct, dest_container_name, dest_obj_name).PUT(dest_req)
                 if dest_resp.status_int >= 300:
+                    update_headers(dest_resp, nexe_headers)
                     return dest_resp
                 update_headers(dest_resp, server_response.getheaders())
             else:

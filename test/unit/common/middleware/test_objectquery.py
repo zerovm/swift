@@ -636,12 +636,8 @@ for i in range(20):
 ''')
         req = self.zerovm_request()
         req.body = 'test'
-        try:
-            resp = self.app.zerovm_query(req)
-        except Exception, e:
-            self.assertIn('ERROR OBJ.QUERY retcode=Output too long', str(e))
-            raised = True
-        self.assert_(raised, 'Exception not raised on timeout')
+        resp = self.app.zerovm_query(req)
+        self.assertIn('ERROR OBJ.QUERY retcode=Output too long', resp.body)
 
     def test_QUERY_zerovm_term_timeouts(self):
         self.setup_zerovm_query(
@@ -652,20 +648,16 @@ sleep(10)
         req = self.zerovm_request()
         req.body = 'test'
         orig_timeout = None
-        raised = False
         # call QUERY method
         try:
             orig_timeout = None if not \
             hasattr(self.app, 'zerovm_timeout') else \
             self.app.zerovm_timeout
             self.app.zerovm_timeout = 1
-            self.app.zerovm_query(req)
-        except Exception, e:
-            self.assertIn('ERROR OBJ.QUERY retcode=Timed out', str(e))
-            raised = True
+            resp = self.app.zerovm_query(req)
+            self.assertIn('ERROR OBJ.QUERY retcode=Timed out', resp.body)
         finally:
             self.app.zerovm_timeout = orig_timeout
-        self.assert_(raised, 'Exception not raised on timeout')
 
     def test_QUERY_zerovm_kill_timeouts(self):
         self.setup_zerovm_query(
@@ -677,7 +669,6 @@ time.sleep(10)
         req = self.zerovm_request()
         req.body = 'test'
         orig_timeout = None
-        raised = False
         # call QUERY method
         try:
             orig_timeout = None if not\
@@ -688,14 +679,11 @@ time.sleep(10)
             hasattr(self.app, 'zerovm_kill_timeout') else\
             self.app.zerovm_kill_timeout
             self.app.zerovm_kill_timeout = 1
-            self.app.zerovm_query(req)
-        except Exception, e:
-            self.assertIn('ERROR OBJ.QUERY retcode=Killed', str(e))
-            raised = True
+            resp = self.app.zerovm_query(req)
+            self.assertIn('ERROR OBJ.QUERY retcode=Killed', resp.body)
         finally:
             self.app.zerovm_timeout = orig_timeout
             self.app.zerovm_kill_timeout = orig_kill_timeout
-        self.assert_(raised, 'Exception not raised on timeout')
 
     def test_QUERY_simulteneous_running_zerovm_limits(self):
         raise SkipTest
