@@ -692,6 +692,126 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         self.assertEqual(res.status_int, 200)
         self.assert_('done\n' in res.body)
 
+    def test_QUERY_generator_zerovm(self):
+        self.setup_QUERY()
+        (_prosrv, _acc1srv, _acc2srv, _con1srv,
+         _con2srv, _obj1srv, _obj2srv) = _test_servers
+        prosrv = _test_servers[0]
+        prolis = _test_sockets[0]
+        self.create_container(prolis, '/v1/a/exe')
+        self.create_container(prolis, '/v1/a/unsorted')
+        self.create_container(prolis, '/v1/a/sorted')
+        _obj1srv.zerovm_exename = ['./zerovm']
+        _obj2srv.zerovm_exename = ['./zerovm']
+        _obj1srv.zerovm_timeout = 30
+        _obj2srv.zerovm_timeout = 30
+        prosrv.app.node_timeout = 30
+
+        fd = open('generator.uint32_t.nexe')
+        exe = fd.read()
+        fd.close()
+        self.create_object(prolis, '/v1/a/exe/generator.uint32_t.nexe', exe)
+        conf = [
+                {
+                "name": "generator",
+                "exec": {"path": "/exe/generator.uint32_t.nexe"},
+                "file_list": [
+                        {
+                        "device": "stdout",
+                        "path": "/unsorted/*.data"
+                    },
+                        {
+                        "device": "stderr"
+                    }
+                ],
+                "args": "500000",
+                "count":2
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        print res
+
+        fd = open('nodeman.nexe')
+        exe = fd.read()
+        fd.close()
+        self.create_object(prolis, '/v1/a/exe/nodeman.nexe', exe)
+        fd = open('nodesrc.nexe')
+        exe = fd.read()
+        fd.close()
+        self.create_object(prolis, '/v1/a/exe/nodesrc.nexe', exe)
+        fd = open('nodedst.nexe')
+        exe = fd.read()
+        fd.close()
+        self.create_object(prolis, '/v1/a/exe/nodedst.nexe', exe)
+        conf = [
+                {
+                "name":"src",
+                "exec":{
+                    "path":"/exe/nodesrc.nexe"
+                },
+                "connect":[ "dst", "man" ],
+                "file_list":[
+                        {
+                        "device":"stdin",
+                        "path":"/unsorted/generator*.data"
+                    }
+                ],
+                "env":{
+                    "SOURCE_NAME":"src",
+                    "MAN_NAME":"man",
+                    "DEST_NAME":"dst"
+                }
+            },
+                {
+                "name":"dst",
+                "exec":{
+                    "path":"/exe/nodedst.nexe"
+                },
+                "connect":[ "man" ],
+                "file_list":[
+                        {
+                        "device":"stdout",
+                        "path":"/sorted/*.data"
+                    }
+                ],
+                "env":{
+                    "SOURCE_NAME":"src",
+                    "MAN_NAME":"man",
+                    "DEST_NAME":"dst"
+                },
+                "count":2
+            },
+                {
+                "name":"man",
+                "exec":{
+                    "path":"/exe/nodeman.nexe"
+                },
+                "connect":[ "src" ],
+                "file_list":[
+                        {
+                        "device":"stdout"
+                    },
+                        {
+                        "device":"stderr"
+                    }
+                ],
+                "env":{
+                    "SOURCE_NAME":"src",
+                    "MAN_NAME":"man",
+                    "DEST_NAME":"dst"
+                }
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        print res
+
+
     def test_QUERY_immediate_stdout(self):
         self.setup_QUERY()
         conf = [

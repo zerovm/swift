@@ -94,7 +94,7 @@ class ObjectQueryMiddleware(object):
         self.zerovm_maxnexe = int(conf.get('zerovm_maxnexe', 256 * 1048576))
 
         # maximum output data file size
-        self.zerovm_maxoutput = int(conf.get('zerovm_maxoutput', 64 * 1048576)) # TODO this breaks some tests
+        self.zerovm_maxoutput = int(conf.get('zerovm_maxoutput', 64 * 1048576))
 
         self.zerovm_maxchunksize = int(conf.get('zerovm_maxchunksize', 1024 * 1024))
 
@@ -356,7 +356,7 @@ class ObjectQueryMiddleware(object):
                     nexe_name = re.split('\s*,\s*', req.headers['x-node-name'])
 
                 if 'x-name-service' in req.headers:
-                    zerovm_inputmnfst += 'NameService=%s\n'\
+                    zerovm_inputmnfst += 'NameServer=%s\n'\
                     % req.headers['x-name-service']
 
                 while zerovm_inputmnfst:

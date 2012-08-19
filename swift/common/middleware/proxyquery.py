@@ -92,12 +92,12 @@ class NameService(object):
                 count = struct.unpack_from('!I', message, offset)[0]
                 offset += 4
                 for i in range(count):
-                    h, port = struct.unpack_from('!IH', message, offset)[0:2]
+                    h, _junk, port = struct.unpack_from('!IIH', message, offset)[0:3]
                     bind_map.setdefault(alias, {})[h] = port
-                    offset += 6
+                    offset += 10
                 conn_map[alias] = ctypes.create_string_buffer(message[offset:])
                 peer_map.setdefault(alias, {})[0] = address[0]
-                peer_map[alias][1] = address[1]
+                peer_map.setdefault(alias, {})[1] = address[1]
 
                 if len(peer_map) == self.peers:
                     for src in peer_map.iterkeys():
@@ -108,13 +108,14 @@ class NameService(object):
                         for i in range(count):
                             h = struct.unpack_from('!I', reply, offset)[0]
                             port = bind_map[h][src]
-                            struct.pack_into('!4sH', reply, offset,
+                            struct.pack_into('!4sH', reply, offset + 4,
                                 socket.inet_pton(socket.AF_INET, peer_map[src][0]), port)
-                            offset += 6
+                            offset += 10
                         self.sock.sendto(reply, (peer_map[src][0], peer_map[src][1]))
             except greenlet.GreenletExit:
                 return
             except Exception:
+                print traceback.format_exc()
                 pass
 
     def stop(self):
@@ -345,7 +346,7 @@ class ClusterController(Controller):
         load_from = request.path_info + node.exe
         source_req = request.copy_get()
         source_req.path_info = load_from
-        source_req.headers['X-Newest'] = 'true'
+        #source_req.headers['X-Newest'] = 'true'
         acct, src_container_name, src_obj_name = split_path(load_from, 1, 3, True)
         source_resp = ObjectController(self.app, acct, src_container_name, src_obj_name).GET(source_req)
         if source_resp.status_int >= 300:
@@ -592,6 +593,7 @@ class ClusterController(Controller):
                 read_list = []
                 write_list = []
                 other_list = []
+
                 if file_list:
                     for f in file_list:
                         device = f.get('device')
