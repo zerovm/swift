@@ -763,6 +763,13 @@ class Controller(object):
         reasons = []
         bodies = []
         source = None
+        sources = []
+        try:
+            _junk = int(req.headers.get('x-revision', '-1'))
+        except ValueError:
+            return HTTPBadRequest(request=req,
+                content_type='text/plain',
+                body='Non-integer X-Revision')
         newest = req.headers.get('x-newest', 'f').lower() in TRUE_VALUES
         nodes = iter(nodes)
         while len(statuses) < attempts:
@@ -802,16 +809,19 @@ class Controller(object):
                     possible_source.read()
                     continue
                 if newest:
-                    if source:
+                    if sources:
                         ts = float(source.getheader('x-put-timestamp') or
                                    source.getheader('x-timestamp') or 0)
                         pts = float(
                             possible_source.getheader('x-put-timestamp') or
                             possible_source.getheader('x-timestamp') or 0)
                         if pts > ts:
-                            source = possible_source
+                            sources.insert(0, possible_source)
+                        else:
+                            sources.append(possible_source)
                     else:
-                        source = possible_source
+                        sources.insert(0, possible_source)
+                    source = sources[0]
                     statuses.append(source.status)
                     reasons.append(source.reason)
                     bodies.append('')
@@ -828,8 +838,26 @@ class Controller(object):
                     {'status': possible_source.status,
                     'body': bodies[-1][:1024], 'type': server_type})
         if source:
+            if newest:
+                # we need to close all the hanging swift_conns
+                sources.pop(0)
+                for src in sources:
+                    try:
+                        src.swift_conn.close()
+                    except Exception:
+                        pass
+                    src.swift_conn = None
+                    try:
+                        while src.read(self.app.object_chunk_size):
+                            pass
+                    except Exception:
+                        pass
+                    try:
+                        src.close()
+                    except Exception:
+                        pass
             if req.method == 'GET' and \
-               source.status in (HTTP_OK, HTTP_PARTIAL_CONTENT):
+                source.status in (HTTP_OK, HTTP_PARTIAL_CONTENT):
                 res = Response(request=req, conditional_response=True)
                 res.app_iter = self._make_app_iter(node, source, res)
                 # See NOTE: swift_conn at top of file about this.
@@ -1057,6 +1085,21 @@ class ObjectController(Controller):
             if resp.status_int != HTTP_CREATED:
                 return resp
             return HTTPAccepted(request=req)
+        elif 'x-append-to' in req.headers:
+            try:
+                _junk = int(req.headers['x-append-to'])
+            except ValueError:
+                self.app.logger.increment('errors')
+                return HTTPBadRequest(request=req,
+                    content_type='text/plain',
+                    body='Non-integer X-Append-To')
+            req.method = 'POST'
+            req.path_info = '/%s/%s/%s' % (self.account_name,
+                                           self.container_name, self.object_name)
+            resp = self.PUT(req, start_time=start_time, stats_type='POST', append=True)
+            if resp.status_int != HTTP_CREATED:
+                return resp
+            return HTTPAccepted(request=req)
         else:
             error_response = check_metadata(req, 'object')
             if error_response:
@@ -1129,14 +1172,15 @@ class ObjectController(Controller):
             conn.queue.task_done()
 
     def _connect_put_node(self, nodes, part, path, headers,
-                          logger_thread_locals):
+                          logger_thread_locals, append=False):
         """Method for a file PUT connect"""
         self.app.logger.thread_locals = logger_thread_locals
         for node in nodes:
             try:
                 with ConnectionTimeout(self.app.conn_timeout):
                     conn = http_connect(node['ip'], node['port'],
-                            node['device'], part, 'PUT', path, headers)
+                            node['device'], part,
+                        'POST' if append else 'PUT', path, headers)
                 with Timeout(self.app.node_timeout):
                     resp = conn.getexpect()
                 if resp.status == HTTP_CONTINUE:
@@ -1150,7 +1194,7 @@ class ObjectController(Controller):
 
     @public
     @delay_denial
-    def PUT(self, req, start_time=None, stats_type='PUT'):
+    def PUT(self, req, start_time=None, stats_type='PUT', append=False):
         """HTTP PUT request handler."""
         if not start_time:
             start_time = time.time()
@@ -1341,13 +1385,15 @@ class ObjectController(Controller):
                 nheaders['X-Delete-At-Partition'] = delete_at_part
                 nheaders['X-Delete-At-Device'] = node['device']
             pile.spawn(self._connect_put_node, node_iter, partition,
-                       req.path_info, nheaders, self.app.logger.thread_locals)
+                       req.path_info, nheaders, self.app.logger.thread_locals, append)
         conns = [conn for conn in pile if conn]
         if len(conns) <= len(nodes) / 2:
             self.app.logger.error(
-                _('Object PUT returning 503, %(conns)s/%(nodes)s '
+                _('Object %(stats)s returning 503, %(conns)s/%(nodes)s '
                 'required connections'),
-                {'conns': len(conns), 'nodes': len(nodes) // 2 + 1})
+                {'conns': len(conns),
+                 'nodes': len(nodes) // 2 + 1,
+                 'stats': stats_type})
             self.app.logger.increment('errors')
             return HTTPServiceUnavailable(request=req)
         chunked = req.headers.get('transfer-encoding')
@@ -1377,9 +1423,11 @@ class ObjectController(Controller):
                         else:
                             conns.remove(conn)
                     if len(conns) <= len(nodes) / 2:
-                        self.app.logger.error(_('Object PUT exceptions during'
+                        self.app.logger.error(_('Object %(stats)s exceptions during'
                             ' send, %(conns)s/%(nodes)s required connections'),
-                            {'conns': len(conns), 'nodes': len(nodes) / 2 + 1})
+                            {'conns': len(conns),
+                             'nodes': len(nodes) / 2 + 1,
+                             'stats': stats_type})
                         self.app.logger.increment('errors')
                         return HTTPServiceUnavailable(request=req)
                 for conn in conns:
@@ -1426,7 +1474,7 @@ class ObjectController(Controller):
                         etags.add(response.getheader('etag').strip('"'))
             except (Exception, Timeout):
                 self.exception_occurred(conn.node, _('Object'),
-                    _('Trying to get final status of PUT to %s') % req.path)
+                    _('Trying to get final status of %s to %s') % (stats_type, req.path))
         if len(etags) > 1:
             self.app.logger.error(
                 _('Object servers returned %s mismatched etags'), len(etags))

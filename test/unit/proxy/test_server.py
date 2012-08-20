@@ -27,6 +27,7 @@ from gzip import GzipFile
 from httplib import HTTPException
 from shutil import rmtree
 from time import time
+from unittest.case import SkipTest
 from urllib import unquote, quote
 from hashlib import md5
 from tempfile import mkdtemp
@@ -969,6 +970,32 @@ class TestObjectController(unittest.TestCase):
             test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1', '3', '1'), '1')
             test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '3', '3', '1'), '3')
             test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None, '1', '2'), None)
+
+    def test_GET_newest_large_file(self):
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        obj = 'a' * (1024 * 1024)
+        path = '/v1/a/c/o.large'
+        fd.write('PUT %s HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Storage-Token: t\r\n'
+                 'Content-Length: %s\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (path, str(len(obj)),  obj))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+        req = Request.blank(path,
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Content-Type': 'application/octet-stream',
+                     'X-Newest': 'true'})
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(len(res.body), len(obj))
 
     def test_POST_meta_val_len(self):
         with save_globals():
@@ -3230,7 +3257,7 @@ class TestObjectController(unittest.TestCase):
             given_headers = {}
 
             def fake_connect_put_node(nodes, part, path, headers,
-                                      logger_thread_locals):
+                                      logger_thread_locals, append=False):
                 given_headers.update(headers)
 
             controller = proxy_server.ObjectController(self.app, 'account',
