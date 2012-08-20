@@ -40,7 +40,7 @@ from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
 from swift.common.exceptions import DiskFileNotExist
 from swift.obj import replicator
 from eventlet import tpool
-
+from swift.common import resumable_md5 as rmd5
 
 class TestDiskFile(unittest.TestCase):
     """Test swift.obj.server.DiskFile"""
@@ -155,7 +155,7 @@ class TestDiskFile(unittest.TestCase):
         df = object_server.DiskFile(self.testdir, 'sda1', '0', 'a', 'c',
                                     obj_name, FakeLogger())
         data = '0' * fsize
-        etag = md5()
+        etag = rmd5.rmd5()
         if ts:
             timestamp = ts
         else:
@@ -163,13 +163,19 @@ class TestDiskFile(unittest.TestCase):
         with df.mkstemp() as (fd, tmppath):
             os.write(fd, data)
             etag.update(data)
-            etag = etag.hexdigest()
+            etag, state = etag.digest_and_state()
+            rev = None
+            if extension == '.data':
+                rev = {
+                    'md5state': state,
+                    'size': os.fstat(fd).st_size
+                }
             metadata = {
                 'ETag': etag,
                 'X-Timestamp': timestamp,
-                'Content-Length': str(os.fstat(fd).st_size),
+                'Content-Length': str(os.fstat(fd).st_size)
             }
-            df.put(fd, tmppath, metadata, extension=extension)
+            df.put(fd, tmppath, metadata, extension=extension, revision=rev)
             if invalid_type == 'ETag':
                 etag = md5()
                 etag.update('1' + '0' * (fsize - 1))

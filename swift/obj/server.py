@@ -59,7 +59,7 @@ PICKLE_PROTOCOL = 2
 METADATA_KEY = 'user.swift.metadata'
 REVSDATA_KEY = 'user.swift.revsdata'
 REVSDATA_STRIDE = 32
-REVSDATA_ITEM_SIZE = 112
+REVSDATA_STRUCT = struct.Struct('!Q156s')
 MAX_OBJECT_NAME_LENGTH = 1024
 # keep these lower-case
 DISALLOWED_HEADERS = set('content-length content-type deleted etag x-revision'.split())
@@ -117,13 +117,9 @@ def read_revsdata(fd, rev_num):
         pass
     result = []
     while revsdata:
-        state = [0,0,0,0]
-        size, count, state[0], state[1], state[2], state[3], buffer = \
-            struct.unpack_from('!6Q64s', revsdata)[0:7]
-        md5 = rmd5.md5()
-        md5.set_state([count, state, buffer])
-        result.append({'size':size, 'md5':md5})
-        revsdata = revsdata[REVSDATA_ITEM_SIZE:]
+        size, state = REVSDATA_STRUCT.unpack_from(revsdata)[0:2]
+        result.append({'size':size, 'md5state':state})
+        revsdata = revsdata[REVSDATA_STRUCT.size:]
     return result
 
 def write_revsdata(fd, rev_num, revsdata):
@@ -135,13 +131,13 @@ def write_revsdata(fd, rev_num, revsdata):
     :param revsdata: list of revision data to write
     """
     key = rev_num // REVSDATA_STRIDE
-    data = ctypes.create_string_buffer(len(revsdata) * REVSDATA_ITEM_SIZE)
+    if len(revsdata) > REVSDATA_STRIDE:
+        raise ValueError('Revision data too long: %d > %d' % (len(revsdata), REVSDATA_STRIDE))
+    data = ctypes.create_string_buffer(len(revsdata) * REVSDATA_STRUCT.size)
     offset = 0
     for item in revsdata:
-        count, state, buffer = item['md5'].get_state()
-        struct.pack_into('!6Q64s', data, offset, item['size'],
-            count, state[0], state[1], state[2], state[3], buffer)
-        offset += REVSDATA_ITEM_SIZE
+        REVSDATA_STRUCT.pack_into(data, offset, item['size'], item['md5state'])
+        offset += REVSDATA_STRUCT.size
     setxattr(fd, '%s%s' % (REVSDATA_KEY, key or ''), data)
 
 class DiskFile(object):
@@ -506,7 +502,11 @@ class DiskFile(object):
         if 'X-Revision' in metadata:
             rev_num = int(metadata['X-Revision']) + 1
         _junk = self.get_revision(fd, rev_num)
-        self.revision_data.insert(rev_num % REVSDATA_STRIDE, rev)
+        index = rev_num % REVSDATA_STRIDE
+        if len(self.revision_data) < index + 1:
+            self.revision_data.append(rev)
+        else:
+            self.revision_data[index] = rev
         write_revsdata(fd, rev_num, self.revision_data)
         metadata['X-Revision'] = str(rev_num)
 
@@ -710,8 +710,8 @@ class ObjectController(object):
                 fd = obj_file.fileno()
                 os.lseek(fd, file.get_data_file_size(), os.SEEK_SET)
                 old_rev = file.get_revision(fd, rev_num)
-                new_md5 = rmd5.md5(state=old_rev['md5'].get_state())
-                etag = rmd5.md5()
+                new_md5 = rmd5.rmd5(old_rev['md5state'])
+                etag = rmd5.rmd5()
                 if 'content-length' in request.headers:
                     fallocate(fd, int(request.headers['content-length']) + file_size)
                 reader = request.environ['wsgi.input'].read
@@ -735,19 +735,19 @@ class ObjectController(object):
                 if 'content-length' in request.headers and\
                    int(request.headers['content-length']) != upload_size:
                     return HTTPClientDisconnect(request=request)
-                new_rev = {
-                    'md5': new_md5,
-                    'size': os.fstat(fd).st_size
-                }
-                etag = etag.hexdigest()
+                etag, state = etag.digest_and_state()
                 if 'etag' in request.headers and\
                    request.headers['etag'].lower() != etag:
                     return HTTPUnprocessableEntity(request=request)
-                etag = rmd5.md5(state=new_md5.get_state())
+                etag, state = new_md5.digest_and_state()
+                new_rev = {
+                    'md5state': state,
+                    'size': os.fstat(fd).st_size
+                }
                 metadata = {
                     'X-Timestamp': request.headers['x-timestamp'],
                     'Content-Type': file.metadata['Content-Type'],
-                    'ETag': etag.hexdigest(),
+                    'ETag': etag,
                     'Content-Length': str(new_rev['size']),
                     'X-Revision': str(current_rev)
                     }
@@ -828,7 +828,7 @@ class ObjectController(object):
                         obj, self.logger, disk_chunk_size=self.disk_chunk_size)
         orig_timestamp = file.metadata.get('X-Timestamp')
         upload_expiration = time.time() + self.max_upload_time
-        etag = rmd5.md5()
+        etag = rmd5.rmd5()
         upload_size = 0
         last_sync = 0
         with file.mkstemp() as (fd, tmppath):
@@ -854,12 +854,11 @@ class ObjectController(object):
             if 'content-length' in request.headers and \
                     int(request.headers['content-length']) != upload_size:
                 return HTTPClientDisconnect(request=request)
+            etag, state = etag.digest_and_state()
             rev = {
-                'md5': rmd5.md5(),
+                'md5state': state,
                 'size': os.fstat(fd).st_size
                 }
-            rev['md5'].set_state(etag.get_state())
-            etag = etag.hexdigest()
             if 'etag' in request.headers and \
                             request.headers['etag'].lower() != etag:
                 return HTTPUnprocessableEntity(request=request)
@@ -941,7 +940,7 @@ class ObjectController(object):
                 return HTTPNotFound(request=request)
             if rev_num >= 0:
                 rev = file.get_revision(file.fp, rev_num)
-                etag = rmd5.md5(state=rev['md5'].get_state()).hexdigest()
+                etag, state = rmd5.rmd5(rev['md5state']).digest_and_state()
                 file_size = rev['size']
                 app_iter = file.app_iter_revision(rev_num)
         if request.headers.get('if-match') not in (None, '*') and \
@@ -1051,8 +1050,8 @@ class ObjectController(object):
             response.etag = file.metadata['ETag']
             response.content_length = file_size
         else:
-            etag = rmd5.md5(state=rev['md5'].get_state())
-            response.etag = etag.hexdigest()
+            etag, state = rmd5.rmd5(rev['md5state'])
+            response.etag = etag
             response.content_length = str(rev['size'])
         response.last_modified = float(file.metadata['X-Timestamp'])
         # Needed for container sync feature
