@@ -41,7 +41,7 @@ from swift.common.utils import mkdirs, normalize_timestamp, public, \
     storage_directory, hash_path, renamer, fallocate, \
     split_path, drop_buffer_cache, get_logger, write_pickle, \
     TRUE_VALUES, validate_device_partition, lock_file
-from swift.common import resumable_md5 as rmd5
+from swift.common.resumable_md5 import rmd5
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_object_creation, check_mount, \
     check_float, check_utf8
@@ -59,7 +59,7 @@ PICKLE_PROTOCOL = 2
 METADATA_KEY = 'user.swift.metadata'
 REVSDATA_KEY = 'user.swift.revsdata'
 REVSDATA_STRIDE = 32
-REVSDATA_STRUCT = struct.Struct('!Q156s')
+REVSDATA_STRUCT = struct.Struct('!Q100s')
 MAX_OBJECT_NAME_LENGTH = 1024
 # keep these lower-case
 DISALLOWED_HEADERS = set('content-length content-type deleted etag x-revision'.split())
@@ -710,8 +710,8 @@ class ObjectController(object):
                 fd = obj_file.fileno()
                 os.lseek(fd, file.get_data_file_size(), os.SEEK_SET)
                 old_rev = file.get_revision(fd, rev_num)
-                new_md5 = rmd5.rmd5(old_rev['md5state'])
-                etag = rmd5.rmd5()
+                new_md5 = rmd5(old_rev['md5state'])
+                etag = rmd5()
                 if 'content-length' in request.headers:
                     fallocate(fd, int(request.headers['content-length']) + file_size)
                 reader = request.environ['wsgi.input'].read
@@ -735,11 +735,12 @@ class ObjectController(object):
                 if 'content-length' in request.headers and\
                    int(request.headers['content-length']) != upload_size:
                     return HTTPClientDisconnect(request=request)
-                etag, state = etag.digest_and_state()
+                etag = etag.hexdigest()
                 if 'etag' in request.headers and\
                    request.headers['etag'].lower() != etag:
                     return HTTPUnprocessableEntity(request=request)
-                etag, state = new_md5.digest_and_state()
+                state = new_md5.get_state()
+                etag = new_md5.hexdigest()
                 new_rev = {
                     'md5state': state,
                     'size': os.fstat(fd).st_size
@@ -828,7 +829,7 @@ class ObjectController(object):
                         obj, self.logger, disk_chunk_size=self.disk_chunk_size)
         orig_timestamp = file.metadata.get('X-Timestamp')
         upload_expiration = time.time() + self.max_upload_time
-        etag = rmd5.rmd5()
+        etag = rmd5()
         upload_size = 0
         last_sync = 0
         with file.mkstemp() as (fd, tmppath):
@@ -854,7 +855,8 @@ class ObjectController(object):
             if 'content-length' in request.headers and \
                     int(request.headers['content-length']) != upload_size:
                 return HTTPClientDisconnect(request=request)
-            etag, state = etag.digest_and_state()
+            state = etag.get_state()
+            etag = etag.hexdigest()
             rev = {
                 'md5state': state,
                 'size': os.fstat(fd).st_size
@@ -940,7 +942,7 @@ class ObjectController(object):
                 return HTTPNotFound(request=request)
             if rev_num >= 0:
                 rev = file.get_revision(file.fp, rev_num)
-                etag, state = rmd5.rmd5(rev['md5state']).digest_and_state()
+                etag = rmd5(rev['md5state']).hexdigest()
                 file_size = rev['size']
                 app_iter = file.app_iter_revision(rev_num)
         if request.headers.get('if-match') not in (None, '*') and \
@@ -1050,7 +1052,7 @@ class ObjectController(object):
             response.etag = file.metadata['ETag']
             response.content_length = file_size
         else:
-            etag, state = rmd5.rmd5(rev['md5state'])
+            etag = rmd5(rev['md5state']).hexdigest()
             response.etag = etag
             response.content_length = str(rev['size'])
         response.last_modified = float(file.metadata['X-Timestamp'])

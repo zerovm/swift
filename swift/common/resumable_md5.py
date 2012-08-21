@@ -1,47 +1,62 @@
-from ctypes import c_uint32, memmove, create_string_buffer, Structure, sizeof, byref, addressof, util, CDLL
+from _ctypes import POINTER
+from ctypes import *
+import hashlib
 
-_libmd5 = CDLL(util.find_library('rmd5'))
-
-class rmd5_ctx(Structure):
+class EVP_MD(Structure):
     _fields_ = [
-        ('A', c_uint32),
-        ('B', c_uint32),
-        ('C', c_uint32),
-        ('D', c_uint32),
-        ('total', c_uint32 * 2),
-        ('buflen', c_uint32),
-        ('buffer', c_uint32 * 32)
+        ('type', c_int),
+        ('pkey_type', c_int),
+        ('md_size', c_int),
+        ('flags', c_ulong),
+        ('init', c_void_p),
+        ('update', c_void_p),
+        ('final', c_void_p),
+        ('copy', c_void_p),
+        ('cleanup', c_void_p),
+        ('sign', c_void_p),
+        ('verify', c_void_p),
+        ('required_pkey_type', c_int*5),
+        ('block_size', c_int),
+        ('ctx_size', c_int),
     ]
 
-    def get(self):
-        return buffer(self)[:]
+class EVP_MD_CTX(Structure):
+    _fields_ = [
+        ('digest', POINTER(EVP_MD)),
+        ('engine', c_void_p),
+        ('flags', c_ulong),
+        ('md_data', POINTER(c_char)),
+    ]
 
-    def set(self, bytes):
-        fit = min(len(bytes), sizeof(self))
-        memmove(addressof(self), bytes, fit)
+
+class EVPobject(Structure):
+    _fields_ = [
+        ('ob_refcnt', c_size_t),
+        ('ob_type', c_void_p),
+        ('name', py_object),
+        ('ctx', EVP_MD_CTX),
+    ]
 
 class rmd5:
 
-    def __init__(self, ctx=None):
-        self.ctx = rmd5_ctx()
-        if ctx is None:
-            _libmd5.md5_init_ctx(byref(self.ctx))
-        else:
-            self.ctx.set(ctx)
-        self.final = False
+    def __init__(self, state=None):
+        self.hash = hashlib.md5()
+        self.evp_ctx = cast(c_void_p(id(self.hash)), POINTER(EVPobject)).contents
+        if not state is None:
+            self.set_state(state)
 
     def update(self, bytes):
-        size = len(bytes)
-        if size % 64 == 0:
-            _libmd5.md5_process_block(bytes, size, byref(self.ctx))
-        else:
-            _libmd5.md5_process_bytes(bytes, size, byref(self.ctx))
+        self.hash.update(bytes)
 
-    def digest_and_state(self):
-        if self.final:
-            raise
-        state = self.ctx.get()
-        result = create_string_buffer(16)
-        _libmd5.md5_finish_ctx(byref(self.ctx), byref(result))
-        self.final = True
-        return result.raw.encode('hex_codec'), state
+    def hexdigest(self):
+        return self.hash.hexdigest()
+
+    def set_state(self, state):
+        ctx = self.evp_ctx.ctx
+        digest = ctx.digest.contents
+        memmove(ctx.md_data, state, digest.ctx_size)
+
+    def get_state(self):
+        ctx = self.evp_ctx.ctx
+        digest = ctx.digest.contents
+        return ctx.md_data[:digest.ctx_size]

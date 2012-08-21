@@ -40,7 +40,7 @@ from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
 from swift.common.exceptions import DiskFileNotExist
 from swift.obj import replicator
 from eventlet import tpool
-from swift.common import resumable_md5 as rmd5
+from swift.common.resumable_md5 import rmd5
 
 class TestDiskFile(unittest.TestCase):
     """Test swift.obj.server.DiskFile"""
@@ -155,7 +155,7 @@ class TestDiskFile(unittest.TestCase):
         df = object_server.DiskFile(self.testdir, 'sda1', '0', 'a', 'c',
                                     obj_name, FakeLogger())
         data = '0' * fsize
-        etag = rmd5.rmd5()
+        etag = rmd5()
         if ts:
             timestamp = ts
         else:
@@ -163,7 +163,8 @@ class TestDiskFile(unittest.TestCase):
         with df.mkstemp() as (fd, tmppath):
             os.write(fd, data)
             etag.update(data)
-            etag, state = etag.digest_and_state()
+            state = etag.get_state()
+            etag = etag.hexdigest()
             rev = None
             if extension == '.data':
                 rev = {
