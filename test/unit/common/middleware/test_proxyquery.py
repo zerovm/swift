@@ -281,7 +281,7 @@ class TestProxyQuery(unittest.TestCase):
         exp = 'HTTP/1.1 201'
         self.assertEqual(headers[:len(exp)], exp)
 
-    def get_random_numbers(self, min_num=0, max_num=10):
+    def get_random_numbers(self, min_num=0, max_num=10, proto='pickle'):
         numlist = [i for i in range(min_num, max_num)]
         count = max_num - min_num
         if count < 0:
@@ -291,10 +291,17 @@ class TestProxyQuery(unittest.TestCase):
             randindex2 = random.randrange(count)
             numlist[randindex1], numlist[randindex2] =\
             numlist[randindex2], numlist[randindex1]
-        return pickle.dumps(numlist, protocol=0)
+        if proto == 'binary':
+            return struct.pack('%sI' % len(numlist), *numlist)
+        else:
+            return pickle.dumps(numlist, protocol=0)
 
-    def get_sorted_numbers(self, min_num=0, max_num=10):
-        return pickle.dumps([i for i in range(min_num,max_num)], protocol=0)
+    def get_sorted_numbers(self, min_num=0, max_num=10, proto='pickle'):
+        numlist = [i for i in range(min_num,max_num)]
+        if proto == 'binary':
+            return struct.pack('%sI' % len(numlist), *numlist)
+        else:
+            return pickle.dumps(numlist, protocol=0)
 
     def setup_QUERY(self):
 
@@ -356,7 +363,7 @@ def retrieve_mnfst_field(n, eq=None, min=None, max=None, isint=False, optional=F
     setattr(mnfst, n.strip(), v)
 
 
-retrieve_mnfst_field('Version', '13072012')
+retrieve_mnfst_field('Version', '09082012')
 retrieve_mnfst_field('Nexe')
 retrieve_mnfst_field('NexeMax', isint=True)
 retrieve_mnfst_field('SyscallsMax', min=1, isint=True)
@@ -367,7 +374,7 @@ retrieve_mnfst_field('Environment', optional=True)
 retrieve_mnfst_field('CommandLine', optional=True)
 retrieve_mnfst_field('Channel')
 retrieve_mnfst_field('NodeName', optional=True)
-retrieve_mnfst_field('NameService', optional=True)
+retrieve_mnfst_field('NameServer', optional=True)
 
 channel_list = re.split('\s*,\s*',mnfst.Channel)
 if len(channel_list) % 7 != 0:
@@ -393,21 +400,21 @@ for i in xrange(0,len(dev_list)):
         node_name = device.split('/')[3]
         proto, host, port = fname.split(':')
         host = int(host)
-        if port == '0':
+        if '/dev/in/' in device:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.bind(('', 0))
             s.listen(1)
             port = s.getsockname()[1]
             bind_map[host] = {'name':device,'port':port,'proto':proto, 'sock':s}
-            bind_data += struct.pack('!IH', host, int(port))
+            bind_data += struct.pack('!IIH', host, 0, int(port))
             bind_count += 1
         else:
-            connect_data += struct.pack('!IH', host, 0)
+            connect_data += struct.pack('!IIH', host, 0, 0)
             connect_count += 1
             con_list.append(device)
 request = struct.pack('!I', alias) +\
           struct.pack('!I', bind_count) + bind_data + struct.pack('!I', connect_count) + connect_data
-ns_host, ns_port = mnfst.NameService.split(':')
+ns_proto, ns_host, ns_port = mnfst.NameServer.split(':')
 ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 ns.connect((ns_host, int(ns_port)))
 ns.sendto(request, (ns_host, int(ns_port)))
@@ -420,8 +427,8 @@ while 1:
         count = struct.unpack_from('!I', reply, offset)[0]
         offset += 4
         for i in range(count):
-            host, port = struct.unpack_from('!4sH', reply, offset)[0:2]
-            offset += 6
+            host, port = struct.unpack_from('!4sH', reply, offset+4)[0:2]
+            offset += 10
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((socket.inet_ntop(socket.AF_INET, host), port))
             con_list[i] = [con_list[i], 'tcp://%s:%d'
@@ -631,6 +638,197 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
         self.assertEqual(res.body, '\nfinished\n')
+
+    def test_QUERY_sort_store_stdout_stderr_realzvm(self):
+        self.setup_QUERY()
+        (_prosrv, _acc1srv, _acc2srv, _con1srv,
+         _con2srv, _obj1srv, _obj2srv) = _test_servers
+        _obj1srv.zerovm_exename = ['./zerovm']
+        _obj2srv.zerovm_exename = ['./zerovm']
+        prosrv = _test_servers[0]
+        prolis = _test_sockets[0]
+        fd = open('sort.nexe')
+        exe = fd.read()
+        fd.close()
+        self.create_object(prolis, '/v1/a/c/sort.exe', exe)
+        randomnum = self.get_random_numbers(0, 1024 * 1024 / 4, proto='binary')
+        self.create_object(prolis, '/v1/a/c/binary.data', randomnum)
+        conf = [
+                {
+                'name':'sort',
+                'exec':{'path':'/c/sort.exe'},
+                'file_list':[
+                        {'device':'stdin','path':'/c/binary.data'},
+                        {'device':'stdout','path':'/c/binary.out'},
+                        {'device':'stderr','path':'/c/sort.log'}
+                ],
+                'args':'%d' % (1024 * 1024)
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        resp = [
+                {
+                'status': '201 Created',
+                'body': '201 Created\n\n\n\n   ',
+                'name': 'sort',
+                'nexe_etag': 'disabled',
+                'nexe_status': 'ok',
+                'nexe_retcode': 0
+            }
+        ]
+        self.assertEqual(res.body, json.dumps(resp))
+
+        req = self.object_request('/v1/a/c/binary.out')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(0, 1024 * 1024 / 4, proto='binary'))
+
+        req = self.object_request('/v1/a/c/sort.log')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assert_('done\n' in res.body)
+
+    def test_QUERY_generator_zerovm(self):
+        self.setup_QUERY()
+        (_prosrv, _acc1srv, _acc2srv, _con1srv,
+         _con2srv, _obj1srv, _obj2srv) = _test_servers
+        prosrv = _test_servers[0]
+        prolis = _test_sockets[0]
+        self.create_container(prolis, '/v1/a/exe')
+        self.create_container(prolis, '/v1/a/unsorted')
+        self.create_container(prolis, '/v1/a/sorted')
+
+        @contextmanager
+        def save_args():
+            obj1_exe = _obj1srv.zerovm_exename
+            obj2_exe = _obj2srv.zerovm_exename
+            obj1_timeout = _obj1srv.zerovm_timeout
+            obj2_timeout = _obj2srv.zerovm_timeout
+            proxy_timeout = prosrv.app.node_timeout
+            try:
+                yield True
+            finally:
+                _obj1srv.zerovm_exename = obj1_exe
+                _obj2srv.zerovm_exename = obj2_exe
+                _obj1srv.zerovm_timeout = obj1_timeout
+                _obj2srv.zerovm_timeout = obj2_timeout
+                prosrv.app.node_timeout = proxy_timeout
+
+        with save_args():
+            _obj1srv.zerovm_exename = ['./zerovm']
+            _obj2srv.zerovm_exename = ['./zerovm']
+            _obj1srv.zerovm_timeout = 30
+            _obj2srv.zerovm_timeout = 30
+            prosrv.app.node_timeout = 30
+
+            fd = open('generator.uint32_t.nexe')
+            exe = fd.read()
+            fd.close()
+            self.create_object(prolis, '/v1/a/exe/generator.uint32_t.nexe', exe)
+            conf = [
+                    {
+                    "name": "generator",
+                    "exec": {"path": "/exe/generator.uint32_t.nexe"},
+                    "file_list": [
+                            {
+                            "device": "stdout",
+                            "path": "/unsorted/*.data"
+                        },
+                            {
+                            "device": "stderr"
+                        }
+                    ],
+                    "args": "500000",
+                    "count":2
+                }
+            ]
+            conf = json.dumps(conf)
+            req = self.zerovm_request()
+            req.body = conf
+            res = req.get_response(prosrv)
+            print res
+
+            fd = open('nodeman.nexe')
+            exe = fd.read()
+            fd.close()
+            self.create_object(prolis, '/v1/a/exe/nodeman.nexe', exe)
+            fd = open('nodesrc.nexe')
+            exe = fd.read()
+            fd.close()
+            self.create_object(prolis, '/v1/a/exe/nodesrc.nexe', exe)
+            fd = open('nodedst.nexe')
+            exe = fd.read()
+            fd.close()
+            self.create_object(prolis, '/v1/a/exe/nodedst.nexe', exe)
+            conf = [
+                    {
+                    "name":"src",
+                    "exec":{
+                        "path":"/exe/nodesrc.nexe"
+                    },
+                    "connect":[ "dst", "man" ],
+                    "file_list":[
+                            {
+                            "device":"stdin",
+                            "path":"/unsorted/generator*.data"
+                        }
+                    ],
+                    "env":{
+                        "SOURCE_NAME":"src",
+                        "MAN_NAME":"man",
+                        "DEST_NAME":"dst"
+                    }
+                },
+                    {
+                    "name":"dst",
+                    "exec":{
+                        "path":"/exe/nodedst.nexe"
+                    },
+                    "connect":[ "man" ],
+                    "file_list":[
+                            {
+                            "device":"stdout",
+                            "path":"/sorted/*.data"
+                        }
+                    ],
+                    "env":{
+                        "SOURCE_NAME":"src",
+                        "MAN_NAME":"man",
+                        "DEST_NAME":"dst"
+                    },
+                    "count":2
+                },
+                    {
+                    "name":"man",
+                    "exec":{
+                        "path":"/exe/nodeman.nexe"
+                    },
+                    "connect":[ "src" ],
+                    "file_list":[
+                            {
+                            "device":"stdout"
+                        },
+                            {
+                            "device":"stderr"
+                        }
+                    ],
+                    "env":{
+                        "SOURCE_NAME":"src",
+                        "MAN_NAME":"man",
+                        "DEST_NAME":"dst"
+                    }
+                }
+            ]
+            conf = json.dumps(conf)
+            req = self.zerovm_request()
+            req.body = conf
+            res = req.get_response(prosrv)
+            print res
+
 
     def test_QUERY_immediate_stdout(self):
         self.setup_QUERY()
@@ -1143,11 +1341,11 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         req = self.object_request('/v1/a/c_out1/out.sort-1')
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
-        self.assertEqual(res.body, self.get_sorted_numbers(0, 0))
+        self.assertEqual(res.body, '(l.')
         req = self.object_request('/v1/a/c_out1/out.sort-2')
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
-        self.assertEqual(res.body, self.get_sorted_numbers(0, 0))
+        self.assertEqual(res.body, '(l.')
 
     def test_QUERY_group_transform_multiple(self):
         self.setup_QUERY()

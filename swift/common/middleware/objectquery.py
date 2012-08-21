@@ -63,7 +63,7 @@ class ObjectQueryMiddleware(object):
         else:
             self.logger = get_logger(conf, log_route='obj-query')
 
-        self.zerovm_manifest_ver = conf.get('zerovm_manifest_ver','13072012')
+        self.zerovm_manifest_ver = conf.get('zerovm_manifest_ver','09082012')
         self.zerovm_exename = set(i.strip() for i in conf.get('zerovm_exename', 'zerovm').split() if i.strip())
         #self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '').split() if i.strip())
 
@@ -94,7 +94,7 @@ class ObjectQueryMiddleware(object):
         self.zerovm_maxnexe = int(conf.get('zerovm_maxnexe', 256 * 1048576))
 
         # maximum output data file size
-        self.zerovm_maxoutput = int(conf.get('zerovm_maxoutput', 64 * 1048576)) # TODO this breaks some tests
+        self.zerovm_maxoutput = int(conf.get('zerovm_maxoutput', 64 * 1048576))
 
         self.zerovm_maxchunksize = int(conf.get('zerovm_maxchunksize', 1024 * 1024))
 
@@ -118,6 +118,14 @@ class ObjectQueryMiddleware(object):
     def zerovm_query(self, req):
         """Handle HTTP QUERY requests for the Swift Object Server."""
 
+        nexe_headers = {
+            'x-nexe-retcode': 0,
+            'x-nexe-status': 'Zerovm did not run',
+            'x-nexe-etag': ''
+        }
+        if 'x-node-name' in req.headers:
+            nexe_name = re.split('\s*,\s*', req.headers['x-node-name'])
+            nexe_headers['x-nexe-name'] = nexe_name[0]
         zerovm_execute_only = False
         try:
             (device, partition, account) = \
@@ -133,28 +141,28 @@ class ObjectQueryMiddleware(object):
                 return HTTPBadRequest(body=str(err), request=req,
                     content_type='text/plain')
 
-        if self.zerovm_thrdpool.size != self.zerovm_maxpool:
-            self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
+        #if self.zerovm_thrdpool.size != self.zerovm_maxpool:
+        #    self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
         if self.zerovm_thrdpool.free() <= 0\
         and self.zerovm_thrdpool.waiting() >= self.zerovm_maxqueue:
             return HTTPServiceUnavailable(body='Slot not available',
-                request=req, content_type='text/plain')
+                request=req, content_type='text/plain', headers=nexe_headers)
         if self.app.mount_check and not check_mount(self.app.devices, device):
-            return Response(status='507 %s is not mounted' % device)
+            return Response(status='507 %s is not mounted' % device, headers=nexe_headers)
         if 'content-length' not in req.headers\
         and req.headers.get('transfer-encoding') != 'chunked':
-            return HTTPLengthRequired(request=req)
+            return HTTPLengthRequired(request=req, headers=nexe_headers)
         if 'content-length' in req.headers\
         and int(req.headers['content-length']) > self.zerovm_maxnexe:
             return HTTPRequestEntityTooLarge(body='Your request is too large.'
-                , request=req, content_type='text/plain')
+                , request=req, content_type='text/plain', headers=nexe_headers)
         if 'Content-Type' not in req.headers:
             return HTTPBadRequest(request=req, content_type='text/plain'
-                , body='No content type')
+                , body='No content type', headers=nexe_headers)
         if req.headers['Content-Type'] != 'application/octet-stream':
             return HTTPBadRequest(request=req,
                 body='Invalid Content-Type',
-                content_type='text/plain')
+                content_type='text/plain', headers=nexe_headers)
 
         channels = []
         if 'x-nexe-channels' in req.headers:
@@ -163,7 +171,8 @@ class ObjectQueryMiddleware(object):
                 if not channel in req.headers:
                     return HTTPBadRequest(request=req,
                         body='Missing header %s' % channel,
-                        content_type='text/plain')
+                        content_type='text/plain',
+                        headers=nexe_headers)
                 channels.append(req.headers[channel])
         channel_list = ''
         for channel in channels:
@@ -196,10 +205,10 @@ class ObjectQueryMiddleware(object):
             try:
                 input_file_size = file.get_data_file_size()
             except (DiskFileError, DiskFileNotExist):
-                return HTTPNotFound(request=req)
+                return HTTPNotFound(request=req, headers=nexe_headers)
             if input_file_size > self.zerovm_maxinput:
                 return HTTPRequestEntityTooLarge(body='Data Object is too large'
-                    , request=req, content_type='text/plain')
+                    , request=req, content_type='text/plain', headers=nexe_headers)
 
         with file.mkstemp() as (zerovm_nexe_fd, zerovm_nexe_fn):
             if 'content-length' in req.headers:
@@ -213,18 +222,19 @@ class ObjectQueryMiddleware(object):
                 ''):
                 upload_size += len(chunk)
                 if time.time() > upload_expiration:
-                    return HTTPRequestTimeout(request=req)
+                    return HTTPRequestTimeout(request=req, headers=nexe_headers)
                 etag.update(chunk)
                 while chunk:
                     written = self.os_interface.write(zerovm_nexe_fd, chunk)
                     chunk = chunk[written:]
+                    sleep()
             if 'content-length' in req.headers\
             and int(req.headers['content-length']) != upload_size:
-                return Response(status='499 Client Disconnect')
+                return Response(status='499 Client Disconnect', headers=nexe_headers)
             etag = etag.hexdigest()
             if 'etag' in req.headers and req.headers['etag'].lower()\
             != etag:
-                return HTTPUnprocessableEntity(request=req)
+                return HTTPUnprocessableEntity(request=req, headers=nexe_headers)
 
             def file_iter(fd_list, fn_list):
                 """Returns an iterator over the data file."""
@@ -244,6 +254,7 @@ class ObjectQueryMiddleware(object):
                                         read - dropped_cache)
                                     dropped_cache = read
                                 yield chunk
+                                sleep()
                             else:
                                 drop_buffer_cache(fd, dropped_cache, read
                                 - dropped_cache)
@@ -311,7 +322,7 @@ class ObjectQueryMiddleware(object):
                         self.zerovm_maxnexe,
                         self.zerovm_maxsyscalls,
                         etag,
-                        self.zerovm_timeout * 1000,
+                        self.zerovm_timeout,
                         self.zerovm_maxnexemem
                         ))
 
@@ -345,7 +356,7 @@ class ObjectQueryMiddleware(object):
                     nexe_name = re.split('\s*,\s*', req.headers['x-node-name'])
 
                 if 'x-name-service' in req.headers:
-                    zerovm_inputmnfst += 'NameService=%s\n'\
+                    zerovm_inputmnfst += 'NameServer=%s\n'\
                     % req.headers['x-name-service']
 
                 while zerovm_inputmnfst:
@@ -391,7 +402,10 @@ class ObjectQueryMiddleware(object):
                                 return 4, stdout_data, stderr_data
                         if proc.poll() is not None:
                             stdout_data, stderr_data = get_output(stdout_data, stderr_data)
-                            return proc.returncode, stdout_data, stderr_data
+                            ret = 0
+                            if proc.returncode:
+                                ret = 1
+                            return ret, stdout_data, stderr_data
                         sleep(0.1)
                     if proc.poll() is None:
                         proc.terminate()
@@ -409,10 +423,15 @@ class ObjectQueryMiddleware(object):
                 thrd = self.zerovm_thrdpool.spawn(ex_zerovm)
                 (zerovm_retcode, zerovm_stdout, zerovm_stderr) = thrd.wait()
                 if zerovm_retcode:
-                    raise Exception('ERROR OBJ.QUERY retcode=%s, '\
-                                    ' zerovm_stdout=%s'\
-                                    ' zerovm_stderr=%s'\
-                                    % (self.retcode_map[zerovm_retcode], zerovm_stdout, zerovm_stderr))
+                    err = 'ERROR OBJ.QUERY retcode=%s, '\
+                          ' zerovm_stdout=%s'\
+                            % (self.retcode_map[zerovm_retcode],
+                               zerovm_stdout)
+                    self.logger.exception(err)
+                    resp = Response(body=err,status='503 Internal Error')
+                    nexe_headers['x-nexe-status'] = 'ZeroVM runtime error'
+                    resp.headers = nexe_headers
+                    return resp
                 if zerovm_stderr:
                     self.logger.warning('zerovm stderr: '+zerovm_stderr)
                 report = zerovm_stdout.splitlines()

@@ -6,7 +6,7 @@ import traceback
 from eventlet.green import socket
 import time
 from hashlib import md5
-from eventlet import GreenPile, GreenPool
+from eventlet import GreenPile, GreenPool, sleep
 import greenlet
 from swiftclient.client import quote
 
@@ -92,12 +92,12 @@ class NameService(object):
                 count = struct.unpack_from('!I', message, offset)[0]
                 offset += 4
                 for i in range(count):
-                    h, port = struct.unpack_from('!IH', message, offset)[0:2]
+                    h, _junk, port = struct.unpack_from('!IIH', message, offset)[0:3]
                     bind_map.setdefault(alias, {})[h] = port
-                    offset += 6
+                    offset += 10
                 conn_map[alias] = ctypes.create_string_buffer(message[offset:])
                 peer_map.setdefault(alias, {})[0] = address[0]
-                peer_map[alias][1] = address[1]
+                peer_map.setdefault(alias, {})[1] = address[1]
 
                 if len(peer_map) == self.peers:
                     for src in peer_map.iterkeys():
@@ -108,13 +108,14 @@ class NameService(object):
                         for i in range(count):
                             h = struct.unpack_from('!I', reply, offset)[0]
                             port = bind_map[h][src]
-                            struct.pack_into('!4sH', reply, offset,
+                            struct.pack_into('!4sH', reply, offset + 4,
                                 socket.inet_pton(socket.AF_INET, peer_map[src][0]), port)
-                            offset += 6
+                            offset += 10
                         self.sock.sendto(reply, (peer_map[src][0], peer_map[src][1]))
             except greenlet.GreenletExit:
                 return
             except Exception:
+                print traceback.format_exc()
                 pass
 
     def stop(self):
@@ -325,6 +326,12 @@ class ClusterController(Controller):
         return result
 
     def make_request(self, node, request, ns_port):
+        nexe_headers = {
+            'x-node-name': node.name,
+            'x-nexe-status': 'ZeroVM did not run',
+            'x-nexe-retcode' : 0,
+            'x-nexe-etag': ''
+        }
         path_info = request.path_info
         top_path = node.channels[0].path
         if top_path \
@@ -339,10 +346,11 @@ class ClusterController(Controller):
         load_from = request.path_info + node.exe
         source_req = request.copy_get()
         source_req.path_info = load_from
-        source_req.headers['X-Newest'] = 'true'
+        #source_req.headers['X-Newest'] = 'true'
         acct, src_container_name, src_obj_name = split_path(load_from, 1, 3, True)
         source_resp = ObjectController(self.app, acct, src_container_name, src_obj_name).GET(source_req)
         if source_resp.status_int >= 300:
+            source_resp.headers = nexe_headers
             return source_resp
         code_source = source_resp.app_iter
         shuffle(obj_nodes)
@@ -355,7 +363,7 @@ class ClusterController(Controller):
             # which currently only happens because there are more than
             # CONTAINER_LISTING_LIMIT segments in a segmented object. In
             # this case, we're going to refuse request.
-            return HTTPRequestEntityTooLarge(request=req)
+            return HTTPRequestEntityTooLarge(request=req, headers=nexe_headers)
         req.etag = source_resp.etag
         req.headers['Content-Type'] =\
             source_resp.headers['Content-Type']
@@ -394,7 +402,7 @@ class ClusterController(Controller):
                 addr = self.get_local_address(n)
                 if addr:
                     break
-        req.headers['x-name-service'] = '%s:%d' % (addr, ns_port)
+        req.headers['x-name-service'] = 'udp:%s:%d' % (addr, ns_port)
         if node.args:
             req.headers['x-nexe-args'] = node.args
         if node.env:
@@ -421,7 +429,10 @@ class ClusterController(Controller):
                     continue
         conn = connect()
         if not conn:
-            raise Exception('Cannot find suitable node to execute code on')
+            self.app.logger.exception(
+                _('ERROR Cannot find suitable node to execute code on'))
+            return HTTPServiceUnavailable(body='Cannot find suitable node to execute code on', headers=nexe_headers)
+
         chunked = req.headers.get('transfer-encoding')
         try:
             req.bytes_transferred = 0
@@ -435,11 +446,12 @@ class ClusterController(Controller):
                         break
                     req.bytes_transferred += len(chunk)
                     if req.bytes_transferred > self.app.zerovm_maxnexe:
-                        return HTTPRequestEntityTooLarge(request=req)
+                        return HTTPRequestEntityTooLarge(request=req, headers=nexe_headers)
                     try:
                         with ChunkWriteTimeout(self.app.node_timeout):
                             conn.send('%x\r\n%s\r\n' % (len(chunk), chunk)
                             if chunked else chunk)
+                            sleep()
                     except (Exception, ChunkWriteTimeout):
                         raise Exception(conn.node, _('Object'),
                             _('Trying to write to %s') % req.path_info)
@@ -447,17 +459,17 @@ class ClusterController(Controller):
         except ChunkReadTimeout, err:
             self.app.logger.warn(
                 _('ERROR Client read timeout (%ss)'), err.seconds)
-            return HTTPRequestTimeout(request=req)
+            return HTTPRequestTimeout(request=req, headers=nexe_headers)
         except Exception:
             req.client_disconnect = True
             self.app.logger.exception(
                 _('ERROR Exception causing client disconnect'))
-            return Response(status='499 Client Disconnect')
+            return Response(status='499 Client Disconnect', headers=nexe_headers)
         if req.content_length and req.bytes_transferred < req.content_length:
             req.client_disconnect = True
             self.app.logger.warn(
                 _('Client disconnected without sending enough data'))
-            return Response(status='499 Client Disconnect')
+            return Response(status='499 Client Disconnect', headers=nexe_headers)
         try:
             with Timeout(self.app.node_timeout):
                 server_response = conn.getresponse()
@@ -465,10 +477,12 @@ class ClusterController(Controller):
             self.exception_occurred(conn.node, _('Object'),
                 _('Trying to get final status of POST to %s')
                 % req.path_info)
-            return Response(status='499 Client Disconnect')
+            return Response(status='499 Client Disconnect', headers=nexe_headers)
         if server_response.status != 200:
-            raise Exception('Error querying object server %s %s'
-            % (server_response.status, server_response.read()))
+            resp = Response(status='%d %s' % (server_response.status, server_response.reason),
+                body=server_response.read())
+            update_headers(resp, nexe_headers)
+            return resp
 
         std_size = server_response.getheader('x-nexe-stdsize')
         if not std_size:
@@ -488,6 +502,7 @@ class ClusterController(Controller):
                     if not chunk:
                         break
                     yield chunk
+                    sleep()
                     #client_response.bytes_transferred += len(chunk)
             except GeneratorExit:
                 client_response.client_disconnect = True
@@ -511,6 +526,7 @@ class ClusterController(Controller):
                 dest_resp = \
                     ObjectController(self.app, acct, dest_container_name, dest_obj_name).PUT(dest_req)
                 if dest_resp.status_int >= 300:
+                    update_headers(dest_resp, nexe_headers)
                     return dest_resp
                 update_headers(dest_resp, server_response.getheaders())
             else:
@@ -559,7 +575,7 @@ class ClusterController(Controller):
 
         try:
             cluster_config = json.loads(cluster_config)
-            nid = 0
+            nid = 1
             for node in cluster_config:
                 node_name = node.get('name')
                 if not node_name:
@@ -577,6 +593,7 @@ class ClusterController(Controller):
                 read_list = []
                 write_list = []
                 other_list = []
+
                 if file_list:
                     for f in file_list:
                         device = f.get('device')
