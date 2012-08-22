@@ -17,6 +17,7 @@
 
 import cPickle as pickle
 import os
+from random import randrange
 import sys
 import shutil
 import unittest
@@ -27,7 +28,7 @@ from tempfile import mkdtemp
 from hashlib import md5
 
 from eventlet import sleep, spawn, wsgi, listen, Timeout
-from swift.obj.server import read_metadata
+from swift.obj.server import read_metadata, REVSDATA_STRIDE
 from webob import Request
 from test.unit import FakeLogger
 from test.unit import _getxattr as getxattr
@@ -102,6 +103,28 @@ class TestDiskFile(unittest.TestCase):
             pass
 
         self.assertEquals(hook_call_count[0], 9)
+
+    def test_iter_hook_append(self):
+        hook_call_count = [0]
+        def hook():
+            hook_call_count[0] += 1
+
+        df = self._get_data_file(fsize=64, csize=8, iter_hook=hook)
+        self._append_to_file(df, appended_size=65)
+        #print repr(df.__dict__)
+        for _ in df:
+            pass
+        self.assertEquals(hook_call_count[0], 17)
+
+    def test_revision_key(self):
+        size = 64
+        df = self._get_data_file(fsize=size, csize=8)
+        for i in range(REVSDATA_STRIDE+1):
+            self._append_to_file(df, appended_size=64)
+            size += 64
+        self.assertEqual(df.get_data_file_size(), size)
+        ndf = self._get_data_file(fsize=size, csize=8)
+        self.assertEqual(ndf.metadata['ETag'], df.metadata['ETag'])
 
     def test_quarantine(self):
         df = object_server.DiskFile(self.testdir, 'sda1', '0', 'a', 'c', 'o',
@@ -198,6 +221,48 @@ class TestDiskFile(unittest.TestCase):
         df.unit_test_len = fsize
         return df
 
+    def _append_to_file(self, df, invalid_type=None,
+                       appended_size=1024, ts=None):
+        data = '0' * appended_size
+        if ts:
+            timestamp = ts
+        else:
+            timestamp = str(normalize_timestamp(time()))
+        with df.get_appendable_file() as obj_file:
+            fd = obj_file.fileno()
+            os.lseek(fd, df.get_data_file_size(), os.SEEK_SET)
+            old_rev = df.get_revision(fd, -1)
+            new_md5 = rmd5(old_rev['md5state'])
+            os.write(fd, data)
+            new_md5.update(data)
+            state = new_md5.get_state()
+            new_rev = {
+                'md5state': state,
+                'size': os.fstat(fd).st_size
+            }
+            metadata = {
+                'X-Timestamp': timestamp,
+                'ETag': new_md5.hexdigest(),
+                'Content-Length': str(new_rev['size']),
+                'X-Revision': df.metadata['X-Revision']
+            }
+            df.append(fd, metadata, new_rev)
+            if invalid_type == 'ETag':
+                etag = md5()
+                etag.update('1' + '0' * (appended_size - 1))
+                etag = etag.hexdigest()
+                metadata['ETag'] = etag
+                object_server.write_metadata(fd, metadata)
+            if invalid_type == 'Content-Length':
+                metadata['Content-Length'] = new_rev['size'] + 1
+                object_server.write_metadata(fd, metadata)
+
+        if invalid_type == 'Zero-Byte':
+            os.remove(df.data_file)
+            fp = open(df.data_file, 'w')
+            fp.close()
+        df.unit_test_len = new_rev['size']
+
     def test_quarantine_valids(self):
         df = self._get_data_file(obj_name='1')
         for chunk in df:
@@ -210,6 +275,28 @@ class TestDiskFile(unittest.TestCase):
         self.assertFalse(df.quarantined_dir)
 
         df = self._get_data_file(obj_name='3', csize=100000)
+        for chunk in df:
+            pass
+        self.assertFalse(df.quarantined_dir)
+
+    def test_quarantine_valids_apended(self):
+        df = self._get_data_file(obj_name='1')
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        for chunk in df:
+            pass
+        self.assertFalse(df.quarantined_dir)
+
+        df = self._get_data_file(obj_name='2', csize=1)
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        for chunk in df:
+            pass
+        self.assertFalse(df.quarantined_dir)
+
+        df = self._get_data_file(obj_name='3', csize=100000)
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
         for chunk in df:
             pass
         self.assertFalse(df.quarantined_dir)
@@ -257,10 +344,94 @@ class TestDiskFile(unittest.TestCase):
             pass
         self.assertEquals(bool(df.quarantined_dir), expected_quar)
 
+    def run_quarantine_invalids_appended(self, invalid_type):
+        df = self._get_data_file(obj_name='1')
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        self._append_to_file(df, invalid_type=invalid_type)
+        for chunk in df:
+            pass
+        self.assertTrue(df.quarantined_dir)
+        df = self._get_data_file(obj_name='2', csize=1)
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        self._append_to_file(df, invalid_type=invalid_type)
+        for chunk in df:
+            pass
+        self.assertTrue(df.quarantined_dir)
+        df = self._get_data_file(obj_name='3', csize=100000)
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        self._append_to_file(df, invalid_type=invalid_type)
+        for chunk in df:
+            pass
+        self.assertTrue(df.quarantined_dir)
+        df = self._get_data_file(obj_name='4')
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        self._append_to_file(df, invalid_type=invalid_type)
+        self.assertFalse(df.quarantined_dir)
+        df = self._get_data_file(obj_name='5')
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        self._append_to_file(df, invalid_type=invalid_type)
+        for chunk in df.app_iter_range(0, df.unit_test_len):
+            pass
+        self.assertTrue(df.quarantined_dir)
+        df = self._get_data_file(obj_name='6')
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        self._append_to_file(df, invalid_type=invalid_type)
+        for chunk in df.app_iter_range(0, df.unit_test_len + 100):
+            pass
+        self.assertTrue(df.quarantined_dir)
+        expected_quar = False
+        # for the following, Content-Length/Zero-Byte errors will always result
+        # in a quarantine, even if the whole file isn't check-summed
+        if invalid_type in ('Zero-Byte', 'Content-Length'):
+            expected_quar = True
+        df = self._get_data_file(obj_name='7')
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        self._append_to_file(df, invalid_type=invalid_type)
+        for chunk in df.app_iter_range(1, df.unit_test_len):
+            pass
+        self.assertEquals(bool(df.quarantined_dir), expected_quar)
+        df = self._get_data_file(obj_name='8')
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        self._append_to_file(df, invalid_type=invalid_type)
+        for chunk in df.app_iter_range(0, df.unit_test_len - 1):
+            pass
+        self.assertEquals(bool(df.quarantined_dir), expected_quar)
+        df = self._get_data_file(obj_name='8')
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        self._append_to_file(df, invalid_type=invalid_type)
+        for chunk in df.app_iter_range(1, df.unit_test_len + 1):
+            pass
+        self.assertEquals(bool(df.quarantined_dir), expected_quar)
+
     def test_quarantine_invalids(self):
         self.run_quarantine_invalids('ETag')
         self.run_quarantine_invalids('Content-Length')
         self.run_quarantine_invalids('Zero-Byte')
+
+    def test_quarantine_invalids_append(self):
+        self.run_quarantine_invalids_appended('ETag')
+        self.run_quarantine_invalids_appended('Content-Length')
+        self.run_quarantine_invalids_appended('Zero-Byte')
+
+    def test_failed_append(self):
+        df = self._get_data_file(obj_name='1')
+        for i in range(randrange(REVSDATA_STRIDE * 2)):
+            self._append_to_file(df, appended_size=64)
+        fp = open(df.data_file, 'a')
+        fp.write('0'*1024)
+        fp.close()
+        for chunk in df:
+            pass
+        self.assertFalse(df.quarantined_dir)
 
     def test_quarantine_deleted_files(self):
         df = self._get_data_file(invalid_type='Content-Length',

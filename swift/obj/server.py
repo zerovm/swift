@@ -373,7 +373,7 @@ class DiskFile(object):
         if extension == '.data':
             if revision is None:
                 raise Exception('Revision is required for data files')
-            self.add_revision(fd, revision, metadata)
+            self._add_revision(fd, revision, metadata)
         write_metadata(fd, metadata)
         if 'Content-Length' in metadata:
             self.drop_cache(fd, 0, int(metadata['Content-Length']))
@@ -397,9 +397,10 @@ class DiskFile(object):
         if 'Content-Length' in metadata:
             self.drop_cache(fd, 0, int(metadata['Content-Length']))
         tpool.execute(os.fsync, fd)
-        self.add_revision(fd, revision, metadata)
+        self._add_revision(fd, revision, metadata)
         write_metadata(fd, metadata)
         new_name = os.path.join(self.datadir, timestamp + '.data')
+        invalidate_hash(os.path.dirname(self.datadir))
         renamer(self.data_file, new_name)
         self.data_file = new_name
         self.metadata = metadata
@@ -490,7 +491,7 @@ class DiskFile(object):
             return None
         return result
 
-    def add_revision(self, fd, rev, metadata):
+    def _add_revision(self, fd, rev, metadata):
         """
         Add new revision data to the file attributes and write it to disk
 
