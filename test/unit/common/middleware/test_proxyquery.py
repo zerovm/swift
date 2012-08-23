@@ -374,7 +374,7 @@ retrieve_mnfst_field('Environment', optional=True)
 retrieve_mnfst_field('CommandLine', optional=True)
 retrieve_mnfst_field('Channel')
 retrieve_mnfst_field('NodeName', optional=True)
-retrieve_mnfst_field('NameService', optional=True)
+retrieve_mnfst_field('NameServer', optional=True)
 
 channel_list = re.split('\s*,\s*',mnfst.Channel)
 if len(channel_list) % 7 != 0:
@@ -406,15 +406,15 @@ for i in xrange(0,len(dev_list)):
             s.listen(1)
             port = s.getsockname()[1]
             bind_map[host] = {'name':device,'port':port,'proto':proto, 'sock':s}
-            bind_data += struct.pack('!IH', host, int(port))
+            bind_data += struct.pack('!IIH', host, 0, int(port))
             bind_count += 1
         else:
-            connect_data += struct.pack('!IH', host, 0)
+            connect_data += struct.pack('!IIH', host, 0, 0)
             connect_count += 1
             con_list.append(device)
 request = struct.pack('!I', alias) +\
           struct.pack('!I', bind_count) + bind_data + struct.pack('!I', connect_count) + connect_data
-ns_proto, ns_host, ns_port = mnfst.NameService.split(':')
+ns_proto, ns_host, ns_port = mnfst.NameServer.split(':')
 ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 ns.connect((ns_host, int(ns_port)))
 ns.sendto(request, (ns_host, int(ns_port)))
@@ -427,8 +427,8 @@ while 1:
         count = struct.unpack_from('!I', reply, offset)[0]
         offset += 4
         for i in range(count):
-            host, port = struct.unpack_from('!4sH', reply, offset)[0:2]
-            offset += 6
+            host, port = struct.unpack_from('!4sH', reply, offset+4)[0:2]
+            offset += 10
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((socket.inet_ntop(socket.AF_INET, host), port))
             con_list[i] = [con_list[i], 'tcp://%s:%d'
@@ -701,115 +701,133 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         self.create_container(prolis, '/v1/a/exe')
         self.create_container(prolis, '/v1/a/unsorted')
         self.create_container(prolis, '/v1/a/sorted')
-        _obj1srv.zerovm_exename = ['./zerovm']
-        _obj2srv.zerovm_exename = ['./zerovm']
-        _obj1srv.zerovm_timeout = 30
-        _obj2srv.zerovm_timeout = 30
-        prosrv.app.node_timeout = 30
 
-        fd = open('generator.uint32_t.nexe')
-        exe = fd.read()
-        fd.close()
-        self.create_object(prolis, '/v1/a/exe/generator.uint32_t.nexe', exe)
-        conf = [
-                {
-                "name": "generator",
-                "exec": {"path": "/exe/generator.uint32_t.nexe"},
-                "file_list": [
-                        {
-                        "device": "stdout",
-                        "path": "/unsorted/*.data"
-                    },
-                        {
-                        "device": "stderr"
-                    }
-                ],
-                "args": "500000",
-                "count":2
-            }
-        ]
-        conf = json.dumps(conf)
-        req = self.zerovm_request()
-        req.body = conf
-        res = req.get_response(prosrv)
-        print res
+        @contextmanager
+        def save_args():
+            obj1_exe = _obj1srv.zerovm_exename
+            obj2_exe = _obj2srv.zerovm_exename
+            obj1_timeout = _obj1srv.zerovm_timeout
+            obj2_timeout = _obj2srv.zerovm_timeout
+            proxy_timeout = prosrv.app.node_timeout
+            try:
+                yield True
+            finally:
+                _obj1srv.zerovm_exename = obj1_exe
+                _obj2srv.zerovm_exename = obj2_exe
+                _obj1srv.zerovm_timeout = obj1_timeout
+                _obj2srv.zerovm_timeout = obj2_timeout
+                prosrv.app.node_timeout = proxy_timeout
 
-        fd = open('nodeman.nexe')
-        exe = fd.read()
-        fd.close()
-        self.create_object(prolis, '/v1/a/exe/nodeman.nexe', exe)
-        fd = open('nodesrc.nexe')
-        exe = fd.read()
-        fd.close()
-        self.create_object(prolis, '/v1/a/exe/nodesrc.nexe', exe)
-        fd = open('nodedst.nexe')
-        exe = fd.read()
-        fd.close()
-        self.create_object(prolis, '/v1/a/exe/nodedst.nexe', exe)
-        conf = [
-                {
-                "name":"src",
-                "exec":{
-                    "path":"/exe/nodesrc.nexe"
-                },
-                "connect":[ "dst", "man" ],
-                "file_list":[
-                        {
-                        "device":"stdin",
-                        "path":"/unsorted/generator*.data"
-                    }
-                ],
-                "env":{
-                    "SOURCE_NAME":"src",
-                    "MAN_NAME":"man",
-                    "DEST_NAME":"dst"
+        with save_args():
+            _obj1srv.zerovm_exename = ['./zerovm']
+            _obj2srv.zerovm_exename = ['./zerovm']
+            _obj1srv.zerovm_timeout = 30
+            _obj2srv.zerovm_timeout = 30
+            prosrv.app.node_timeout = 30
+
+            fd = open('generator.uint32_t.nexe')
+            exe = fd.read()
+            fd.close()
+            self.create_object(prolis, '/v1/a/exe/generator.uint32_t.nexe', exe)
+            conf = [
+                    {
+                    "name": "generator",
+                    "exec": {"path": "/exe/generator.uint32_t.nexe"},
+                    "file_list": [
+                            {
+                            "device": "stdout",
+                            "path": "/unsorted/*.data"
+                        },
+                            {
+                            "device": "stderr"
+                        }
+                    ],
+                    "args": "500000",
+                    "count":2
                 }
-            },
-                {
-                "name":"dst",
-                "exec":{
-                    "path":"/exe/nodedst.nexe"
-                },
-                "connect":[ "man" ],
-                "file_list":[
-                        {
-                        "device":"stdout",
-                        "path":"/sorted/*.data"
-                    }
-                ],
-                "env":{
-                    "SOURCE_NAME":"src",
-                    "MAN_NAME":"man",
-                    "DEST_NAME":"dst"
-                },
-                "count":2
-            },
-                {
-                "name":"man",
-                "exec":{
-                    "path":"/exe/nodeman.nexe"
-                },
-                "connect":[ "src" ],
-                "file_list":[
-                        {
-                        "device":"stdout"
+            ]
+            conf = json.dumps(conf)
+            req = self.zerovm_request()
+            req.body = conf
+            res = req.get_response(prosrv)
+            print res
+
+            fd = open('nodeman.nexe')
+            exe = fd.read()
+            fd.close()
+            self.create_object(prolis, '/v1/a/exe/nodeman.nexe', exe)
+            fd = open('nodesrc.nexe')
+            exe = fd.read()
+            fd.close()
+            self.create_object(prolis, '/v1/a/exe/nodesrc.nexe', exe)
+            fd = open('nodedst.nexe')
+            exe = fd.read()
+            fd.close()
+            self.create_object(prolis, '/v1/a/exe/nodedst.nexe', exe)
+            conf = [
+                    {
+                    "name":"src",
+                    "exec":{
+                        "path":"/exe/nodesrc.nexe"
                     },
-                        {
-                        "device":"stderr"
+                    "connect":[ "dst", "man" ],
+                    "file_list":[
+                            {
+                            "device":"stdin",
+                            "path":"/unsorted/generator*.data"
+                        }
+                    ],
+                    "env":{
+                        "SOURCE_NAME":"src",
+                        "MAN_NAME":"man",
+                        "DEST_NAME":"dst"
                     }
-                ],
-                "env":{
-                    "SOURCE_NAME":"src",
-                    "MAN_NAME":"man",
-                    "DEST_NAME":"dst"
+                },
+                    {
+                    "name":"dst",
+                    "exec":{
+                        "path":"/exe/nodedst.nexe"
+                    },
+                    "connect":[ "man" ],
+                    "file_list":[
+                            {
+                            "device":"stdout",
+                            "path":"/sorted/*.data"
+                        }
+                    ],
+                    "env":{
+                        "SOURCE_NAME":"src",
+                        "MAN_NAME":"man",
+                        "DEST_NAME":"dst"
+                    },
+                    "count":2
+                },
+                    {
+                    "name":"man",
+                    "exec":{
+                        "path":"/exe/nodeman.nexe"
+                    },
+                    "connect":[ "src" ],
+                    "file_list":[
+                            {
+                            "device":"stdout"
+                        },
+                            {
+                            "device":"stderr"
+                        }
+                    ],
+                    "env":{
+                        "SOURCE_NAME":"src",
+                        "MAN_NAME":"man",
+                        "DEST_NAME":"dst"
+                    }
                 }
-            }
-        ]
-        conf = json.dumps(conf)
-        req = self.zerovm_request()
-        req.body = conf
-        res = req.get_response(prosrv)
-        print res
+            ]
+            conf = json.dumps(conf)
+            req = self.zerovm_request()
+            req.body = conf
+            res = req.get_response(prosrv)
+            print res
 
 
     def test_QUERY_immediate_stdout(self):

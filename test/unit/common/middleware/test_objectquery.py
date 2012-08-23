@@ -156,7 +156,7 @@ retrieve_mnfst_field('Environment', optional=True)
 retrieve_mnfst_field('CommandLine', optional=True)
 retrieve_mnfst_field('Channel')
 retrieve_mnfst_field('NodeName', optional=True)
-retrieve_mnfst_field('NameService', optional=True)
+retrieve_mnfst_field('NameServer', optional=True)
 
 channel_list = re.split('\s*,\s*',mnfst.Channel)
 if len(channel_list) % 7 != 0:
