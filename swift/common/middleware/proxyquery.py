@@ -813,6 +813,10 @@ class ClusterController(Controller):
         node_list = []
         for k in sorted(self.nodes.iterkeys()):
             node_list.append(self.nodes[k])
+            if not self.nodes[k].bind and not self.nodes[k].connect \
+                and not self.nodes[k].channels:
+                return HTTPBadRequest(request=req,
+                    body='Isolated node detected in config: %s' % k)
         #for n in node_list:
         #    print n.__dict__
         ns_server = NameService()
