@@ -541,6 +541,99 @@ class TestObject(unittest.TestCase):
         resp.read()
         self.assertEquals(resp.status, 204)
 
+    def test_append(self):
+        size = 1024
+        obj_path = '%s/%s' % (self.container, 'appendable')
+
+        # do a simple PUT
+        body = 'a' * size
+        obj_content = body
+        def put(url, token, parsed, conn, body=body):
+            conn.request('PUT', '%s/%s' % (parsed.path, obj_path), body,
+                    {'X-Auth-Token': token})
+            return check_response(conn)
+        resp = retry(put, body=body)
+        contents = resp.read()
+        self.assertEquals(resp.status, 201)
+
+        # GET the original object after PUT
+        def get(url, token, parsed, conn):
+            conn.request('GET',
+                '%s/%s' % (parsed.path, obj_path),
+                '', {'X-Auth-Token': token})
+            return check_response(conn)
+        resp = retry(get)
+        contents = resp.read()
+        self.assertEquals(resp.status, 200)
+        self.assertEquals(contents, obj_content)
+        self.assertEqual(resp.getheader('X-Revision'), str(0))
+
+        # append first revision
+        body = 'b' * size
+        obj_content += body
+        def append(url, token, parsed, conn):
+            conn.request('POST', '%s/%s' % (parsed.path, obj_path), body,
+                    {'X-Auth-Token': token,
+                     'X-Append-To': -1})
+            return check_response(conn)
+        resp = retry(append)
+        contents = resp.read()
+        self.assertEquals(resp.status, 202)
+
+        # GET appended object
+        resp = retry(get)
+        contents = resp.read()
+        self.assertEquals(resp.status, 200)
+        self.assertEquals(contents, obj_content)
+        self.assertEqual(resp.getheader('X-Revision'), str(1))
+
+        # append more revisions
+        revs = 5
+        for i in range(revs):
+            obj_content += body
+            resp = retry(append)
+            contents = resp.read()
+            self.assertEquals(resp.status, 202)
+
+            resp = retry(get)
+            contents = resp.read()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(contents, obj_content)
+        self.assertEqual(resp.getheader('X-Revision'), str(revs + 1))
+
+        def get_revision(url, token, parsed, conn, rev_num=0):
+            conn.request('GET',
+                '%s/%s' % (parsed.path, obj_path),
+                '', {'X-Auth-Token': token,
+                     'X-Revision': rev_num})
+            return check_response(conn)
+
+        # GET specific revision from the middle
+        obj_content = 'a' * size + 'b' * size * (revs // 2 + 1)
+        resp = retry(get_revision, rev_num=(revs // 2 + 1))
+        contents = resp.read()
+        self.assertEquals(resp.status, 200)
+        self.assertEquals(contents, obj_content)
+        self.assertEqual(resp.getheader('X-Revision'), str(revs // 2 + 1))
+
+        # GET specific revision from the end
+        obj_content = 'a' * size + 'b' * size * revs
+        resp = retry(get_revision, rev_num=revs)
+        contents = resp.read()
+        self.assertEquals(resp.status, 200)
+        self.assertEquals(contents, obj_content)
+        self.assertEqual(resp.getheader('X-Revision'), str(revs))
+
+        # PUT should overwrite appeneded object: revision = 0 again
+        body = 'c' * size
+        resp = retry(put, body=body)
+        contents = resp.read()
+        self.assertEquals(resp.status, 201)
+        resp = retry(get)
+        contents = resp.read()
+        self.assertEquals(resp.status, 200)
+        self.assertEquals(contents, body)
+        self.assertEqual(resp.getheader('X-Revision'), str(0))
 
 if __name__ == '__main__':
     unittest.main()

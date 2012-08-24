@@ -776,6 +776,7 @@ class ObjectController(object):
                          'x-etag': file.metadata['ETag'],
                          'x-trans-id': request.headers.get('x-trans-id', '-')},
                     device)
+            return HTTPAccepted(request=request, etag=file.metadata['ETag'])
         else:
             metadata = {'X-Timestamp': request.headers['x-timestamp']}
             metadata.update(val for val in request.headers.iteritems()
@@ -937,6 +938,7 @@ class ObjectController(object):
             return HTTPNotFound(request=request)
         etag = file.metadata['ETag']
         app_iter = file
+        rev_num = int(file.metadata['X-Revision'])
         if 'x-revision' in request.headers:
             rev_num = int(request.headers['x-revision'])
             if rev_num > int(file.metadata['X-Revision']):
@@ -1001,7 +1003,7 @@ class ObjectController(object):
         if 'Content-Encoding' in file.metadata:
             response.content_encoding = file.metadata['Content-Encoding']
         response.headers['X-Timestamp'] = file.metadata['X-Timestamp']
-        response.headers['X-Revision'] = file.metadata['X-Revision']
+        response.headers['X-Revision'] = str(rev_num)
         self.logger.timing_since('GET.timing', start_time)
         return request.get_response(response)
 

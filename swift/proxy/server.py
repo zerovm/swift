@@ -1069,7 +1069,22 @@ class ObjectController(Controller):
                                       content_type='text/plain',
                                       body='Non-integer X-Delete-After')
             req.headers['x-delete-at'] = '%d' % (time.time() + x_delete_after)
-        if self.app.object_post_as_copy:
+        if 'x-append-to' in req.headers:
+            try:
+                _junk = int(req.headers['x-append-to'])
+            except ValueError:
+                self.app.logger.increment('errors')
+                return HTTPBadRequest(request=req,
+                    content_type='text/plain',
+                    body='Non-integer X-Append-To')
+            req.method = 'POST'
+            req.path_info = '/%s/%s/%s' % (self.account_name,
+                                           self.container_name, self.object_name)
+            resp = self.PUT(req, start_time=start_time, stats_type='POST', append=True)
+            if resp.status_int != HTTP_CREATED:
+                return resp
+            return HTTPAccepted(request=req)
+        elif self.app.object_post_as_copy:
             req.method = 'PUT'
             req.path_info = '/%s/%s/%s' % (self.account_name,
                 self.container_name, self.object_name)
@@ -1082,21 +1097,6 @@ class ObjectController(Controller):
             # Older editions returned 202 Accepted on object POSTs, so we'll
             # convert any 201 Created responses to that for compatibility with
             # picky clients.
-            if resp.status_int != HTTP_CREATED:
-                return resp
-            return HTTPAccepted(request=req)
-        elif 'x-append-to' in req.headers:
-            try:
-                _junk = int(req.headers['x-append-to'])
-            except ValueError:
-                self.app.logger.increment('errors')
-                return HTTPBadRequest(request=req,
-                    content_type='text/plain',
-                    body='Non-integer X-Append-To')
-            req.method = 'POST'
-            req.path_info = '/%s/%s/%s' % (self.account_name,
-                                           self.container_name, self.object_name)
-            resp = self.PUT(req, start_time=start_time, stats_type='POST', append=True)
             if resp.status_int != HTTP_CREATED:
                 return resp
             return HTTPAccepted(request=req)
