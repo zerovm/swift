@@ -4,6 +4,7 @@ import struct
 from eventlet.green import socket
 from swiftclient.client import quote
 import random
+import swift
 
 try:
     import simplejson as json
@@ -40,7 +41,7 @@ from swift.common.middleware import proxyquery, objectquery
 def setup():
     global _testdir, _test_servers, _test_sockets,\
     _orig_container_listing_limit, _test_coros
-    monkey_patch_mimetools()
+    #monkey_patch_mimetools()
     # Since we're starting up a lot here, we're going to test more than
     # just chunked puts; we're also going to test parts of
     # proxy_server.Application we couldn't get to easily otherwise.
@@ -51,7 +52,8 @@ def setup():
     mkdirs(os.path.join(_testdir, 'sda1', 'tmp'))
     mkdirs(os.path.join(_testdir, 'sdb1'))
     mkdirs(os.path.join(_testdir, 'sdb1', 'tmp'))
-    _orig_container_listing_limit = proxy_server.CONTAINER_LISTING_LIMIT
+    _orig_container_listing_limit = \
+        swift.proxy.controllers.obj.CONTAINER_LISTING_LIMIT
     conf = {'devices': _testdir, 'swift_dir': _testdir,
             'mount_check': 'false', 'allowed_headers':
             'content-encoding, x-object-manifest, content-disposition, foo'}
@@ -107,7 +109,7 @@ def setup():
     ts = normalize_timestamp(time())
     partition, nodes = prosrv.app.account_ring.get_nodes('a')
     for node in nodes:
-        conn = proxy_server.http_connect(node['ip'], node['port'],
+        conn = swift.proxy.controllers.base.http_connect(node['ip'], node['port'],
             node['device'], partition, 'PUT', '/a',
                 {'X-Timestamp': ts, 'x-trans-id': 'test'})
         resp = conn.getresponse()
@@ -126,18 +128,23 @@ def setup():
 def teardown():
     for server in _test_coros:
         server.kill()
-    proxy_server.CONTAINER_LISTING_LIMIT = _orig_container_listing_limit
+    swift.proxy.controllers.obj.CONTAINER_LISTING_LIMIT = \
+        _orig_container_listing_limit
     rmtree(os.path.dirname(_testdir))
 
 @contextmanager
 def save_globals():
-    orig_http_connect = getattr(proxy_server, 'http_connect', None)
+    orig_http_connect = getattr(swift.proxy.controllers.base, 'http_connect', None)
     orig_query_connect = getattr(proxyquery, 'http_connect', None)
     orig_account_info = getattr(proxy_server.Controller, 'account_info', None)
     try:
         yield True
     finally:
         proxy_server.http_connect = orig_http_connect
+        swift.proxy.controllers.base.http_connect = orig_http_connect
+        swift.proxy.controllers.obj.http_connect = orig_http_connect
+        swift.proxy.controllers.account.http_connect = orig_http_connect
+        swift.proxy.controllers.container.http_connect = orig_http_connect
         proxy_server.Controller.account_info = orig_account_info
         proxyquery.http_connect = orig_query_connect
 
@@ -247,7 +254,7 @@ class TestProxyQuery(unittest.TestCase):
 #        self.conf = {'devices': _testdir, 'swift_dir': _testdir,
 #                'mount_check': 'false', 'allowed_headers':
 #                'content-encoding, x-object-manifest, content-disposition, foo'}
-        monkey_patch_mimetools()
+        #monkey_patch_mimetools()
 
     def tearDown(self):
         proxy_server.CONTAINER_LISTING_LIMIT = _orig_container_listing_limit
@@ -1596,7 +1603,13 @@ errdump(0, retcode, mnfst.NexeEtag, status)
 
     def test_QUERY_account_server_error(self):
         with save_globals():
-            proxy_server.http_connect =\
+            swift.proxy.controllers.account.http_connect =\
+            fake_http_connect(500, 500, 500, 500, 500)
+            swift.proxy.controllers.base.http_connect =\
+            fake_http_connect(500, 500, 500, 500, 500)
+            swift.proxy.controllers.container.http_connect =\
+            fake_http_connect(500, 500, 500, 500, 500)
+            swift.proxy.controllers.obj.http_connect =\
             fake_http_connect(500, 500, 500, 500, 500)
             proxyquery.http_connect = \
             fake_http_connect(500, 500, 500, 500, 500)

@@ -9,6 +9,7 @@ from hashlib import md5
 from eventlet import GreenPile, GreenPool, sleep
 import greenlet
 from swiftclient.client import quote
+from swift.proxy.controllers.base import update_headers
 
 try:
     import simplejson as json
@@ -24,7 +25,7 @@ from webob.exc import HTTPNotFound, HTTPPreconditionFailed, \
     HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest, HTTPUnprocessableEntity, HTTPServiceUnavailable
 
 from swift.common.utils import split_path, get_logger, TRUE_VALUES, get_remote_client
-from swift.proxy.server import update_headers, Controller, ObjectController, delay_denial, ContainerController, AccountController
+from swift.proxy.server import Controller, ObjectController, ContainerController, AccountController
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout, ChunkReadTimeout, \
     ChunkWriteTimeout
@@ -813,10 +814,6 @@ class ClusterController(Controller):
         node_list = []
         for k in sorted(self.nodes.iterkeys()):
             node_list.append(self.nodes[k])
-            if not self.nodes[k].bind and not self.nodes[k].connect \
-                and not self.nodes[k].channels:
-                return HTTPBadRequest(request=req,
-                    body='Isolated node detected in config: %s' % k)
         #for n in node_list:
         #    print n.__dict__
         ns_server = NameService()
