@@ -97,20 +97,30 @@ import re
 import logging
 import cPickle as pickle
 from time import sleep
+from argparse import ArgumentParser
 
-def errdump(zvm_errcode, nexe_errcode, nexe_etag, status_line):
-    print '%d\n%s\n%s' % (nexe_errcode, nexe_etag, status_line)
+def errdump(zvm_errcode, nexe_validity, nexe_errcode, nexe_etag, nexe_accounting, status_line):
+    print '%d\n%d\n%s\n%s\n%s' % (nexe_validity, nexe_errcode, nexe_etag,
+            ' '.join([str(val) for val in nexe_accounting]), status_line)
     exit(zvm_errcode)
 
-if len(argv) < 2 or len(argv) > 4:
-    errdump(1,0,'','Incorrect number of arguments')
-if argv[1][:2] != '-M':
-    errdump(1,0,'','Invalid argument: %s' % argv[1])
-manifest = argv[1][2:]
+parser = ArgumentParser()
+parser.add_argument('-M', dest='manifest')
+parser.add_argument('-s', action='store_true', dest='skip')
+parser.add_argument('-z', action='store_true', dest='validate')
+args = parser.parse_args()
+
+valid = 1
+if args.skip:
+    valid = 0
+accounting = [0,0,0,0,0,0,0,0,0,0,0,0]
+manifest = args.manifest
+if not manifest:
+    errdump(1,valid, 0,'',accounting,'Manifest file required')
 try:
     inputmnfst = file(manifest, 'r').read().splitlines()
 except IOError:
-    errdump(1,0,'','Cannot open manifest file: %s' % manifest)
+    errdump(1,valid, 0,'',accounting,'Cannot open manifest file: %s' % manifest)
 dl = re.compile("\s*=\s*")
 mnfst_dict = dict()
 for line in inputmnfst:
@@ -125,28 +135,33 @@ class Mnfst:
 
 mnfst = Mnfst()
 index = 0
-status = 'ok.' if len(argv) < 3 else argv[2]
-retcode = 0 if len(argv) < 4 else argv[3]
+status = 'ok.'
+retcode = 0
 
 def retrieve_mnfst_field(n, eq=None, min=None, max=None, isint=False, optional=False):
     if n not in mnfst_dict:
         if optional:
             return
-        errdump(1,0,'','Manifest key missing "%s"' % n)
+        errdump(1,valid,0,'',accounting,'Manifest key missing "%s"' % n)
     v = mnfst_dict[n]
     if isint:
         v = int(v)
         if min and v < min:
-            errdump(1,0,'','%s = %d is less than expected: %d' % (n,v,min))
+            errdump(1,valid,0,'',accounting,'%s = %d is less than expected: %d' % (n,v,min))
         if max and v > max:
-            errdump(1,0,'','%s = %d is more than expected: %d' % (n,v,max))
+            errdump(1,valid,0,'',accounting,'%s = %d is more than expected: %d' % (n,v,max))
     if eq and v != eq:
-        errdump(1,0,'','%s = %s and expected %s' % (n,v,eq))
+        errdump(1,valid,0,'',accounting,'%s = %s and expected %s' % (n,v,eq))
     setattr(mnfst, n.strip(), v)
 
 
 retrieve_mnfst_field('Version', '09082012')
 retrieve_mnfst_field('Nexe')
+exe = file(mnfst.Nexe, 'r').read()
+if 'INVALID' == exe:
+    valid = 2
+    retcode = 0
+    status = 'nexe did not run'
 retrieve_mnfst_field('NexeMax', isint=True)
 retrieve_mnfst_field('SyscallsMax', min=1, isint=True)
 retrieve_mnfst_field('NexeEtag', optional=True)
@@ -160,36 +175,42 @@ retrieve_mnfst_field('NameServer', optional=True)
 
 channel_list = re.split('\s*,\s*',mnfst.Channel)
 if len(channel_list) % 7 != 0:
-    errdump(1,0,mnfst.Nexe,'wrong channel config: %s' % mnfst.Channel)
+    errdump(1,valid,0,mnfst.Nexe,accounting,'wrong channel config: %s' % mnfst.Channel)
 dev_list = channel_list[1::7]
 for i in xrange(0,len(dev_list)):
     device = dev_list[i]
     fname = channel_list[i*7]
-    if device == '/dev/stdin' or device == '/dev/input':
+    if device == '/dev/stdin' or device == '/dev/input' or device == '/dev/cdr':
         mnfst.input = fname
     elif device == '/dev/stdout' or device == '/dev/output':
         mnfst.output = fname
     elif device == '/dev/stderr':
         logging.basicConfig(filename=fname,level=logging.DEBUG,filemode='w')
-try:
-    inf = file(mnfst.input, 'r')
-    ouf = file(mnfst.output, 'w')
-    id = pickle.load(inf)
-except EOFError:
-    id = []
-except Exception:
-    errdump(1,0,mnfst.Nexe,'Std files I/O error')
+if valid < 2:
+    try:
+        inf = file(mnfst.input, 'r')
+        ouf = file(mnfst.output, 'w')
+        ins = inf.read()
+        accounting[4] += 1
+        accounting[5] += len(ins)
+        id = pickle.loads(ins)
+    except EOFError:
+        id = []
+    except Exception:
+        errdump(1,valid,0,mnfst.Nexe,accounting,'Std files I/O error')
 
-od = ''
-try:
-    od = pickle.dumps(eval(file(mnfst.Nexe, 'r').read()))
-except Exception:
-    logging.exception('Exception:')
-
-ouf.write(od)
-inf.close()
-ouf.close()
-print '%s\n%s\n%s' % (retcode, mnfst.NexeEtag, status)
+    od = ''
+    try:
+        od = pickle.dumps(eval(exe))
+    except Exception:
+        logging.exception('Exception:')
+    ouf.write(od)
+    accounting[6] += 1
+    accounting[7] += len(od)
+    inf.close()
+    ouf.close()
+print '%d\n%d\n%s\n%s\n%s' % (valid, retcode, mnfst.NexeEtag,
+    ' '.join([str(val) for val in accounting]), status)
 logging.info('finished')
 exit(0)
 '''
@@ -259,6 +280,7 @@ exit(0)
         return req
 
     def test_QUERY_realzvm(self):
+        raise SkipTest
         self.setup_zerovm_query()
         self.app.zerovm_exename = ['./zerovm']
         randomnum = self.create_random_numbers(1024 * 1024 / 4, proto='binary')
@@ -319,6 +341,31 @@ exit(0)
         self.assertEquals(resp.headers['x-nexe-etag'], self._nexescript_etag)
         self.assertEquals(resp.headers['x-nexe-retcode'], 0)
         self.assertEquals(resp.headers['x-nexe-status'], 'ok.')
+        self.assertEquals(resp.headers['x-nexe-validation'], 1)
+        self.assertIn('x-nexe-cdr-line', resp.headers)
+        timestamp = normalize_timestamp(time())
+        self.assertEquals(math.floor(float(resp.headers['X-Timestamp'])),
+            math.floor(float(timestamp)))
+
+    def test_QUERY_invalid_nexe(self):
+        self.setup_zerovm_query()
+        req = self.zerovm_request()
+        nexe = 'INVALID'
+        req.headers['etag'] = md5(nexe).hexdigest()
+        req.headers['x-nexe-content-type'] = 'text/plain'
+        req.body = nexe
+        resp = self.app.zerovm_query(req)
+        #resp = req.get_response(self.app)
+
+        self.assertEquals(resp.status_int, 200)
+        self.assertEquals(resp.content_type, 'text/plain')
+        self.assertEquals(resp.headers['content-length'],'0')
+        self.assertEquals(resp.headers['content-type'], 'text/plain')
+        self.assertEquals(resp.headers['x-nexe-etag'], req.headers['etag'])
+        self.assertEquals(resp.headers['x-nexe-retcode'], 0)
+        self.assertEquals(resp.headers['x-nexe-status'], 'nexe did not run')
+        self.assertEquals(resp.headers['x-nexe-validation'], 2)
+        self.assertEquals(resp.headers['x-nexe-cdr-line'], '0 0 0 0 0 0 0 0 0 0 0 0')
         timestamp = normalize_timestamp(time())
         self.assertEquals(math.floor(float(resp.headers['X-Timestamp'])),
             math.floor(float(timestamp)))

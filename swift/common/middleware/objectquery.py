@@ -121,8 +121,16 @@ class ObjectQueryMiddleware(object):
         nexe_headers = {
             'x-nexe-retcode': 0,
             'x-nexe-status': 'Zerovm did not run',
-            'x-nexe-etag': ''
+            'x-nexe-etag': '',
+            'x-nexe-validation': 0,
+            'x-nexe-cdr-line': '0 0 0 0 0 0 0 0 0 0 0 0'
         }
+        if 'x-validator-exec' in req.headers:
+            validator = req.headers['x-validator-exec']
+            if 'skip' in validator:
+                self.zerovm_exename.add('-s')
+            if 'fuzzy' in validator:
+                self.zerovm_exename.add('-z')
         if 'x-node-name' in req.headers:
             nexe_name = re.split('\s*,\s*', req.headers['x-node-name'])
             nexe_headers['x-nexe-name'] = nexe_name[0]
@@ -435,22 +443,28 @@ class ObjectQueryMiddleware(object):
                 if zerovm_stderr:
                     self.logger.warning('zerovm stderr: '+zerovm_stderr)
                 report = zerovm_stdout.splitlines()
-                if len(report) < 3:
+                if len(report) < 5:
+                    nexe_validation = 0
                     nexe_retcode = 0
                     nexe_etag = ''
+                    nexe_cdr_line = '0 0 0 0 0 0 0 0 0 0 0 0'
                     nexe_status = 'Zerovm crashed'
                 else:
-                    nexe_retcode = int(report[0])
-                    nexe_etag = report[1]
-                    nexe_status = '\n'.join(report[2:])
+                    nexe_validation = int(report[0])
+                    nexe_retcode = int(report[1])
+                    nexe_etag = report[2]
+                    nexe_cdr_line = report[3]
+                    nexe_status = '\n'.join(report[4:])
 
                 response = Response(app_iter=outputiter,
                     request=req, conditional_response=True)
                 response.headers['x-nexe-retcode'] = nexe_retcode
                 response.headers['x-nexe-status'] = nexe_status
                 response.headers['x-nexe-etag'] = nexe_etag
+                response.headers['x-nexe-validation'] = nexe_validation
+                response.headers['x-nexe-cdr-line'] = nexe_cdr_line
                 response.headers['X-Timestamp'] =\
-                normalize_timestamp(time.time())
+                    normalize_timestamp(time.time())
                 content_length = 0
                 for fn in fn_list:
                     content_length += self.os_interface.path.getsize(fn)
