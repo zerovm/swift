@@ -77,10 +77,10 @@ class NameService(object):
     def start(self, pool, peers):
         self.sock.bind(('', 0))
         self.peers = peers
-        self.thread = pool.spawn(self.run)
+        self.thread = pool.spawn(self._run)
         return self.sock.getsockname()[1]
 
-    def run(self):
+    def _run(self):
         bind_map = {}
         conn_map = {}
         peer_map = {}
@@ -218,9 +218,10 @@ class ZvmNode(object):
         for bind_name in connect_list:
             if nodes.get(bind_name):
                 bind_node = nodes.get(bind_name)
-                if not bind_node is self:
-                    bind_node.bind.append(self.name)
-                    self.connect.append(bind_name)
+                if bind_node is self:
+                    raise Exception('Cannot bind to itself: %s' % bind_name)
+                bind_node.bind.append(self.name)
+                self.connect.append(bind_name)
             elif nodes.get(bind_name + '-1'):
                 i = 1
                 bind_node = nodes.get(bind_name + '-' + str(i))

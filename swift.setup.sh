@@ -317,7 +317,7 @@ cat > ~/bin/resetswift <<END
 #!/bin/bash
 
 swift-init all stop
-find /var/log/swift -type f -exec rm -f {} \;
+sudo find /var/log/swift -type f -exec rm -f {} \;
 sudo umount /mnt/sdb1
 sudo mkfs.xfs -f -i size=1024 $dev
 sudo mount /mnt/sdb1
