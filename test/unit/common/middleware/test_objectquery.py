@@ -19,6 +19,7 @@ from swift.common.middleware import objectquery
 from swift.common.middleware import proxyquery
 from swift.common.utils import mkdirs, normalize_timestamp, get_logger
 from swift.obj.server import ObjectController
+from test.unit import FakeLogger
 
 class FakeLoggingHandler(logging.Handler):
 
@@ -82,7 +83,7 @@ class TestObjectQuery(unittest.TestCase):
         mkdirs(os.path.join(self.testdir, 'sda1', 'tmp'))
         self.conf = {'devices': self.testdir, 'mount_check': 'false'}
         self.obj_controller = FakeApp(self.conf)
-        self.app = objectquery.ObjectQueryMiddleware(self.obj_controller, self.conf)
+        self.app = objectquery.ObjectQueryMiddleware(self.obj_controller, self.conf, logger=FakeLogger())
 
     def tearDown(self):
         """ Tear down for testing swift.object_server.ObjectController """
@@ -135,7 +136,7 @@ class Mnfst:
 
 mnfst = Mnfst()
 index = 0
-status = 'ok.'
+status = 'nexe did not run'
 retcode = 0
 
 def retrieve_mnfst_field(n, eq=None, min=None, max=None, isint=False, optional=False):
@@ -161,7 +162,10 @@ exe = file(mnfst.Nexe, 'r').read()
 if 'INVALID' == exe:
     valid = 2
     retcode = 0
-    status = 'nexe did not run'
+if args.validate:
+    print '%d\n%d\n%s\n%s\n%s' % (valid, retcode, '',
+    ' '.join([str(val) for val in accounting]), status)
+    exit(0)
 retrieve_mnfst_field('NexeMax', isint=True)
 retrieve_mnfst_field('SyscallsMax', min=1, isint=True)
 retrieve_mnfst_field('NexeEtag', optional=True)
@@ -209,6 +213,7 @@ if valid < 2:
     accounting[7] += len(od)
     inf.close()
     ouf.close()
+    status = 'ok.'
 print '%d\n%d\n%s\n%s\n%s' % (valid, retcode, mnfst.NexeEtag,
     ' '.join([str(val) for val in accounting]), status)
 logging.info('finished')
@@ -342,10 +347,11 @@ exit(0)
         self.assertEquals(resp.headers['x-nexe-retcode'], 0)
         self.assertEquals(resp.headers['x-nexe-status'], 'ok.')
         self.assertEquals(resp.headers['x-nexe-validation'], 1)
-        self.assertIn('x-nexe-cdr-line', resp.headers)
         timestamp = normalize_timestamp(time())
         self.assertEquals(math.floor(float(resp.headers['X-Timestamp'])),
             math.floor(float(timestamp)))
+        self.assertEqual(self.app.logger.log_dict['info'][0][0][0],
+            'Zerovm CDR: 0 0 0 0 1 46 1 46 0 0 0 0')
 
     def test_QUERY_invalid_nexe(self):
         self.setup_zerovm_query()
@@ -365,7 +371,6 @@ exit(0)
         self.assertEquals(resp.headers['x-nexe-retcode'], 0)
         self.assertEquals(resp.headers['x-nexe-status'], 'nexe did not run')
         self.assertEquals(resp.headers['x-nexe-validation'], 2)
-        self.assertEquals(resp.headers['x-nexe-cdr-line'], '0 0 0 0 0 0 0 0 0 0 0 0')
         timestamp = normalize_timestamp(time())
         self.assertEquals(math.floor(float(resp.headers['X-Timestamp'])),
             math.floor(float(timestamp)))
@@ -850,6 +855,39 @@ time.sleep(10)
     def test_QUERY_filter_factory(self):
         app = objectquery.filter_factory(self.conf)(FakeApp(self.conf))
         self.assertIsInstance(app, objectquery.ObjectQueryMiddleware)
+
+    def test_QUERY_prevalidate(self):
+        self.setup_zerovm_query()
+        req = Request.blank('/sda1/p/a/c/exe',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'x-validator-exec': '',
+                     'Content-Type': 'application/octet-stream'})
+        req.body = self._nexescript
+        resp = req.get_response(self.app)
+        self.assertEquals(resp.status_int, 201)
+        self.assertEquals(resp.headers['x-nexe-validation'], '0')
+
+        req = Request.blank('/sda1/p/a/c/exe',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'x-validator-exec': 'fuzzy',
+                     'Content-Type': 'application/octet-stream'})
+        req.body = self._nexescript
+        resp = req.get_response(self.app)
+        self.assertEquals(resp.status_int, 201)
+        self.assertEquals(resp.headers['x-nexe-validation'], '1')
+
+        req = Request.blank('/sda1/p/a/c/exe',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'x-validator-exec': 'fuzzy',
+                     'Content-Type': 'application/octet-stream'})
+
+        req.body = 'INVALID'
+        resp = req.get_response(self.app)
+        self.assertEquals(resp.status_int, 201)
+        self.assertEquals(resp.headers['x-nexe-validation'], '2')
 
 if __name__ == '__main__':
     unittest.main()
