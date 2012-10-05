@@ -26,7 +26,7 @@ from webob.exc import HTTPBadRequest, HTTPNotFound,\
 from swift.common.utils import normalize_timestamp,\
     fallocate, split_path, drop_buffer_cache,\
     get_logger, mkdirs
-from swift.obj.server import DiskFile, write_metadata
+from swift.obj.server import DiskFile, write_metadata, read_metadata
 from swift.common.constraints import check_mount, check_utf8
 from swift.common.exceptions import DiskFileError, DiskFileNotExist
 
@@ -485,12 +485,19 @@ class ObjectQueryMiddleware(object):
             res = HTTPPreconditionFailed(body='Invalid UTF8')
         else:
             try:
-                if req.method == 'POST' and 'x-zerovm-execute' in req.headers:
+                if 'x-zerovm-execute' in req.headers and req.method == 'POST':
                     res = self.zerovm_query(req)
-                elif req.method == 'PUT' and 'x-validator-exec' in req.headers:
+                elif 'x-validator-exec' in req.headers and req.method == 'PUT':
                     def validate_resp(status, response_headers, exc_info=None):
                         if 200 <= int(status.split(' ')[0]) < 300:
                             valid = self.validate(req)
+                            response_headers.append(('x-nexe-validation',str(valid)))
+                        return start_response(status, response_headers, exc_info)
+                    return self.app(env, validate_resp)
+                elif 'x-nexe-validation' in req.headers and req.method == 'GET':
+                    def validate_resp(status, response_headers, exc_info=None):
+                        if 200 <= int(status.split(' ')[0]) < 300:
+                            valid = self.get_validation_status(req)
                             response_headers.append(('x-nexe-validation',str(valid)))
                         return start_response(status, response_headers, exc_info)
                     return self.app(env, validate_resp)
@@ -576,11 +583,33 @@ class ObjectQueryMiddleware(object):
             if len(report) < 5:
                 return 0
             else:
-                nexe_validation_status = int(report[0])
                 metadata = file.metadata
-                metadata['Validation-Status'] = nexe_validation_status
+                metadata['Validation-Status'] = report[0]
                 write_metadata(file.data_file, metadata)
-                return nexe_validation_status
+                return int(report[0])
+
+    def get_validation_status(self, req):
+        try:
+            (device, partition, account, container, obj) =\
+            split_path(unquote(req.path), 5, 5, True)
+        except ValueError:
+            return 0
+        if self.app.mount_check and not check_mount(self.app.devices, device):
+            return 0
+        file = DiskFile(
+            self.app.devices,
+            device,
+            partition,
+            account,
+            container,
+            obj,
+            self.logger,
+            disk_chunk_size=self.app.disk_chunk_size,
+        )
+        metadata = read_metadata(file.data_file)
+        status = int(metadata.get('Validation-Status', '0'))
+        return status
+
 
 def filter_factory(global_conf, **local_conf):
     """

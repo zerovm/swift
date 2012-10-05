@@ -322,20 +322,30 @@ import re
 import logging
 import cPickle as pickle
 from time import sleep
+from argparse import ArgumentParser
 
-def errdump(zvm_errcode, nexe_errcode, nexe_etag, status_line):
-    print '%d\n%s\n%s' % (nexe_errcode, nexe_etag, status_line)
+def errdump(zvm_errcode, nexe_validity, nexe_errcode, nexe_etag, nexe_accounting, status_line):
+    print '%d\n%d\n%s\n%s\n%s' % (nexe_validity, nexe_errcode, nexe_etag,
+                                  ' '.join([str(val) for val in nexe_accounting]), status_line)
     exit(zvm_errcode)
 
-if len(argv) < 2 or len(argv) > 4:
-    errdump(1,0,'','Incorrect number of arguments')
-if argv[1][:2] != '-M':
-    errdump(1,0,'','Invalid argument: %s' % argv[1])
-manifest = argv[1][2:]
+parser = ArgumentParser()
+parser.add_argument('-M', dest='manifest')
+parser.add_argument('-s', action='store_true', dest='skip')
+parser.add_argument('-z', action='store_true', dest='validate')
+args = parser.parse_args()
+
+valid = 1
+if args.skip:
+    valid = 0
+accounting = [0,0,0,0,0,0,0,0,0,0,0]
+manifest = args.manifest
+if not manifest:
+    errdump(1,valid, 0,'',accounting,'Manifest file required')
 try:
     inputmnfst = file(manifest, 'r').read().splitlines()
 except IOError:
-    errdump(1,0,'','Cannot open manifest file: %s' % manifest)
+    errdump(1,valid, 0,'',accounting,'Cannot open manifest file: %s' % manifest)
 dl = re.compile("\s*=\s*")
 mnfst_dict = dict()
 for line in inputmnfst:
@@ -350,28 +360,35 @@ class Mnfst:
 
 mnfst = Mnfst()
 index = 0
-status = 'ok.' if len(argv) < 3 else argv[2]
-retcode = 0 if len(argv) < 4 else argv[3]
+status = 'nexe did not run'
+retcode = 0
 
 def retrieve_mnfst_field(n, eq=None, min=None, max=None, isint=False, optional=False):
     if n not in mnfst_dict:
         if optional:
             return
-        errdump(1,0,'','Manifest key missing "%s"' % n)
+        errdump(1,valid,0,'',accounting,'Manifest key missing "%s"' % n)
     v = mnfst_dict[n]
     if isint:
         v = int(v)
         if min and v < min:
-            errdump(1,0,'','%s = %d is less than expected: %d' % (n,v,min))
+            errdump(1,valid,0,'',accounting,'%s = %d is less than expected: %d' % (n,v,min))
         if max and v > max:
-            errdump(1,0,'','%s = %d is more than expected: %d' % (n,v,max))
+            errdump(1,valid,0,'',accounting,'%s = %d is more than expected: %d' % (n,v,max))
     if eq and v != eq:
-        errdump(1,0,'','%s = %s and expected %s' % (n,v,eq))
+        errdump(1,valid,0,'',accounting,'%s = %s and expected %s' % (n,v,eq))
     setattr(mnfst, n.strip(), v)
 
 
 retrieve_mnfst_field('Version', '09082012')
 retrieve_mnfst_field('Nexe')
+exe = file(mnfst.Nexe, 'r').read()
+if 'INVALID' == exe:
+    valid = 2
+    retcode = 0
+if args.validate:
+    errdump(0, valid, retcode, '', accounting, status)
+    exit(0)
 retrieve_mnfst_field('NexeMax', isint=True)
 retrieve_mnfst_field('SyscallsMax', min=1, isint=True)
 retrieve_mnfst_field('NexeEtag', optional=True)
@@ -385,7 +402,7 @@ retrieve_mnfst_field('NameServer', optional=True)
 
 channel_list = re.split('\s*,\s*',mnfst.Channel)
 if len(channel_list) % 7 != 0:
-    errdump(1,0,mnfst.NexeEtag,'wrong channel config: %s' % mnfst.Channel)
+    errdump(1,valid,0,mnfst.NexeEtag,accounting,'wrong channel config: %s' % mnfst.Channel)
 dev_list = channel_list[1::7]
 bind_data = ''
 bind_count = 0
@@ -443,30 +460,43 @@ while 1:
         break
 if bind_map:
     sleep(0.5)
-try:
-    inf = file(mnfst.input, 'r')
-    ouf = file(mnfst.output, 'w')
-    err = file(mnfst.err, 'w')
-    id = pickle.load(inf)
-except EOFError:
-    id = []
-except Exception:
-    errdump(1,0,mnfst.NexeEtag,'Std files I/O error')
+if valid < 2:
+    try:
+        inf = file(mnfst.input, 'r')
+        ouf = file(mnfst.output, 'w')
+        err = file(mnfst.err, 'w')
+        ins = inf.read()
+        accounting[4] += 1
+        accounting[5] += len(ins)
+        id = pickle.loads(ins)
+    except EOFError:
+        id = []
+    except Exception:
+        errdump(1,valid,0,mnfst.NexeEtag,accounting,'Std files I/O error')
 
-od = ''
-try:
-    od = pickle.dumps(eval(file(mnfst.Nexe, 'r').read()))
-except Exception, e:
-    err.write(e.message+'\n')
+    od = ''
+    try:
+        od = pickle.dumps(eval(exe))
+    except Exception, e:
+        err.write(e.message+'\n')
+        accounting[6] += 1
+        accounting[7] += len(e.message+'\n')
 
-ouf.write(od)
-for t in con_list:
-    err.write('%s, %s\n' % (t[1], t[0]))
-inf.close()
-ouf.close()
-err.write('\nfinished\n')
-err.close()
-errdump(0, retcode, mnfst.NexeEtag, status)
+    ouf.write(od)
+    accounting[6] += 1
+    accounting[7] += len(od)
+    for t in con_list:
+        err.write('%s, %s\n' % (t[1], t[0]))
+        accounting[6] += 1
+        accounting[7] += len('%s, %s\n' % (t[1], t[0]))
+    inf.close()
+    ouf.close()
+    err.write('\nfinished\n')
+    accounting[6] += 1
+    accounting[7] += len('\nfinished\n')
+    err.close()
+status = 'ok.'
+errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
 '''
             (_prosrv, _acc1srv, _acc2srv, _con1srv,
              _con2srv, _obj1srv, _obj2srv) = _test_servers
@@ -647,6 +677,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         self.assertEqual(res.body, '\nfinished\n')
 
     def test_QUERY_sort_store_stdout_stderr_realzvm(self):
+        raise SkipTest
         self.setup_QUERY()
         (_prosrv, _acc1srv, _acc2srv, _con1srv,
          _con2srv, _obj1srv, _obj2srv) = _test_servers
@@ -700,6 +731,7 @@ errdump(0, retcode, mnfst.NexeEtag, status)
         self.assert_('done\n' in res.body)
 
     def test_QUERY_generator_zerovm(self):
+        raise SkipTest
         self.setup_QUERY()
         (_prosrv, _acc1srv, _acc2srv, _con1srv,
          _con2srv, _obj1srv, _obj2srv) = _test_servers
@@ -1630,162 +1662,6 @@ errdump(0, retcode, mnfst.NexeEtag, status)
             self.assertEqual(res.status_int, 400)
             self.assertEqual(res.body, 'Error querying object server for account a')
 
-    def test_QUERY_response_client_disconnect_attr(self):
-        raise SkipTest
-        with save_globals():
-            proxy_server.http_connect =\
-            fake_http_connect(200, body='1234567890')
-            controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            req = Request.blank('/a/c/o')
-            self.app.update_request(req)
-            orig_object_chunk_size = self.app.object_chunk_size
-            try:
-                self.app.object_chunk_size = 5
-                res = controller.QUERY(req)
-                ix = 0
-                for v in res.app_iter:
-                    ix += 1
-                    if ix > 1:
-                        break
-                res.app_iter.close()
-                self.assertEqual(res.bytes_transferred, 5)
-                self.assert_(hasattr(res, 'client_disconnect'))
-                self.assert_(res.client_disconnect)
-            finally:
-                self.app.object_chunk_size = orig_object_chunk_size
-
-    def test_QUERY_invalid_path(self):
-        raise SkipTest
-        self.setup_QUERY()
-        (prolis, acc1lis, acc2lis, con2lis, con2lis, obj1lis, obj2lis) =\
-        _test_sockets
-        # create code object
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/c/co HTTP/1.1\r\n'
-                 'Host: '
-                 'localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Length: %s\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 'X-Object-Meta-Format: pickle\r\n'
-                 'X-Object-Meta-Name: sorter\r\n'
-                 'X-Object-Meta-Arg1: pickle\r\n'
-                 'X-Object-Meta-Type: python\r\n'
-                 'etag: %s\r\n'
-                 '\r\n%s' % (str(len(self._nexescript)),
-                             self._nexescript_etag, self._nexescript))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-        #run the query
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('QUERY /v1/invalid/invalid/invalid HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Length: 0\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 'X-Load-From: c/co\r\n'
-                 '\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 404'
-        self.assertEqual(headers[:len(exp)], exp)
-
-    def test_QUERY_chunked_lobjects(self):
-        raise SkipTest
-        # Create a container for our segmented/manifest object testing
-        (prolis, acc1lis, acc2lis, con2lis, con2lis, obj1lis, obj2lis) =\
-        _test_sockets
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/segmented2 HTTP/1.1\r\nHost: localhost\r\n'
-                 'Connection: close\r\nX-Storage-Token: t\r\n'
-                 'Content-Length: 0\r\n\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-        # Create the object segments
-        segment_etags = []
-        for segment in xrange(5):
-            sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-            fd = sock.makefile()
-            fd.write('PUT /v1/a/segmented2/name/%s HTTP/1.1\r\nHost: '
-                     'localhost\r\nConnection: close\r\nX-Storage-Token: '
-                     't\r\nContent-Length: 5\r\n\r\n1234 ' % str(segment))
-            fd.flush()
-            headers = readuntil2crlfs(fd)
-            exp = 'HTTP/1.1 201'
-            self.assertEqual(headers[:len(exp)], exp)
-            segment_etags.append(md5('1234 ').hexdigest())
-            # Create the object manifest file
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('PUT /v1/a/segmented2/name HTTP/1.1\r\nHost: '
-                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
-                 't\r\nContent-Length: 0\r\nX-Object-Manifest: '
-                 'segmented2/name/\r\nContent-Type: text/jibberish\r\n'
-                 'Foo: barbaz\r\n\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-        # Ensure retrieving the manifest file gets the whole object
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('GET /v1/a/segmented2/name HTTP/1.1\r\nHost: '
-                 'localhost\r\nConnection: close\r\nX-Auth-Token: '
-                 't\r\n\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 200'
-        self.assertEqual(headers[:len(exp)], exp)
-        self.assert_('X-Object-Manifest: segmented2/name/' in headers)
-        self.assert_('Content-Type: text/jibberish' in headers)
-        self.assert_('Foo: barbaz' in headers)
-        expected_etag = md5(''.join(segment_etags)).hexdigest()
-        self.assert_('Etag: "%s"' % expected_etag in headers)
-        body = fd.read()
-        self.assertEqual(body, '1234 1234 1234 1234 1234 ')
-        # Do it again but exceeding the container listing limit
-        proxy_server.CONTAINER_LISTING_LIMIT = 2
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('GET /v1/a/segmented2/name HTTP/1.1\r\nHost: '
-                 'localhost\r\nConnection: close\r\nX-Auth-Token: '
-                 't\r\n\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 200'
-        self.assertEqual(headers[:len(exp)], exp)
-        self.assert_('X-Object-Manifest: segmented2/name/' in headers)
-        self.assert_('Content-Type: text/jibberish' in headers)
-        body = fd.read()
-        # A bit fragile of a test; as it makes the assumption that all
-        # will be sent in a single chunk.
-        self.assertEqual(body,
-            '19\r\n1234 1234 1234 1234 1234 \r\n0\r\n\r\n')
-        # Make a copy of the manifested object, which should
-        # error since the number of segments exceeds
-        # CONTAINER_LISTING_LIMIT.
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        fd.write('QUERY /v1/a/segmented2/copy HTTP/1.1\r\nHost: '
-                 'localhost\r\nConnection: close\r\nX-Auth-Token: '
-                 't\r\nX-Load-From: segmented2/name\r\nContent-Length: '
-                 '0\r\n\r\n')
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 413'
-        self.assertEqual(headers[:len(exp)], exp)
-        body = fd.read()
-
     def test_QUERY_chunked(self):
 
         class ChunkedFile():
@@ -1835,331 +1711,6 @@ errdump(0, retcode, mnfst.NexeEtag, status)
             res = controller.zerovm_query(req)
             self.assertEqual(res.status_int, 200)
 
-    def test_QUERY_zerovm_maxnexe(self):
-        raise SkipTest
-        with save_globals():
-            proxy_server.http_connect =\
-            fake_http_connect(200, 200, 201, 201, 201, body='1234567890')
-            controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'QUERY'},
-                headers={'Content-Length': '10'},
-                body='1234567890')
-            self.app.update_request(req)
-            controller.zerovm_maxnexe = 0
-            res = controller.QUERY(req)
-            res.body
-            self.assertEqual(res.status_int, 413)
-
-    def test_QUERY_connection_getexpect_timeout(self):
-        raise SkipTest
-
-        def mock_http_connect(*code_iter, **kwargs):
-
-            class FakeConn(object):
-
-                def __init__(self, status):
-                    self.status = status
-                    self.reason = 'Fake'
-
-                def getresponse(self):
-                    return self
-
-                def read(self, amt=None):
-                    return ''
-
-                def getheader(self, name):
-                    return ''
-
-                def getexpect(self):
-                    sleep(0.5)
-
-            code_iter = iter(code_iter)
-
-            def connect(*args, **ckwargs):
-                status = code_iter.next()
-                if status == -1:
-                    raise HTTPException()
-                return FakeConn(status)
-
-            return connect
-
-        with save_globals():
-            proxy_server.http_connect =\
-            mock_http_connect(200, 200, 201, 201, 201, body='1234567890')
-            controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            controller.app.node_timeout = 0.1
-            req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'QUERY'},
-                headers={'Content-Length': '10'},
-                body='1234567890')
-            self.app.update_request(req)
-            try:
-                controller.QUERY(req)
-            except Exception, msg:
-                self.assert_('Cannot find suitable node to execute code on',
-                    msg)
-            else:
-                raise Exception
-
-    def test_QUERY_connection_send_timeout(self):
-        raise SkipTest
-
-        def mock_http_connect(*code_iter, **kwargs):
-
-            class FakeConn(object):
-
-                def __init__(self, status):
-                    self.status = status
-                    self.reason = 'Fake'
-
-                def getresponse(self):
-                    return self
-
-                def read(self, amt=None):
-                    return ''
-
-                def getheader(self, name):
-                    return ''
-
-                def getexpect(self):
-                    return FakeConn(100)
-
-                def send(self, param):
-                    sleep(0.5)
-
-            code_iter = iter(code_iter)
-
-            def connect(*args, **ckwargs):
-                status = code_iter.next()
-                if status == -1:
-                    raise HTTPException()
-                return FakeConn(status)
-
-            return connect
-
-        with save_globals():
-            proxy_server.http_connect =\
-            mock_http_connect(200, 200, 201, 201, 201, body='1234567890')
-            controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            controller.app.node_timeout = 0.1
-            req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'QUERY'},
-                headers={'Content-Length': '10',
-                         'Transfer-Encoding': 'chunked'},
-                body='1234567890')
-            self.app.update_request(req)
-            resp = controller.QUERY(req)
-            self.assertEqual(resp.status, '408 Request Timeout')
-
-    def test_QUERY_connection_send_fail(self):
-        raise SkipTest
-
-        def mock_http_connect(*code_iter, **kwargs):
-
-            class FakeConn(object):
-
-                def __init__(self, status):
-                    self.status = status
-                    self.reason = 'Fake'
-
-                def getresponse(self):
-                    return self
-
-                def read(self, amt=None):
-                    return ''
-
-                def getheader(self, name):
-                    return ''
-
-                def getexpect(self):
-                    return FakeConn(100)
-
-            code_iter = iter(code_iter)
-
-            def connect(*args, **ckwargs):
-                status = code_iter.next()
-                if status == -1:
-                    raise HTTPException()
-                return FakeConn(status)
-
-            return connect
-
-        with save_globals():
-            proxy_server.http_connect =\
-            mock_http_connect(200, 200, 201, 201, 201, body='1234567890')
-            controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'QUERY'},
-                headers={'Content-Length': '10'},
-                body='1234567890')
-            self.app.update_request(req)
-            res = controller.QUERY(req)
-            res.body
-            self.assertEqual(res.status_int, 499)
-
-    def test_QUERY_file_iter_fail(self):
-        raise SkipTest
-
-        def mock_http_connect(*code_iter, **kwargs):
-
-            class FakeConn(object):
-
-                def __init__(self, status):
-                    self.status = status
-                    self.reason = 'Fake'
-
-                def getresponse(self):
-                    return self
-
-                def read(self, amt=None):
-                    sleep(0.5)
-
-                def getheader(self, name):
-                    return ''
-
-                def getexpect(self):
-                    return FakeConn(100)
-
-                def send(self, param):
-                    return ''
-
-                def getheaders(self):
-                    return ''
-
-            code_iter = iter(code_iter)
-
-            def connect(*args, **ckwargs):
-                status = code_iter.next()
-                if status == -1:
-                    raise HTTPException()
-                return FakeConn(status)
-
-            return connect
-
-        with save_globals():
-            proxy_server.http_connect =\
-            mock_http_connect(200, 200, 201, 201, 201, body='1234567890')
-            controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            controller.app.node_timeout = .002
-            req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'QUERY'},
-                headers={'Content-Length': '10'},
-                body='1234567890')
-            self.app.update_request(req)
-            res = controller.QUERY(req)
-            from swift.common.exceptions import ChunkReadTimeout
-            try:
-                res.body
-            except ChunkReadTimeout:
-                pass
-            else:
-                raise Exception
-
-    def test_QUERY_connection_getresponse_timeout(self):
-        raise SkipTest
-
-        def mock_http_connect(*code_iter, **kwargs):
-
-            class FakeConn(object):
-
-                def __init__(self, status):
-                    self.status = status
-                    self.reason = 'Fake'
-
-                def getresponse(self):
-                    sleep(0.5)
-
-                def read(self, amt=None):
-                    return ''
-
-                def getheader(self, name):
-                    return ''
-
-                def getexpect(self):
-                    return FakeConn(100)
-
-                def send(self, param):
-                    return ''
-
-            code_iter = iter(code_iter)
-
-            def connect(*args, **ckwargs):
-                status = code_iter.next()
-                if status == -1:
-                    raise HTTPException()
-                return FakeConn(status)
-
-            return connect
-
-        with save_globals():
-            proxy_server.http_connect =\
-            mock_http_connect(200, 200, 201, 201, 201, body='1234567890')
-            controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            controller.app.node_timeout = 0.1
-            req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'QUERY'},
-                headers={'Content-Length': '10',
-                         'Transfer-Encoding': 'chunked'},
-                body='1234567890')
-            self.app.update_request(req)
-            resp = controller.QUERY(req)
-            self.assertEqual(resp.status, '499 Client Disconnect')
-
-    def test_QUERY_connection_getresponse2_timeout(self):
-        raise SkipTest
-
-        def mock_http_connect(*code_iter, **kwargs):
-
-            class FakeConn(object):
-
-                def __init__(self, status):
-                    self.status = status
-                    self.reason = 'Fake'
-
-                def getresponse(self):
-                    self.status = 201
-                    return self
-
-                def read(self, amt=None):
-                    return ''
-
-                def getheader(self, name):
-                    return ''
-
-                def getexpect(self):
-                    return FakeConn(100)
-
-                def send(self, param):
-                    return ''
-
-            code_iter = iter(code_iter)
-
-            def connect(*args, **ckwargs):
-                status = code_iter.next()
-                if status == -1:
-                    raise HTTPException()
-                return FakeConn(status)
-
-            return connect
-
-        with save_globals():
-            proxy_server.http_connect =\
-            mock_http_connect(200, 200, 201, 201, 201, body='1234567890')
-            controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            controller.app.node_timeout = 0.1
-            req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'QUERY'},
-                headers={'Content-Length': '10',
-                         'Transfer-Encoding': 'chunked'},
-                body='1234567890')
-            self.app.update_request(req)
-            try:
-                controller.QUERY(req)
-            except Exception, msg:
-                self.assert_('Error querying object server', msg)
-            else:
-                raise Exception
     '''
     def test_QUERY_connect_exceptions(self):
 

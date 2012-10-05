@@ -49,7 +49,7 @@ class FakeApp(ObjectController):
     def __call__(self, env, start_response):
         if self.fault:
             raise Exception
-        ObjectController.__call__(self,env, start_response)
+        ObjectController.__call__(self, env, start_response)
 
 class OsMock():
     def __init__(self):
@@ -374,6 +374,8 @@ exit(0)
         timestamp = normalize_timestamp(time())
         self.assertEquals(math.floor(float(resp.headers['X-Timestamp'])),
             math.floor(float(timestamp)))
+        self.assertEqual(self.app.logger.log_dict['info'][0][0][0],
+            'Zerovm CDR: 0 0 0 0 0 0 0 0 0 0 0 0')
 
     def test_QUERY_freenode(self):
         # check running code without input file
@@ -402,6 +404,8 @@ exit(0)
         timestamp = normalize_timestamp(time())
         self.assertEquals(math.floor(float(resp.headers['X-Timestamp'])),
             math.floor(float(timestamp)))
+        self.assertEqual(self.app.logger.log_dict['info'][0][0][0],
+            'Zerovm CDR: 0 0 0 0 1 0 1 3 0 0 0 0')
 
     def test_QUERY_OsErr(self):
         def mock(*args):
