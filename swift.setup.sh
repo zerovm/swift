@@ -31,7 +31,7 @@ sudo su -c 'for x in {1..4}; do ln -s /mnt/sdb1/$x /srv/$x; done'
 sudo mkdir -p /etc/swift/object-server /etc/swift/container-server /etc/swift/account-server /srv/1/node/sdb1 /srv/2/node/sdb2 /srv/3/node/sdb3 /srv/4/node/sdb4 /var/run/swift
 sudo chown -R $uname:$gname /etc/swift /srv/[1-4]/ /var/run/swift
 sudo sed -i '/\/var\/cache\/swift/d;/\/var\/run\/swift/d' /etc/rc.local
-sudo sed -i '/^exit 0/i mkdir /var/cache/swift1 /var/cache/swift2 /var/cache/swift3 /var/cache/swift4\nchown '$uname:$gname' /var/cache/swift*\nmkdir /var/run/swift\nchown '$uname:$gname' /var/run/swift' /etc/rc.local
+sudo sed -i '/^exit 0/i mkdir -p /var/cache/swift1 /var/cache/swift2 /var/cache/swift3 /var/cache/swift4\nchown '$uname:$gname' /var/cache/swift*\nmkdir /var/run/swift\nchown '$uname:$gname' /var/run/swift' /etc/rc.local
 sudo su -c 'cat > /etc/rsyncd.conf' <<END
 uid = $uname
 gid = $gname
@@ -220,6 +220,7 @@ cat > /etc/swift/account-server/${i}.conf <<END
 [DEFAULT]
 devices = /srv/${i}/node
 mount_check = false
+disable_fallocate = true
 bind_port = 60${i}2
 user = $uname
 log_facility = LOG_LOCAL$(($i + 1))
@@ -250,6 +251,7 @@ cat > /etc/swift/container-server/${i}.conf <<END
 [DEFAULT]
 devices = /srv/${i}/node
 mount_check = false
+disable_fallocate = true
 bind_port = 60${i}1
 user = $uname
 log_facility = LOG_LOCAL$(($i + 1))
@@ -282,6 +284,7 @@ cat > /etc/swift/object-server/${i}.conf <<END
 [DEFAULT]
 devices = /srv/${i}/node
 mount_check = false
+disable_fallocate = true
 bind_port = 60${i}0
 user = $uname
 log_facility = LOG_LOCAL$(($i + 1))
