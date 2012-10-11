@@ -25,17 +25,18 @@ from tempfile import mkdtemp
 from hashlib import md5
 
 from eventlet import sleep, spawn, wsgi, listen, Timeout
-from webob import Request
 from test.unit import FakeLogger
 from test.unit import _getxattr as getxattr
 from test.unit import _setxattr as setxattr
 from test.unit import connect_tcp, readuntil2crlfs
-from swift.obj import server as object_server
+from swift.obj import server as object_server, replicator
 from swift.common import utils
 from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
                                NullLogger, storage_directory
 from swift.common.exceptions import DiskFileNotExist
+from swift.common import constraints
 from eventlet import tpool
+from swift.common.swob import Request
 
 
 class TestDiskFile(unittest.TestCase):
@@ -1046,7 +1047,7 @@ class TestObjectController(unittest.TestCase):
         resp = self.object_controller.GET(req)
         self.assertEquals(resp.status_int, 200)
 
-        since = strftime('%a, %d %b %Y %H:%M:%S GMT', gmtime(float(timestamp)))
+        since = strftime('%a, %d %b %Y %H:%M:%S GMT', gmtime(float(timestamp) + 1))
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'},
                             headers={'If-Modified-Since': since})
         resp = self.object_controller.GET(req)
@@ -1389,7 +1390,8 @@ class TestObjectController(unittest.TestCase):
 
     def test_max_object_name_length(self):
         timestamp = normalize_timestamp(time())
-        req = Request.blank('/sda1/p/a/c/' + ('1' * 1024),
+        max_name_len = constraints.MAX_OBJECT_NAME_LENGTH
+        req = Request.blank('/sda1/p/a/c/' + ('1' * max_name_len),
                 environ={'REQUEST_METHOD': 'PUT'},
                 headers={'X-Timestamp': timestamp,
                          'Content-Length': '4',
@@ -1397,7 +1399,7 @@ class TestObjectController(unittest.TestCase):
         req.body = 'DATA'
         resp = self.object_controller.PUT(req)
         self.assertEquals(resp.status_int, 201)
-        req = Request.blank('/sda1/p/a/c/' + ('2' * 1025),
+        req = Request.blank('/sda1/p/a/c/' + ('2' * (max_name_len + 1)),
                 environ={'REQUEST_METHOD': 'PUT'},
                 headers={'X-Timestamp': timestamp,
                          'Content-Length': '4',
@@ -1518,6 +1520,24 @@ class TestObjectController(unittest.TestCase):
         resp = self.object_controller.GET(req)
         self.assertEquals(resp.status_int, 200)
         self.assertEquals(resp.headers.get('x-object-manifest'), 'c/o/')
+
+    def test_manifest_head_request(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                headers={'X-Timestamp': timestamp,
+                         'Content-Type': 'text/plain',
+                         'Content-Length': '0',
+                         'X-Object-Manifest': 'c/o/'})
+        req.body = 'hi'
+        resp = self.object_controller.PUT(req)
+        objfile = os.path.join(self.testdir, 'sda1',
+            storage_directory(object_server.DATADIR, 'p', hash_path('a', 'c',
+            'o')), timestamp + '.data')
+        self.assert_(os.path.isfile(objfile))
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'HEAD'})
+        resp = self.object_controller.GET(req)
+        self.assertEquals(resp.body, '')
 
     def test_async_update_http_connect(self):
         given_args = []
@@ -2160,6 +2180,40 @@ class TestObjectController(unittest.TestCase):
         finally:
             tpool.execute = was_tpool_exe
             object_server.get_hashes = was_get_hashes
+
+    def test_PUT_with_full_drive(self):
+
+        class IgnoredBody():
+
+            def __init__(self):
+                self.read_called = False
+
+            def read(self, size=-1):
+                if not self.read_called:
+                    self.read_called = True
+                    return 'VERIFY'
+                return ''
+
+        def fake_fallocate(fd, size):
+            raise OSError(42, 'Unable to fallocate(%d)' % size)
+
+        orig_fallocate = object_server.fallocate
+        try:
+            object_server.fallocate = fake_fallocate
+            timestamp = normalize_timestamp(time())
+            body_reader = IgnoredBody()
+            req = Request.blank('/sda1/p/a/c/o',
+                    environ={'REQUEST_METHOD': 'PUT',
+                             'wsgi.input': body_reader},
+                    headers={'X-Timestamp': timestamp,
+                             'Content-Length': '6',
+                             'Content-Type': 'application/octet-stream',
+                             'Expect': '100-continue'})
+            resp = self.object_controller.PUT(req)
+            self.assertEquals(resp.status_int, 507)
+            self.assertFalse(body_reader.read_called)
+        finally:
+            object_server.fallocate = orig_fallocate
 
 if __name__ == '__main__':
     unittest.main()

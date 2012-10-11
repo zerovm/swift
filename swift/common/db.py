@@ -29,10 +29,9 @@ import errno
 from tempfile import mkstemp
 
 from eventlet import sleep, Timeout
-import simplejson as json
 import sqlite3
 
-from swift.common.utils import normalize_timestamp, renamer, \
+from swift.common.utils import json, normalize_timestamp, renamer, \
         mkdirs, lock_parent_directory, fallocate
 from swift.common.exceptions import LockTimeout
 
@@ -1556,7 +1555,7 @@ class AccountBroker(DatabaseBroker):
         :param marker: marker query
         :param end_marker: end marker query
         :param prefix: prefix query
-        :param delimeter: delimeter for query
+        :param delimiter: delimiter for query
 
         :returns: list of tuples of (name, object_count, bytes_used, 0)
         """

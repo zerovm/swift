@@ -30,9 +30,6 @@ import functools
 from eventlet import spawn_n, GreenPile, Timeout
 from eventlet.queue import Queue, Empty, Full
 from eventlet.timeout import Timeout
-from webob.exc import \
-    status_map
-from webob import Request, Response
 
 from swift.common.utils import normalize_timestamp, TRUE_VALUES, public
 from swift.common.bufferedhttp import http_connect
@@ -42,13 +39,14 @@ from swift.common.http import is_informational, is_success, is_redirection, \
     is_server_error, HTTP_OK, HTTP_PARTIAL_CONTENT, HTTP_MULTIPLE_CHOICES, \
     HTTP_BAD_REQUEST, HTTP_NOT_FOUND, HTTP_SERVICE_UNAVAILABLE, \
     HTTP_INSUFFICIENT_STORAGE
+from swift.common.swob import Request, Response, status_map
 
 
 def update_headers(response, headers):
     """
     Helper function to update headers in the response.
 
-    :param response: webob.Response object
+    :param response: swob.Response object
     :param headers: dictionary headers
     """
     if hasattr(headers, 'items'):
@@ -59,6 +57,17 @@ def update_headers(response, headers):
         elif name not in ('date', 'content-length', 'content-type',
                           'connection', 'x-put-timestamp', 'x-delete-after'):
             response.headers[name] = value
+
+
+def source_key(resp):
+    """
+    Provide the timestamp of the swift http response as a floating
+    point value.  Used as a sort key.
+
+    :param resp: httplib response object
+    """
+    return float(resp.getheader('x-put-timestamp') or
+                 resp.getheader('x-timestamp') or 0)
 
 
 def delay_denial(func):
@@ -87,7 +96,7 @@ def get_container_memcache_key(account, container):
 
 class Controller(object):
     """Base WSGI controller class for the proxy"""
-    server_type = _('Base')
+    server_type = 'Base'
 
     # Ensure these are all lowercase
     pass_through_headers = []
@@ -98,15 +107,21 @@ class Controller(object):
         self.trans_id = '-'
 
     def transfer_headers(self, src_headers, dst_headers):
-        x_remove = 'x-remove-%s-meta-' % self.server_type.lower()
-        x_meta = 'x-%s-meta-' % self.server_type.lower()
+
+        st = self.server_type.lower()
+        x_remove = 'x-remove-%s-meta-' % st
+        x_remove_read = 'x-remove-%s-read' % st
+        x_remove_write = 'x-remove-%s-write' % st
+        x_meta = 'x-%s-meta-' % st
         dst_headers.update((k.lower().replace('-remove', '', 1), '')
                            for k in src_headers
-                           if k.lower().startswith(x_remove))
+                           if k.lower().startswith(x_remove) or
+                           k.lower() in (x_remove_read, x_remove_write))
+
         dst_headers.update((k.lower(), v)
                            for k, v in src_headers.iteritems()
                            if k.lower() in self.pass_through_headers or
-                              k.lower().startswith(x_meta))
+                           k.lower().startswith(x_meta))
 
     def error_increment(self, node):
         """
@@ -126,7 +141,8 @@ class Controller(object):
         """
         self.error_increment(node)
         self.app.logger.error(_('%(msg)s %(ip)s:%(port)s'),
-            {'msg': msg, 'ip': node['ip'], 'port': node['port']})
+                              {'msg': msg, 'ip': node['ip'],
+                              'port': node['port']})
 
     def exception_occurred(self, node, typ, additional_info):
         """
@@ -211,7 +227,8 @@ class Controller(object):
             try:
                 with ConnectionTimeout(self.app.conn_timeout):
                     conn = http_connect(node['ip'], node['port'],
-                            node['device'], partition, 'HEAD', path, headers)
+                                        node['device'], partition, 'HEAD',
+                                        path, headers)
                 with Timeout(self.app.node_timeout):
                     resp = conn.getresponse()
                     body = resp.read()
@@ -232,7 +249,8 @@ class Controller(object):
                         result_code = -1
             except (Exception, Timeout):
                 self.exception_occurred(node, _('Account'),
-                    _('Trying to get account info for %s') % path)
+                                        _('Trying to get account info for %s')
+                                        % path)
         if result_code == HTTP_NOT_FOUND and autocreate:
             if len(account) > MAX_ACCOUNT_NAME_LENGTH:
                 return None, None, None
@@ -240,10 +258,10 @@ class Controller(object):
                        'X-Trans-Id': self.trans_id,
                        'Connection': 'close'}
             resp = self.make_requests(Request.blank('/v1' + path),
-                self.app.account_ring, partition, 'PUT',
-                path, [headers] * len(nodes))
+                                      self.app.account_ring, partition, 'PUT',
+                                      path, [headers] * len(nodes))
             if not is_success(resp.status_int):
-                self.app.logger.warning('Could not autocreate account %r' % \
+                self.app.logger.warning('Could not autocreate account %r' %
                                         path)
                 return None, None, None
             result_code = HTTP_OK
@@ -253,8 +271,9 @@ class Controller(object):
             else:
                 cache_timeout = self.app.recheck_account_existence * 0.1
             self.app.memcache.set(cache_key,
-                {'status': result_code, 'container_count': container_count},
-                timeout=cache_timeout)
+                                  {'status': result_code,
+                                  'container_count': container_count},
+                                  timeout=cache_timeout)
         if result_code == HTTP_OK:
             return partition, nodes, container_count
         return None, None, None
@@ -267,89 +286,79 @@ class Controller(object):
 
         :param account: account name for the container
         :param container: container name to look up
-        :returns: tuple of (container partition, container nodes, container
-                  read acl, container write acl, container sync key) or (None,
-                  None, None, None, None) if the container does not exist
+        :returns: dict containing at least container partition ('partition'),
+                  container nodes ('containers'), container read
+                  acl ('read_acl'), container write acl ('write_acl'),
+                  and container sync key ('sync_key').
+                  Values are set to None if the container does not exist.
         """
-        partition, nodes = self.app.container_ring.get_nodes(
-                account, container)
+        part, nodes = self.app.container_ring.get_nodes(account, container)
         path = '/%s/%s' % (account, container)
+        container_info = {'status': 0, 'read_acl': None,
+                          'write_acl': None, 'sync_key': None,
+                          'count': None, 'bytes': None,
+                          'versions': None, 'partition': None,
+                          'nodes': None}
         if self.app.memcache:
             cache_key = get_container_memcache_key(account, container)
             cache_value = self.app.memcache.get(cache_key)
             if isinstance(cache_value, dict):
-                status = cache_value['status']
-                read_acl = cache_value['read_acl']
-                write_acl = cache_value['write_acl']
-                sync_key = cache_value.get('sync_key')
-                versions = cache_value.get('versions')
-                if status == HTTP_OK:
-                    return partition, nodes, read_acl, write_acl, sync_key, \
-                            versions
-                elif status == HTTP_NOT_FOUND:
-                    return None, None, None, None, None, None
+                if 'container_size' in cache_value:
+                    cache_value['count'] = cache_value['container_size']
+                if is_success(cache_value['status']):
+                    container_info.update(cache_value)
+                    container_info['partition'] = part
+                    container_info['nodes'] = nodes
+                return container_info
         if not self.account_info(account, autocreate=account_autocreate)[1]:
-            return None, None, None, None, None, None
-        result_code = 0
-        read_acl = None
-        write_acl = None
-        sync_key = None
-        container_size = None
-        versions = None
+            return container_info
         attempts_left = len(nodes)
         headers = {'x-trans-id': self.trans_id, 'Connection': 'close'}
-        iternodes = self.iter_nodes(partition, nodes, self.app.container_ring)
-        while attempts_left > 0:
-            try:
-                node = iternodes.next()
-            except StopIteration:
-                break
-            attempts_left -= 1
+        for node in self.iter_nodes(part, nodes, self.app.container_ring):
             try:
                 with ConnectionTimeout(self.app.conn_timeout):
                     conn = http_connect(node['ip'], node['port'],
-                            node['device'], partition, 'HEAD', path, headers)
+                                        node['device'], part, 'HEAD',
+                                        path, headers)
                 with Timeout(self.app.node_timeout):
                     resp = conn.getresponse()
                     body = resp.read()
-                    if is_success(resp.status):
-                        result_code = HTTP_OK
-                        read_acl = resp.getheader('x-container-read')
-                        write_acl = resp.getheader('x-container-write')
-                        sync_key = resp.getheader('x-container-sync-key')
-                        container_size = \
-                            resp.getheader('X-Container-Object-Count')
-                        versions = resp.getheader('x-versions-location')
-                        break
-                    elif resp.status == HTTP_NOT_FOUND:
-                        if result_code == 0:
-                            result_code = HTTP_NOT_FOUND
-                        elif result_code != HTTP_NOT_FOUND:
-                            result_code = -1
-                    elif resp.status == HTTP_INSUFFICIENT_STORAGE:
+                if is_success(resp.status):
+                    container_info.update({
+                        'status': HTTP_OK,
+                        'read_acl': resp.getheader('x-container-read'),
+                        'write_acl': resp.getheader('x-container-write'),
+                        'sync_key': resp.getheader('x-container-sync-key'),
+                        'count': resp.getheader('x-container-object-count'),
+                        'bytes': resp.getheader('x-container-bytes-used'),
+                        'versions': resp.getheader('x-versions-location')})
+                    break
+                elif resp.status == HTTP_NOT_FOUND:
+                    container_info['status'] = HTTP_NOT_FOUND
+                else:
+                    container_info['status'] = -1
+                    if resp.status == HTTP_INSUFFICIENT_STORAGE:
                         self.error_limit(node)
-                        continue
-                    else:
-                        result_code = -1
             except (Exception, Timeout):
-                self.exception_occurred(node, _('Container'),
+                self.exception_occurred(
+                    node, _('Container'),
                     _('Trying to get container info for %s') % path)
-        if self.app.memcache and result_code in (HTTP_OK, HTTP_NOT_FOUND):
-            if result_code == HTTP_OK:
-                cache_timeout = self.app.recheck_container_existence
-            else:
-                cache_timeout = self.app.recheck_container_existence * 0.1
-            self.app.memcache.set(cache_key,
-                                  {'status': result_code,
-                                   'read_acl': read_acl,
-                                   'write_acl': write_acl,
-                                   'sync_key': sync_key,
-                                   'container_size': container_size,
-                                   'versions': versions},
-                                  timeout=cache_timeout)
-        if result_code == HTTP_OK:
-            return partition, nodes, read_acl, write_acl, sync_key, versions
-        return None, None, None, None, None, None
+            attempts_left -= 1
+            if attempts_left <= 0:
+                break
+        if self.app.memcache:
+            if container_info['status'] == HTTP_OK:
+                self.app.memcache.set(
+                    cache_key, container_info,
+                    timeout=self.app.recheck_container_existence)
+            elif container_info['status'] == HTTP_NOT_FOUND:
+                self.app.memcache.set(
+                    cache_key, container_info,
+                    timeout=self.app.recheck_container_existence * 0.1)
+        if container_info['status'] == HTTP_OK:
+            container_info['partition'] = part
+            container_info['nodes'] = nodes
+        return container_info
 
     def iter_nodes(self, partition, nodes, ring):
         """
@@ -382,23 +391,23 @@ class Controller(object):
             try:
                 with ConnectionTimeout(self.app.conn_timeout):
                     conn = http_connect(node['ip'], node['port'],
-                            node['device'], part, method, path,
-                            headers=headers, query_string=query)
+                                        node['device'], part, method, path,
+                                        headers=headers, query_string=query)
                     conn.node = node
                 with Timeout(self.app.node_timeout):
                     resp = conn.getresponse()
                     if not is_informational(resp.status) and \
-                       not is_server_error(resp.status):
+                            not is_server_error(resp.status):
                         return resp.status, resp.reason, resp.read()
                     elif resp.status == HTTP_INSUFFICIENT_STORAGE:
                         self.error_limit(node)
             except (Exception, Timeout):
                 self.exception_occurred(node, self.server_type,
-                    _('Trying to %(method)s %(path)s') %
-                    {'method': method, 'path': path})
+                                        _('Trying to %(method)s %(path)s') %
+                                        {'method': method, 'path': path})
 
     def make_requests(self, req, ring, part, method, path, headers,
-                    query_string=''):
+                      query_string=''):
         """
         Sends an HTTP request to multiple nodes and aggregates the results.
         It attempts the primary nodes concurrently, then iterates over the
@@ -406,7 +415,7 @@ class Controller(object):
 
         :param headers: a list of dicts, where each dict represents one
                         backend request that should be made.
-        :returns: a webob Response object
+        :returns: a swob.Response object
         """
         start_nodes = ring.get_part_nodes(part)
         nodes = self.iter_nodes(part, start_nodes, ring)
@@ -419,7 +428,7 @@ class Controller(object):
             response.append((HTTP_SERVICE_UNAVAILABLE, '', ''))
         statuses, reasons, bodies = zip(*response)
         return self.best_response(req, statuses, reasons, bodies,
-                  '%s %s' % (self.server_type, req.method))
+                                  '%s %s' % (self.server_type, req.method))
 
     def best_response(self, req, statuses, reasons, bodies, server_type,
                       etag=None):
@@ -427,13 +436,13 @@ class Controller(object):
         Given a list of responses from several servers, choose the best to
         return to the API.
 
-        :param req: webob.Request object
+        :param req: swob.Request object
         :param statuses: list of statuses returned
         :param reasons: list of reasons for each status
         :param bodies: bodies of each response
         :param server_type: type of server the responses came from
         :param etag: etag
-        :returns: webob.Response object with the correct status, body, etc. set
+        :returns: swob.Response object with the correct status, body, etc. set
         """
         resp = Response(request=req)
         if len(statuses):
@@ -457,12 +466,12 @@ class Controller(object):
     @public
     def GET(self, req):
         """Handler for HTTP GET requests."""
-        return self.GETorHEAD(req, stats_type='GET')
+        return self.GETorHEAD(req)
 
     @public
     def HEAD(self, req):
         """Handler for HTTP HEAD requests."""
-        return self.GETorHEAD(req, stats_type='HEAD')
+        return self.GETorHEAD(req)
 
     def _make_app_iter_reader(self, node, source, queue, logger_thread_locals):
         """
@@ -496,7 +505,7 @@ class Controller(object):
                 success = False
             except (Exception, Timeout):
                 self.exception_occurred(node, _('Object'),
-                   _('Trying to read during GET'))
+                                        _('Trying to read during GET'))
                 success = False
         finally:
             # Ensure the queue getter gets a terminator.
@@ -504,78 +513,76 @@ class Controller(object):
             queue.put(success)
             # Close-out the connection as best as possible.
             if getattr(source, 'swift_conn', None):
-                try:
-                    source.swift_conn.close()
-                except Exception:
-                    pass
-                source.swift_conn = None
-                try:
-                    while source.read(self.app.object_chunk_size):
-                        pass
-                except Exception:
-                    pass
-                try:
-                    source.close()
-                except Exception:
-                    pass
+                self.close_swift_conn(source)
 
-    def _make_app_iter(self, node, source, response):
+    def _make_app_iter(self, node, source):
         """
         Returns an iterator over the contents of the source (via its read
         func).  There is also quite a bit of cleanup to ensure garbage
         collection works and the underlying socket of the source is closed.
 
-        :param response: The webob.Response object this iterator should be
-                         assigned to via response.app_iter.
         :param source: The httplib.Response object this iterator should read
                        from.
         :param node: The node the source is reading from, for logging purposes.
         """
         try:
-            try:
-                # Spawn reader to read from the source and place in the queue.
-                # We then drop any reference to the source or node, for garbage
-                # collection purposes.
-                queue = Queue(1)
-                spawn_n(self._make_app_iter_reader, node, source, queue,
-                        self.app.logger.thread_locals)
-                source = node = None
-                while True:
-                    chunk = queue.get(timeout=self.app.node_timeout)
-                    if isinstance(chunk, bool):  # terminator
-                        success = chunk
-                        if not success:
-                            raise Exception(_('Failed to read all data'
-                                              ' from the source'))
-                        break
-                    yield chunk
-            except Empty:
-                raise ChunkReadTimeout()
-            except (GeneratorExit, Timeout):
-                self.app.logger.warn(_('Client disconnected on read'))
-            except Exception:
-                self.app.logger.exception(_('Trying to send to client'))
-                raise
-        finally:
-            response.app_iter = None
+            # Spawn reader to read from the source and place in the queue.
+            # We then drop any reference to the source or node, for garbage
+            # collection purposes.
+            queue = Queue(1)
+            spawn_n(self._make_app_iter_reader, node, source, queue,
+                    self.app.logger.thread_locals)
+            source = node = None
+            while True:
+                chunk = queue.get(timeout=self.app.node_timeout)
+                if isinstance(chunk, bool):  # terminator
+                    success = chunk
+                    if not success:
+                        raise Exception(_('Failed to read all data'
+                                          ' from the source'))
+                    break
+                yield chunk
+        except Empty:
+            raise ChunkReadTimeout()
+        except (GeneratorExit, Timeout):
+            self.app.logger.warn(_('Client disconnected on read'))
+        except Exception:
+            self.app.logger.exception(_('Trying to send to client'))
+            raise
+
+    def close_swift_conn(self, src):
+        try:
+            src.swift_conn.close()
+        except Exception:
+            pass
+        src.swift_conn = None
+        try:
+            while src.read(self.app.object_chunk_size):
+                pass
+        except Exception:
+            pass
+        try:
+            src.close()
+        except Exception:
+            pass
 
     def GETorHEAD_base(self, req, server_type, partition, nodes, path,
                        attempts):
         """
         Base handler for HTTP GET or HEAD requests.
 
-        :param req: webob.Request object
+        :param req: swob.Request object
         :param server_type: server type
         :param partition: partition
         :param nodes: nodes
         :param path: path for the request
         :param attempts: number of attempts to try
-        :returns: webob.Response object
+        :returns: swob.Response object
         """
         statuses = []
         reasons = []
         bodies = []
-        source = None
+        sources = []
         newest = req.headers.get('x-newest', 'f').lower() in TRUE_VALUES
         nodes = iter(nodes)
         while len(statuses) < attempts:
@@ -589,90 +596,68 @@ class Controller(object):
                 with ConnectionTimeout(self.app.conn_timeout):
                     headers = dict(req.headers)
                     headers['Connection'] = 'close'
-                    conn = http_connect(node['ip'], node['port'],
-                        node['device'], partition, req.method, path,
-                        headers=headers,
+                    conn = http_connect(
+                        node['ip'], node['port'], node['device'], partition,
+                        req.method, path, headers=headers,
                         query_string=req.query_string)
                 with Timeout(self.app.node_timeout):
                     possible_source = conn.getresponse()
                     # See NOTE: swift_conn at top of file about this.
                     possible_source.swift_conn = conn
             except (Exception, Timeout):
-                self.exception_occurred(node, server_type,
-                    _('Trying to %(method)s %(path)s') %
+                self.exception_occurred(
+                    node, server_type, _('Trying to %(method)s %(path)s') %
                     {'method': req.method, 'path': req.path})
                 continue
-            if possible_source.status == HTTP_INSUFFICIENT_STORAGE:
-                self.error_limit(node)
-                continue
             if is_success(possible_source.status) or \
-               is_redirection(possible_source.status):
+                    is_redirection(possible_source.status):
                 # 404 if we know we don't have a synced copy
                 if not float(possible_source.getheader('X-PUT-Timestamp', 1)):
                     statuses.append(HTTP_NOT_FOUND)
                     reasons.append('')
                     bodies.append('')
-                    possible_source.read()
-                    continue
-                if newest:
-                    if source:
-                        ts = float(source.getheader('x-put-timestamp') or
-                                   source.getheader('x-timestamp') or 0)
-                        pts = float(
-                            possible_source.getheader('x-put-timestamp') or
-                            possible_source.getheader('x-timestamp') or 0)
-                        if pts > ts:
-                            source = possible_source
-                    else:
-                        source = possible_source
-                    statuses.append(source.status)
-                    reasons.append(source.reason)
-                    bodies.append('')
-                    continue
+                    self.close_swift_conn(possible_source)
                 else:
-                    source = possible_source
-                    break
-            statuses.append(possible_source.status)
-            reasons.append(possible_source.reason)
-            bodies.append(possible_source.read())
-            if is_server_error(possible_source.status):
-                self.error_occurred(node, _('ERROR %(status)d %(body)s ' \
-                    'From %(type)s Server') %
-                    {'status': possible_source.status,
-                    'body': bodies[-1][:1024], 'type': server_type})
-        if source:
+                    statuses.append(possible_source.status)
+                    reasons.append(possible_source.reason)
+                    bodies.append('')
+                    sources.append(possible_source)
+                    if not newest:  # one good source is enough
+                        break
+            else:
+                statuses.append(possible_source.status)
+                reasons.append(possible_source.reason)
+                bodies.append(possible_source.read())
+                if possible_source.status == HTTP_INSUFFICIENT_STORAGE:
+                    self.error_limit(node)
+                elif is_server_error(possible_source.status):
+                    self.error_occurred(node, _('ERROR %(status)d %(body)s '
+                                                'From %(type)s Server') %
+                                        {'status': possible_source.status,
+                                         'body': bodies[-1][:1024],
+                                         'type': server_type})
+        if sources:
+            sources.sort(key=source_key)
+            source = sources.pop()
+            for src in sources:
+                self.close_swift_conn(src)
+            res = Response(request=req, conditional_response=True)
             if req.method == 'GET' and \
-               source.status in (HTTP_OK, HTTP_PARTIAL_CONTENT):
-                res = Response(request=req, conditional_response=True)
-                res.app_iter = self._make_app_iter(node, source, res)
+                    source.status in (HTTP_OK, HTTP_PARTIAL_CONTENT):
+                res.app_iter = self._make_app_iter(node, source)
                 # See NOTE: swift_conn at top of file about this.
                 res.swift_conn = source.swift_conn
-                update_headers(res, source.getheaders())
-                # Used by container sync feature
-                if res.environ is None:
-                    res.environ = dict()
-                res.environ['swift_x_timestamp'] = \
-                    source.getheader('x-timestamp')
-                update_headers(res, {'accept-ranges': 'bytes'})
-                res.status = source.status
-                res.content_length = source.getheader('Content-Length')
-                if source.getheader('Content-Type'):
-                    res.charset = None
-                    res.content_type = source.getheader('Content-Type')
-                return res
-            elif is_success(source.status) or is_redirection(source.status):
-                res = status_map[source.status](request=req)
-                update_headers(res, source.getheaders())
-                # Used by container sync feature
-                if res.environ is None:
-                    res.environ = dict()
-                res.environ['swift_x_timestamp'] = \
-                    source.getheader('x-timestamp')
-                update_headers(res, {'accept-ranges': 'bytes'})
-                res.content_length = source.getheader('Content-Length')
-                if source.getheader('Content-Type'):
-                    res.charset = None
-                    res.content_type = source.getheader('Content-Type')
-                return res
+            res.status = source.status
+            update_headers(res, source.getheaders())
+            if not res.environ:
+                res.environ = {}
+            res.environ['swift_x_timestamp'] = \
+                source.getheader('x-timestamp')
+            res.accept_ranges = 'bytes'
+            res.content_length = source.getheader('Content-Length')
+            if source.getheader('Content-Type'):
+                res.charset = None
+                res.content_type = source.getheader('Content-Type')
+            return res
         return self.best_response(req, statuses, reasons, bodies,
                                   '%s %s' % (server_type, req.method))

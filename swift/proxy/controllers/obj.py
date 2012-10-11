@@ -39,10 +39,6 @@ from random import shuffle
 from eventlet import sleep, GreenPile, Timeout
 from eventlet.queue import Queue
 from eventlet.timeout import Timeout
-from webob.exc import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
-    HTTPPreconditionFailed, HTTPRequestEntityTooLarge, HTTPRequestTimeout, \
-    HTTPServerError, HTTPServiceUnavailable
-from webob import Request, Response
 
 from swift.common.utils import ContextPool, normalize_timestamp, TRUE_VALUES, \
     public
@@ -55,8 +51,12 @@ from swift.common.exceptions import ChunkReadTimeout, \
 from swift.common.http import is_success, is_client_error, HTTP_CONTINUE, \
     HTTP_CREATED, HTTP_MULTIPLE_CHOICES, HTTP_NOT_FOUND, \
     HTTP_INTERNAL_SERVER_ERROR, HTTP_SERVICE_UNAVAILABLE, \
-    HTTP_INSUFFICIENT_STORAGE, HTTPClientDisconnect
+    HTTP_INSUFFICIENT_STORAGE
 from swift.proxy.controllers.base import Controller, delay_denial
+from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
+    HTTPPreconditionFailed, HTTPRequestEntityTooLarge, HTTPRequestTimeout, \
+    HTTPServerError, HTTPServiceUnavailable, Request, Response, \
+    HTTPClientDisconnect
 
 
 class SegmentedIterable(object):
@@ -72,7 +72,7 @@ class SegmentedIterable(object):
     :param listing: The listing of object segments to iterate over; this may
                     be an iterator or list that returns dicts with 'name' and
                     'bytes' keys.
-    :param response: The webob.Response this iterable is associated with, if
+    :param response: The swob.Response this iterable is associated with, if
                      any (default: None)
     """
 
@@ -80,7 +80,7 @@ class SegmentedIterable(object):
         self.controller = controller
         self.container = container
         self.listing = iter(listing)
-        self.segment = -1
+        self.segment = 0
         self.segment_dict = None
         self.segment_peek = None
         self.seek = 0
@@ -114,8 +114,8 @@ class SegmentedIterable(object):
                 self.seek = 0
             if self.segment > self.controller.app.rate_limit_after_segment:
                 sleep(max(self.next_get_time - time.time(), 0))
-                self.next_get_time = time.time() + \
-                    1.0 / self.controller.app.rate_limit_segments_per_sec
+            self.next_get_time = time.time() + \
+                1.0 / self.controller.app.rate_limit_segments_per_sec
             shuffle(nodes)
             resp = self.controller.GETorHEAD_base(req, _('Object'), partition,
                 self.controller.iter_nodes(partition, nodes,
@@ -232,7 +232,7 @@ class SegmentedIterable(object):
 
 class ObjectController(Controller):
     """WSGI controller for object requests."""
-    server_type = _('Object')
+    server_type = 'Object'
 
     def __init__(self, app, account_name, container_name, object_name,
                  **kwargs):
@@ -276,15 +276,14 @@ class ObjectController(Controller):
             for obj in sublisting:
                 yield obj
 
-    def GETorHEAD(self, req, stats_type):
+    def GETorHEAD(self, req):
         """Handle HTTP GET or HEAD requests."""
-        start_time = time.time()
-        _junk, _junk, req.acl, _junk, _junk, object_versions = \
-            self.container_info(self.account_name, self.container_name)
+        container_info = self.container_info(self.account_name,
+                                             self.container_name)
+        req.acl = container_info['read_acl']
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
             if aresp:
-                self.app.logger.increment('auth_short_circuits')
                 return aresp
         partition, nodes = self.app.object_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
@@ -305,8 +304,6 @@ class ObjectController(Controller):
                                                         self.app.object_ring),
                                         req.path_info, len(nodes))
             if 'x-object-manifest' not in resp2.headers:
-                self.app.logger.timing_since(
-                    '%s.timing' % (stats_type,), start_time)
                 return resp
             resp = resp2
             req.range = str(req_range)
@@ -320,25 +317,21 @@ class ObjectController(Controller):
                 listing = list(self._listing_iter(lcontainer, lprefix,
                                 req.environ))
             except ListingIterNotFound:
-                self.app.logger.timing_since(
-                    '%s.timing' % (stats_type,), start_time)
                 return HTTPNotFound(request=req)
             except ListingIterNotAuthorized, err:
-                self.app.logger.increment('auth_short_circuits')
                 return err.aresp
             except ListingIterError:
-                self.app.logger.increment('errors')
                 return HTTPServerError(request=req)
 
             if len(listing) > CONTAINER_LISTING_LIMIT:
                 resp = Response(headers=resp.headers, request=req,
                                 conditional_response=True)
                 if req.method == 'HEAD':
-                    # These shenanigans are because webob translates the HEAD
-                    # request into a webob EmptyResponse for the body, which
+                    # These shenanigans are because swob translates the HEAD
+                    # request into a swob EmptyResponse for the body, which
                     # has a len, which eventlet translates as needing a
                     # content-length header added. So we call the original
-                    # webob resp for the headers but return an empty iterator
+                    # swob resp for the headers but return an empty iterator
                     # for the body.
 
                     def head_response(environ, start_response):
@@ -346,8 +339,6 @@ class ObjectController(Controller):
                         return iter([])
 
                     head_response.status_int = resp.status_int
-                    self.app.logger.timing_since(
-                        '%s.timing' % (stats_type,), start_time)
                     return head_response
                 else:
                     resp.app_iter = SegmentedIterable(self, lcontainer,
@@ -377,31 +368,28 @@ class ObjectController(Controller):
                 resp.etag = etag
             resp.headers['accept-ranges'] = 'bytes'
 
-        self.app.logger.timing_since('%s.timing' % (stats_type,), start_time)
         return resp
 
     @public
     @delay_denial
     def GET(self, req):
         """Handler for HTTP GET requests."""
-        return self.GETorHEAD(req, stats_type='GET')
+        return self.GETorHEAD(req)
 
     @public
     @delay_denial
     def HEAD(self, req):
         """Handler for HTTP HEAD requests."""
-        return self.GETorHEAD(req, stats_type='HEAD')
+        return self.GETorHEAD(req)
 
     @public
     @delay_denial
     def POST(self, req):
         """HTTP POST request handler."""
-        start_time = time.time()
         if 'x-delete-after' in req.headers:
             try:
                 x_delete_after = int(req.headers['x-delete-after'])
             except ValueError:
-                self.app.logger.increment('errors')
                 return HTTPBadRequest(request=req,
                                       content_type='text/plain',
                                       body='Non-integer X-Delete-After')
@@ -415,7 +403,7 @@ class ObjectController(Controller):
                 self.object_name))
             req.headers['X-Fresh-Metadata'] = 'true'
             req.environ['swift_versioned_copy'] = True
-            resp = self.PUT(req, start_time=start_time, stats_type='POST')
+            resp = self.PUT(req)
             # Older editions returned 202 Accepted on object POSTs, so we'll
             # convert any 201 Created responses to that for compatibility with
             # picky clients.
@@ -425,28 +413,26 @@ class ObjectController(Controller):
         else:
             error_response = check_metadata(req, 'object')
             if error_response:
-                self.app.logger.increment('errors')
                 return error_response
-            container_partition, containers, _junk, req.acl, _junk, _junk = \
-                self.container_info(self.account_name, self.container_name,
-                    account_autocreate=self.app.account_autocreate)
+            container_info = self.container_info(
+                self.account_name, self.container_name,
+                account_autocreate=self.app.account_autocreate)
+            container_partition = container_info['partition']
+            containers = container_info['nodes']
+            req.acl = container_info['write_acl']
             if 'swift.authorize' in req.environ:
                 aresp = req.environ['swift.authorize'](req)
                 if aresp:
-                    self.app.logger.increment('auth_short_circuits')
                     return aresp
             if not containers:
-                self.app.logger.timing_since('POST.timing', start_time)
                 return HTTPNotFound(request=req)
             if 'x-delete-at' in req.headers:
                 try:
                     x_delete_at = int(req.headers['x-delete-at'])
                     if x_delete_at < time.time():
-                        self.app.logger.increment('errors')
                         return HTTPBadRequest(body='X-Delete-At in past',
                             request=req, content_type='text/plain')
                 except ValueError:
-                    self.app.logger.increment('errors')
                     return HTTPBadRequest(request=req,
                                           content_type='text/plain',
                                           body='Non-integer X-Delete-At')
@@ -476,7 +462,6 @@ class ObjectController(Controller):
                 headers.append(nheaders)
             resp = self.make_requests(req, self.app.object_ring, partition,
                                       'POST', req.path_info, headers)
-            self.app.logger.timing_since('POST.timing', start_time)
             return resp
 
     def _send_file(self, conn, path):
@@ -515,28 +500,26 @@ class ObjectController(Controller):
 
     @public
     @delay_denial
-    def PUT(self, req, start_time=None, stats_type='PUT'):
+    def PUT(self, req):
         """HTTP PUT request handler."""
-        if not start_time:
-            start_time = time.time()
-        (container_partition, containers, _junk, req.acl,
-         req.environ['swift_sync_key'], object_versions) = \
-            self.container_info(self.account_name, self.container_name,
-                account_autocreate=self.app.account_autocreate)
+        container_info = self.container_info(
+            self.account_name, self.container_name,
+            account_autocreate=self.app.account_autocreate)
+        container_partition = container_info['partition']
+        containers = container_info['nodes']
+        req.acl = container_info['write_acl']
+        req.environ['swift_sync_key'] = container_info['sync_key']
+        object_versions = container_info['versions']
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
             if aresp:
-                self.app.logger.increment('auth_short_circuits')
                 return aresp
         if not containers:
-            self.app.logger.timing_since(
-                '%s.timing' % (stats_type,), start_time)
             return HTTPNotFound(request=req)
         if 'x-delete-after' in req.headers:
             try:
                 x_delete_after = int(req.headers['x-delete-after'])
             except ValueError:
-                    self.app.logger.increment('errors')
                     return HTTPBadRequest(request=req,
                                           content_type='text/plain',
                                           body='Non-integer X-Delete-After')
@@ -545,11 +528,9 @@ class ObjectController(Controller):
             try:
                 x_delete_at = int(req.headers['x-delete-at'])
                 if x_delete_at < time.time():
-                    self.app.logger.increment('errors')
                     return HTTPBadRequest(body='X-Delete-At in past',
                         request=req, content_type='text/plain')
             except ValueError:
-                self.app.logger.increment('errors')
                 return HTTPBadRequest(request=req, content_type='text/plain',
                                       body='Non-integer X-Delete-At')
             delete_at_container = str(x_delete_at /
@@ -577,11 +558,8 @@ class ObjectController(Controller):
                 if hresp.environ and 'swift_x_timestamp' in hresp.environ and \
                     float(hresp.environ['swift_x_timestamp']) >= \
                         float(req.headers['x-timestamp']):
-                    self.app.logger.timing_since(
-                        '%.timing' % (stats_type,), start_time)
                     return HTTPAccepted(request=req)
             except ValueError:
-                self.app.logger.increment('errors')
                 return HTTPBadRequest(request=req, content_type='text/plain',
                     body='X-Timestamp should be a UNIX timestamp float value; '
                          'was %r' % req.headers['x-timestamp'])
@@ -596,7 +574,6 @@ class ObjectController(Controller):
             content_type_manually_set = False
         error_response = check_object_creation(req, self.object_name)
         if error_response:
-            self.app.logger.increment('errors')
             return error_response
         if object_versions and not req.environ.get('swift_versioned_copy'):
             is_manifest = 'x-object-manifest' in req.headers or \
@@ -647,7 +624,6 @@ class ObjectController(Controller):
                 src_container_name, src_obj_name = \
                     source_header.split('/', 3)[2:]
             except ValueError:
-                self.app.logger.increment('errors')
                 return HTTPPreconditionFailed(request=req,
                     body='X-Copy-From header must be of the form'
                     '<container name>/<object name>')
@@ -660,8 +636,6 @@ class ObjectController(Controller):
             self.container_name = src_container_name
             source_resp = self.GET(source_req)
             if source_resp.status_int >= HTTP_MULTIPLE_CHOICES:
-                self.app.logger.timing_since(
-                    '%s.timing' % (stats_type,), start_time)
                 return source_resp
             self.object_name = orig_obj_name
             self.container_name = orig_container_name
@@ -674,7 +648,6 @@ class ObjectController(Controller):
                 # which currently only happens because there are more than
                 # CONTAINER_LISTING_LIMIT segments in a segmented object. In
                 # this case, we're going to refuse to do the server-side copy.
-                self.app.logger.increment('errors')
                 return HTTPRequestEntityTooLarge(request=req)
             new_req.etag = source_resp.etag
             # we no longer need the X-Copy-From header
@@ -713,7 +686,6 @@ class ObjectController(Controller):
                 _('Object PUT returning 503, %(conns)s/%(nodes)s '
                 'required connections'),
                 {'conns': len(conns), 'nodes': len(nodes) // 2 + 1})
-            self.app.logger.increment('errors')
             return HTTPServiceUnavailable(request=req)
         chunked = req.headers.get('transfer-encoding')
         bytes_transferred = 0
@@ -733,7 +705,6 @@ class ObjectController(Controller):
                             break
                     bytes_transferred += len(chunk)
                     if bytes_transferred > MAX_FILE_SIZE:
-                        self.app.logger.increment('errors')
                         return HTTPRequestEntityTooLarge(request=req)
                     for conn in list(conns):
                         if not conn.failed:
@@ -745,7 +716,6 @@ class ObjectController(Controller):
                         self.app.logger.error(_('Object PUT exceptions during'
                             ' send, %(conns)s/%(nodes)s required connections'),
                             {'conns': len(conns), 'nodes': len(nodes) / 2 + 1})
-                        self.app.logger.increment('errors')
                         return HTTPServiceUnavailable(request=req)
                 for conn in conns:
                     if conn.queue.unfinished_tasks:
@@ -759,17 +729,12 @@ class ObjectController(Controller):
         except (Exception, Timeout):
             self.app.logger.exception(
                 _('ERROR Exception causing client disconnect'))
-            self.app.logger.increment('client_disconnects')
-            self.app.logger.timing_since(
-                '%s.timing' % (stats_type,), start_time)
             return HTTPClientDisconnect(request=req)
         if req.content_length and bytes_transferred < req.content_length:
             req.client_disconnect = True
             self.app.logger.warn(
                 _('Client disconnected without sending enough data'))
             self.app.logger.increment('client_disconnects')
-            self.app.logger.timing_since(
-                '%s.timing' % (stats_type,), start_time)
             return HTTPClientDisconnect(request=req)
         statuses = []
         reasons = []
@@ -795,7 +760,6 @@ class ObjectController(Controller):
         if len(etags) > 1:
             self.app.logger.error(
                 _('Object servers returned %s mismatched etags'), len(etags))
-            self.app.logger.increment('errors')
             return HTTPServerError(request=req)
         etag = len(etags) and etags.pop() or None
         while len(statuses) < len(nodes):
@@ -814,17 +778,19 @@ class ObjectController(Controller):
                 if k.lower().startswith('x-object-meta-'):
                     resp.headers[k] = v
         resp.last_modified = float(req.headers['X-Timestamp'])
-        self.app.logger.timing_since('%s.timing' % (stats_type,), start_time)
         return resp
 
     @public
     @delay_denial
     def DELETE(self, req):
         """HTTP DELETE request handler."""
-        start_time = time.time()
-        (container_partition, containers, _junk, req.acl,
-         req.environ['swift_sync_key'], object_versions) = \
-            self.container_info(self.account_name, self.container_name)
+        container_info = self.container_info(self.account_name,
+                                             self.container_name)
+        container_partition = container_info['partition']
+        containers = container_info['nodes']
+        req.acl = container_info['write_acl']
+        req.environ['swift_sync_key'] = container_info['sync_key']
+        object_versions = container_info['versions']
         if object_versions:
             # this is a version manifest and needs to be handled differently
             lcontainer = object_versions.split('/')[0]
@@ -839,10 +805,8 @@ class ObjectController(Controller):
                 # no worries, last_item is None
                 pass
             except ListingIterNotAuthorized, err:
-                self.app.logger.increment('auth_short_circuits')
                 return err.aresp
             except ListingIterError:
-                self.app.logger.increment('errors')
                 return HTTPServerError(request=req)
             if last_item:
                 # there are older versions so copy the previous version to the
@@ -872,18 +836,18 @@ class ObjectController(Controller):
                 self.container_name = lcontainer
                 self.object_name = last_item['name']
                 new_del_req = Request.blank(copy_path, environ=req.environ)
-                (container_partition, containers,
-                    _junk, new_del_req.acl, _junk, _junk) = \
-                    self.container_info(self.account_name, self.container_name)
+                container_info = self.container_info(self.account_name,
+                                                     self.container_name)
+                container_partition = container_info['partition']
+                containers = container_info['nodes']
+                new_del_req.acl = container_info['write_acl']
                 new_del_req.path_info = copy_path
                 req = new_del_req
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
             if aresp:
-                self.app.logger.increment('auth_short_circuits')
                 return aresp
         if not containers:
-            self.app.logger.timing_since('DELETE.timing', start_time)
             return HTTPNotFound(request=req)
         partition, nodes = self.app.object_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
@@ -893,7 +857,6 @@ class ObjectController(Controller):
                 req.headers['X-Timestamp'] = \
                     normalize_timestamp(float(req.headers['x-timestamp']))
             except ValueError:
-                self.app.logger.increment('errors')
                 return HTTPBadRequest(request=req, content_type='text/plain',
                     body='X-Timestamp should be a UNIX timestamp float value; '
                          'was %r' % req.headers['x-timestamp'])
@@ -909,17 +872,14 @@ class ObjectController(Controller):
             headers.append(nheaders)
         resp = self.make_requests(req, self.app.object_ring,
                 partition, 'DELETE', req.path_info, headers)
-        self.app.logger.timing_since('DELETE.timing', start_time)
         return resp
 
     @public
     @delay_denial
     def COPY(self, req):
         """HTTP COPY request handler."""
-        start_time = time.time()
         dest = req.headers.get('Destination')
         if not dest:
-            self.app.logger.increment('errors')
             return HTTPPreconditionFailed(request=req,
                                           body='Destination header required')
         dest = unquote(dest)
@@ -928,7 +888,6 @@ class ObjectController(Controller):
         try:
             _junk, dest_container, dest_object = dest.split('/', 2)
         except ValueError:
-            self.app.logger.increment('errors')
             return HTTPPreconditionFailed(request=req,
                     body='Destination header must be of the form '
                          '<container name>/<object name>')
@@ -942,4 +901,4 @@ class ObjectController(Controller):
         req.headers['Content-Length'] = 0
         req.headers['X-Copy-From'] = quote(source)
         del req.headers['Destination']
-        return self.PUT(req, start_time=start_time, stats_type='COPY')
+        return self.PUT(req)

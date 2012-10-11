@@ -22,22 +22,20 @@ from urllib import unquote
 from xml.sax import saxutils
 
 from eventlet import Timeout
-from webob import Request, Response
-from webob.exc import HTTPAccepted, HTTPBadRequest, \
-    HTTPCreated, HTTPForbidden, HTTPInternalServerError, \
-    HTTPMethodNotAllowed, HTTPNoContent, HTTPNotFound, \
-    HTTPPreconditionFailed, HTTPConflict
-import simplejson
 
 import swift.common.db
 from swift.common.db import AccountBroker
 from swift.common.utils import get_logger, get_param, hash_path, public, \
     normalize_timestamp, split_path, storage_directory, TRUE_VALUES, \
-    validate_device_partition
+    validate_device_partition, json
 from swift.common.constraints import ACCOUNT_LISTING_LIMIT, \
     check_mount, check_float, check_utf8, FORMAT2CONTENT_TYPE
 from swift.common.db_replicator import ReplicatorRpc
-from swift.common.http import HTTPInsufficientStorage
+from swift.common.swob import HTTPAccepted, HTTPBadRequest, \
+    HTTPCreated, HTTPForbidden, HTTPInternalServerError, \
+    HTTPMethodNotAllowed, HTTPNoContent, HTTPNotFound, \
+    HTTPPreconditionFailed, HTTPConflict, Request, Response, \
+    HTTPInsufficientStorage
 
 
 DATADIR = 'accounts'
@@ -50,9 +48,10 @@ class AccountController(object):
         self.logger = get_logger(conf, log_route='account-server')
         self.root = conf.get('devices', '/srv/node')
         self.mount_check = conf.get('mount_check', 'true').lower() in \
-                              ('true', 't', '1', 'on', 'yes', 'y')
+            TRUE_VALUES
         self.replicator_rpc = ReplicatorRpc(self.root, DATADIR, AccountBroker,
-            self.mount_check, logger=self.logger)
+                                            self.mount_check,
+                                            logger=self.logger)
         self.auto_create_account_prefix = \
             conf.get('auto_create_account_prefix') or '.'
         swift.common.db.DB_PREALLOCATION = \
@@ -74,15 +73,15 @@ class AccountController(object):
         except ValueError, err:
             self.logger.increment('DELETE.errors')
             return HTTPBadRequest(body=str(err), content_type='text/plain',
-                                                    request=req)
+                                  request=req)
         if self.mount_check and not check_mount(self.root, drive):
             self.logger.increment('DELETE.errors')
             return HTTPInsufficientStorage(drive=drive, request=req)
         if 'x-timestamp' not in req.headers or \
-                    not check_float(req.headers['x-timestamp']):
+                not check_float(req.headers['x-timestamp']):
             self.logger.increment('DELETE.errors')
             return HTTPBadRequest(body='Missing timestamp', request=req,
-                        content_type='text/plain')
+                                  content_type='text/plain')
         broker = self._get_account_broker(drive, part, account)
         if broker.is_deleted():
             self.logger.timing_since('DELETE.timing', start_time)
@@ -119,9 +118,9 @@ class AccountController(object):
                 self.logger.timing_since('PUT.timing', start_time)
                 return HTTPNotFound(request=req)
             broker.put_container(container, req.headers['x-put-timestamp'],
-                req.headers['x-delete-timestamp'],
-                req.headers['x-object-count'],
-                req.headers['x-bytes-used'])
+                                 req.headers['x-delete-timestamp'],
+                                 req.headers['x-object-count'],
+                                 req.headers['x-bytes-used'])
             self.logger.timing_since('PUT.timing', start_time)
             if req.headers['x-delete-timestamp'] > \
                     req.headers['x-put-timestamp']:
@@ -144,8 +143,8 @@ class AccountController(object):
                     return HTTPConflict(request=req)
             metadata = {}
             metadata.update((key, (value, timestamp))
-                for key, value in req.headers.iteritems()
-                if key.lower().startswith('x-account-meta-'))
+                            for key, value in req.headers.iteritems()
+                            if key.lower().startswith('x-account-meta-'))
             if metadata:
                 broker.update_metadata(metadata)
             self.logger.timing_since('PUT.timing', start_time)
@@ -171,7 +170,7 @@ class AccountController(object):
         except ValueError, err:
             self.logger.increment('HEAD.errors')
             return HTTPBadRequest(body=str(err), content_type='text/plain',
-                                                    request=req)
+                                  request=req)
         if self.mount_check and not check_mount(self.root, drive):
             self.logger.increment('HEAD.errors')
             return HTTPInsufficientStorage(drive=drive, request=req)
@@ -194,8 +193,8 @@ class AccountController(object):
             if container_ts is not None:
                 headers['X-Container-Timestamp'] = container_ts
         headers.update((key, value)
-            for key, (value, timestamp) in broker.metadata.iteritems()
-            if value != '')
+                       for key, (value, timestamp) in
+                       broker.metadata.iteritems() if value != '')
         self.logger.timing_since('HEAD.timing', start_time)
         return HTTPNoContent(request=req, headers=headers)
 
@@ -209,7 +208,7 @@ class AccountController(object):
         except ValueError, err:
             self.logger.increment('GET.errors')
             return HTTPBadRequest(body=str(err), content_type='text/plain',
-                                                    request=req)
+                                  request=req)
         if self.mount_check and not check_mount(self.root, drive):
             self.logger.increment('GET.errors')
             return HTTPInsufficientStorage(drive=drive, request=req)
@@ -227,8 +226,8 @@ class AccountController(object):
             'X-Timestamp': info['created_at'],
             'X-PUT-Timestamp': info['put_timestamp']}
         resp_headers.update((key, value)
-            for key, (value, timestamp) in broker.metadata.iteritems()
-            if value != '')
+                            for key, (value, timestamp) in
+                            broker.metadata.iteritems() if value != '')
         try:
             prefix = get_param(req, 'prefix')
             delimiter = get_param(req, 'delimiter')
@@ -243,7 +242,8 @@ class AccountController(object):
                 if limit > ACCOUNT_LISTING_LIMIT:
                     self.logger.increment('GET.errors')
                     return HTTPPreconditionFailed(request=req,
-                        body='Maximum limit is %d' % ACCOUNT_LISTING_LIMIT)
+                                                  body='Maximum limit is %d' %
+                                                  ACCOUNT_LISTING_LIMIT)
             marker = get_param(req, 'marker', '')
             end_marker = get_param(req, 'end_marker')
             query_format = get_param(req, 'format')
@@ -256,9 +256,9 @@ class AccountController(object):
                                                  FORMAT2CONTENT_TYPE['plain'])
         try:
             out_content_type = req.accept.best_match(
-                                    ['text/plain', 'application/json',
-                                     'application/xml', 'text/xml'],
-                                    default_match='text/plain')
+                ['text/plain', 'application/json', 'application/xml',
+                 'text/xml'],
+                default_match='text/plain')
         except AssertionError, err:
             self.logger.increment('GET.errors')
             return HTTPBadRequest(body='bad accept header: %s' % req.accept,
@@ -266,17 +266,14 @@ class AccountController(object):
         account_list = broker.list_containers_iter(limit, marker, end_marker,
                                                    prefix, delimiter)
         if out_content_type == 'application/json':
-            json_pattern = ['"name":%s', '"count":%s', '"bytes":%s']
-            json_pattern = '{' + ','.join(json_pattern) + '}'
-            json_out = []
+            data = []
             for (name, object_count, bytes_used, is_subdir) in account_list:
-                name = simplejson.dumps(name)
                 if is_subdir:
-                    json_out.append('{"subdir":%s}' % name)
+                    data.append({'subdir': name})
                 else:
-                    json_out.append(json_pattern %
-                        (name, object_count, bytes_used))
-            account_list = '[' + ','.join(json_out) + ']'
+                    data.append({'name': name, 'count': object_count,
+                                'bytes': bytes_used})
+            account_list = json.dumps(data)
         elif out_content_type.endswith('/xml'):
             output_list = ['<?xml version="1.0" encoding="UTF-8"?>',
                            '<account name="%s">' % account]
@@ -316,12 +313,12 @@ class AccountController(object):
         except ValueError, err:
             self.logger.increment('REPLICATE.errors')
             return HTTPBadRequest(body=str(err), content_type='text/plain',
-                                                    request=req)
+                                  request=req)
         if self.mount_check and not check_mount(self.root, drive):
             self.logger.increment('REPLICATE.errors')
             return HTTPInsufficientStorage(drive=drive, request=req)
         try:
-            args = simplejson.load(req.environ['wsgi.input'])
+            args = json.load(req.environ['wsgi.input'])
         except ValueError, err:
             self.logger.increment('REPLICATE.errors')
             return HTTPBadRequest(body=str(err), content_type='text/plain')
@@ -345,7 +342,8 @@ class AccountController(object):
                 not check_float(req.headers['x-timestamp']):
             self.logger.increment('POST.errors')
             return HTTPBadRequest(body='Missing or bad timestamp',
-                request=req, content_type='text/plain')
+                                  request=req,
+                                  content_type='text/plain')
         if self.mount_check and not check_mount(self.root, drive):
             self.logger.increment('POST.errors')
             return HTTPInsufficientStorage(drive=drive, request=req)
@@ -356,8 +354,8 @@ class AccountController(object):
         timestamp = normalize_timestamp(req.headers['x-timestamp'])
         metadata = {}
         metadata.update((key, (value, timestamp))
-            for key, value in req.headers.iteritems()
-            if key.lower().startswith('x-account-meta-'))
+                        for key, value in req.headers.iteritems()
+                        if key.lower().startswith('x-account-meta-'))
         if metadata:
             broker.update_metadata(metadata)
         self.logger.timing_since('POST.timing', start_time)
@@ -381,7 +379,8 @@ class AccountController(object):
                     res = method(req)
             except (Exception, Timeout):
                 self.logger.exception(_('ERROR __call__ error with %(method)s'
-                    ' %(path)s '), {'method': req.method, 'path': req.path})
+                                        ' %(path)s '),
+                                      {'method': req.method, 'path': req.path})
                 res = HTTPInternalServerError(body=traceback.format_exc())
         trans_time = '%.4f' % (time.time() - start_time)
         additional_info = ''

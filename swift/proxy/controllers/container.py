@@ -28,19 +28,18 @@ import time
 from urllib import unquote
 from random import shuffle
 
-from webob.exc import HTTPBadRequest, HTTPForbidden, \
-    HTTPNotFound
-
 from swift.common.utils import normalize_timestamp, public
 from swift.common.constraints import check_metadata, MAX_CONTAINER_NAME_LENGTH
 from swift.common.http import HTTP_ACCEPTED
 from swift.proxy.controllers.base import Controller, delay_denial, \
     get_container_memcache_key
+from swift.common.swob import HTTPBadRequest, HTTPForbidden, \
+    HTTPNotFound
 
 
 class ContainerController(Controller):
     """WSGI controller for container requests"""
-    server_type = _('Container')
+    server_type = 'Container'
 
     # Ensure these are all lowercase
     pass_through_headers = ['x-container-read', 'x-container-write',
@@ -64,12 +63,9 @@ class ContainerController(Controller):
                         return HTTPBadRequest(request=req, body=str(err))
         return None
 
-    def GETorHEAD(self, req, stats_type):
+    def GETorHEAD(self, req):
         """Handler for HTTP GET/HEAD requests."""
-        start_time = time.time()
         if not self.account_info(self.account_name)[1]:
-            self.app.logger.timing_since(
-                '%s.timing' % (stats_type,), start_time)
             return HTTPNotFound(request=req)
         part, nodes = self.app.container_ring.get_nodes(
                         self.account_name, self.container_name)
@@ -86,7 +82,8 @@ class ContainerController(Controller):
                'read_acl': resp.headers.get('x-container-read'),
                'write_acl': resp.headers.get('x-container-write'),
                'sync_key': resp.headers.get('x-container-sync-key'),
-               'container_size': resp.headers.get('x-container-object-count'),
+               'count': resp.headers.get('x-container-object-count'),
+               'bytes': resp.headers.get('x-container-bytes-used'),
                'versions': resp.headers.get('x-versions-location')},
                                   timeout=self.app.recheck_container_existence)
 
@@ -94,42 +91,37 @@ class ContainerController(Controller):
             req.acl = resp.headers.get('x-container-read')
             aresp = req.environ['swift.authorize'](req)
             if aresp:
-                self.app.logger.increment('auth_short_circuits')
                 return aresp
         if not req.environ.get('swift_owner', False):
             for key in ('x-container-read', 'x-container-write',
                         'x-container-sync-key', 'x-container-sync-to'):
                 if key in resp.headers:
                     del resp.headers[key]
-        self.app.logger.timing_since('%s.timing' % (stats_type,), start_time)
         return resp
 
     @public
     @delay_denial
     def GET(self, req):
         """Handler for HTTP GET requests."""
-        return self.GETorHEAD(req, stats_type='GET')
+        return self.GETorHEAD(req)
 
     @public
     @delay_denial
     def HEAD(self, req):
         """Handler for HTTP HEAD requests."""
-        return self.GETorHEAD(req, stats_type='HEAD')
+        return self.GETorHEAD(req)
 
     @public
     def PUT(self, req):
         """HTTP PUT request handler."""
-        start_time = time.time()
         error_response = \
             self.clean_acls(req) or check_metadata(req, 'container')
         if error_response:
-            self.app.logger.increment('errors')
             return error_response
         if len(self.container_name) > MAX_CONTAINER_NAME_LENGTH:
             resp = HTTPBadRequest(request=req)
             resp.body = 'Container name length of %d longer than %d' % \
                         (len(self.container_name), MAX_CONTAINER_NAME_LENGTH)
-            self.app.logger.increment('errors')
             return resp
         account_partition, accounts, container_count = \
             self.account_info(self.account_name,
@@ -142,7 +134,6 @@ class ContainerController(Controller):
                         self.app.max_containers_per_account
             return resp
         if not accounts:
-            self.app.logger.timing_since('PUT.timing', start_time)
             return HTTPNotFound(request=req)
         container_partition, containers = self.app.container_ring.get_nodes(
             self.account_name, self.container_name)
@@ -162,23 +153,19 @@ class ContainerController(Controller):
             self.app.memcache.delete(cache_key)
         resp = self.make_requests(req, self.app.container_ring,
                 container_partition, 'PUT', req.path_info, headers)
-        self.app.logger.timing_since('PUT.timing', start_time)
         return resp
 
     @public
     def POST(self, req):
         """HTTP POST request handler."""
-        start_time = time.time()
         error_response = \
             self.clean_acls(req) or check_metadata(req, 'container')
         if error_response:
-            self.app.logger.increment('errors')
             return error_response
         account_partition, accounts, container_count = \
             self.account_info(self.account_name,
                               autocreate=self.app.account_autocreate)
         if not accounts:
-            self.app.logger.timing_since('POST.timing', start_time)
             return HTTPNotFound(request=req)
         container_partition, containers = self.app.container_ring.get_nodes(
             self.account_name, self.container_name)
@@ -187,23 +174,19 @@ class ContainerController(Controller):
                    'Connection': 'close'}
         self.transfer_headers(req.headers, headers)
         if self.app.memcache:
-            cache_key = get_container_memcache_key(self.account_name,
-                                                   self.container_name)
-            self.app.memcache.delete(cache_key)
+            self.app.memcache.delete(get_container_memcache_key(
+                self.account_name, self.container_name))
         resp = self.make_requests(req, self.app.container_ring,
                 container_partition, 'POST', req.path_info,
                 [headers] * len(containers))
-        self.app.logger.timing_since('POST.timing', start_time)
         return resp
 
     @public
     def DELETE(self, req):
         """HTTP DELETE request handler."""
-        start_time = time.time()
         account_partition, accounts, container_count = \
             self.account_info(self.account_name)
         if not accounts:
-            self.app.logger.timing_since('DELETE.timing', start_time)
             return HTTPNotFound(request=req)
         container_partition, containers = self.app.container_ring.get_nodes(
             self.account_name, self.container_name)
@@ -222,7 +205,6 @@ class ContainerController(Controller):
         resp = self.make_requests(req, self.app.container_ring,
                     container_partition, 'DELETE', req.path_info, headers)
         # Indicates no server had the container
-        self.app.logger.timing_since('DELETE.timing', start_time)
         if resp.status_int == HTTP_ACCEPTED:
             return HTTPNotFound(request=req)
         return resp

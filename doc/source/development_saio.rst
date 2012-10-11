@@ -28,10 +28,11 @@ Installing dependencies and the core code
   #. `apt-get install python-software-properties`
   #. `add-apt-repository ppa:swift-core/release`
   #. `apt-get update`
-  #. `apt-get install curl gcc git-core memcached python-configobj
-     python-coverage python-dev python-nose python-setuptools python-simplejson
-     python-xattr sqlite3 xfsprogs python-webob python-eventlet
-     python-greenlet python-pastedeploy python-netifaces`
+  #. `apt-get install curl gcc git-core memcached python-coverage python-dev
+     python-nose python-setuptools python-simplejson python-xattr sqlite3
+     xfsprogs python-eventlet python-greenlet python-pastedeploy
+     python-netifaces python-pip`
+  #. `pip install mock`
   #. Install anything else you want, like screen, ssh, vim, etc.
 
 * On Fedora, log in as root and do:
@@ -40,7 +41,7 @@ Installing dependencies and the core code
      openstack-swift-account openstack-swift-container openstack-swift-object`
   #. `yum install xinetd rsync`
   #. `yum install memcached`
-  #. `yum install python-netifaces python-nose`
+  #. `yum install python-netifaces python-nose python-mock`
 
   This installs all necessary dependencies, and also creates user `swift`
   and group `swift`. So, `swift:swift` ought to be used in every place where
@@ -77,6 +78,7 @@ another device when creating the VM, and follow these instructions.
         chown <your-user-name>:<your-group-name> /var/cache/swift*
         mkdir -p /var/run/swift
         chown <your-user-name>:<your-group-name> /var/run/swift
+
   #. Next, skip to :ref:`rsync-section`.
 
 
@@ -331,6 +333,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/1/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6012
         user = <your-user-name>
         log_facility = LOG_LOCAL2
@@ -357,6 +360,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/2/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6022
         user = <your-user-name>
         log_facility = LOG_LOCAL3
@@ -383,6 +387,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/3/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6032
         user = <your-user-name>
         log_facility = LOG_LOCAL4
@@ -409,6 +414,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/4/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6042
         user = <your-user-name>
         log_facility = LOG_LOCAL5
@@ -435,6 +441,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/1/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6011
         user = <your-user-name>
         log_facility = LOG_LOCAL2
@@ -463,6 +470,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/2/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6021
         user = <your-user-name>
         log_facility = LOG_LOCAL3
@@ -491,6 +499,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/3/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6031
         user = <your-user-name>
         log_facility = LOG_LOCAL4
@@ -519,6 +528,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/4/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6041
         user = <your-user-name>
         log_facility = LOG_LOCAL5
@@ -548,6 +558,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/1/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6010
         user = <your-user-name>
         log_facility = LOG_LOCAL2
@@ -574,6 +585,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/2/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6020
         user = <your-user-name>
         log_facility = LOG_LOCAL3
@@ -600,6 +612,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/3/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6030
         user = <your-user-name>
         log_facility = LOG_LOCAL4
@@ -626,6 +639,7 @@ Sample configuration files are provided with all defaults in line-by-line commen
         [DEFAULT]
         devices = /srv/4/node
         mount_check = false
+        disable_fallocate = true
         bind_port = 6040
         user = <your-user-name>
         log_facility = LOG_LOCAL5
@@ -668,7 +682,7 @@ Setting up scripts for running Swift
         sudo chown <your-user-name>:<your-group-name> /mnt/sdb1/*
         mkdir -p /srv/1/node/sdb1 /srv/2/node/sdb2 /srv/3/node/sdb3 /srv/4/node/sdb4
         sudo rm -f /var/log/debug /var/log/messages /var/log/rsyncd.log /var/log/syslog
-        find /var/cache/swift* -type f -name *.recon -exec -rm -f {} \;
+        find /var/cache/swift* -type f -name *.recon -exec rm -f {} \;
         sudo service rsyslog restart
         sudo service memcached restart
 

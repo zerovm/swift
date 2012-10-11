@@ -22,8 +22,8 @@ import hmac
 import base64
 
 from eventlet import Timeout
-from webob import Response, Request
-from webob.exc import HTTPBadRequest, HTTPForbidden, HTTPNotFound, \
+from swift.common.swob import Response, Request
+from swift.common.swob import HTTPBadRequest, HTTPForbidden, HTTPNotFound, \
     HTTPUnauthorized
 
 from swift.common.middleware.acl import clean_acl, parse_acl, referrer_allowed
@@ -54,6 +54,11 @@ class TempAuth(object):
         user_test_tester = testing .admin
         user_test2_tester2 = testing2 .admin
         user_test_tester3 = testing3
+        # To allow accounts/users with underscores you can base64 encode them.
+        # Here is the account "under_score" and username "a_b" (note the lack
+        # of padding equal signs):
+        user64_dW5kZXJfc2NvcmU_YV9i = testing4
+
 
     See the proxy-server.conf-sample for more information.
 
@@ -86,7 +91,15 @@ class TempAuth(object):
             conf.get('allow_overrides', 't').lower() in TRUE_VALUES
         self.users = {}
         for conf_key in conf:
-            if conf_key.startswith('user_'):
+            if conf_key.startswith('user_') or conf_key.startswith('user64_'):
+                account, username = conf_key.split('_', 1)[1].split('_')
+                if conf_key.startswith('user64_'):
+                    # Because trailing equal signs would screw up config file
+                    # parsing, we auto-pad with '=' chars.
+                    account += '=' * (len(account) % 4)
+                    account = base64.b64decode(account)
+                    username += '=' * (len(username) % 4)
+                    username = base64.b64decode(username)
                 values = conf[conf_key].split()
                 if not values:
                     raise ValueError('%s has no key set' % conf_key)
@@ -100,8 +113,8 @@ class TempAuth(object):
                         ip = '127.0.0.1'
                     url += ip
                     url += ':' + conf.get('bind_port', '8080') + '/v1/' + \
-                           self.reseller_prefix + conf_key.split('_')[1]
-                self.users[conf_key.split('_', 1)[1].replace('_', ':')] = {
+                        self.reseller_prefix + account
+                self.users[account + ':' + username] = {
                     'key': key, 'url': url, 'groups': values}
 
     def __call__(self, env, start_response):
@@ -285,7 +298,7 @@ class TempAuth(object):
         """
         WSGI entry point for auth requests (ones that match the
         self.auth_prefix).
-        Wraps env in webob.Request object and passes it down.
+        Wraps env in swob.Request object and passes it down.
 
         :param env: WSGI environment dictionary
         :param start_response: WSGI callable
@@ -321,9 +334,9 @@ class TempAuth(object):
     def handle_request(self, req):
         """
         Entry point for auth requests (ones that match the self.auth_prefix).
-        Should return a WSGI-style callable (such as webob.Response).
+        Should return a WSGI-style callable (such as swob.Response).
 
-        :param req: webob.Request object
+        :param req: swob.Request object
         """
         req.start_time = time()
         handler = None
@@ -363,8 +376,8 @@ class TempAuth(object):
         X-Storage-Token set to the token to use with Swift and X-Storage-URL
         set to the URL to the default Swift cluster to use.
 
-        :param req: The webob.Request to process.
-        :returns: webob.Response, 2xx on success with data set as explained
+        :param req: The swob.Request to process.
+        :returns: swob.Response, 2xx on success with data set as explained
                   above.
         """
         # Validate the request info

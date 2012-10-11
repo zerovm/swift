@@ -231,6 +231,8 @@ mount_check         true        Whether or not check if the devices are
 bind_ip             0.0.0.0     IP Address for server to bind to
 bind_port           6000        Port for server to bind to
 workers             1           Number of workers to fork
+disable_fallocate   false       Disable "fast fail" fallocate checks if the
+                                underlying filesystem does not support it.
 ==================  ==========  =============================================
 
 [object-server]
@@ -336,6 +338,8 @@ bind_ip             0.0.0.0     IP Address for server to bind to
 bind_port           6001        Port for server to bind to
 workers             1           Number of workers to fork
 user                swift       User to run as
+disable_fallocate   false       Disable "fast fail" fallocate checks if the
+                                underlying filesystem does not support it.
 ==================  ==========  ============================================
 
 [container-server]
@@ -434,6 +438,8 @@ db_preallocation    off         If you don't mind the extra disk space usage in
                                 overhead, you can turn this on to preallocate
                                 disk space with SQLite databases to decrease
                                 fragmentation.
+disable_fallocate   false       Disable "fast fail" fallocate checks if the
+                                underlying filesystem does not support it.
 ==================  ==========  =============================================
 
 [account-server]
@@ -638,6 +644,12 @@ is::
 
     user_<account>_<user> = <key> [group] [group] [...] [storage_url]
 
+or if you want to be able to include underscores in the ``<account>`` or
+``<user>`` portions, you can base64 encode them (with *no* equal signs) in a
+line like this::
+
+    user64_<account_b64>_<user_b64> = <key> [group] [group] [...] [storage_url]
+
 There are special groups of::
 
     .reseller_admin = can do anything to any account for this auth
@@ -662,6 +674,9 @@ Here are example entries, required for running the tests::
     user_test_tester = testing .admin
     user_test2_tester2 = testing2 .admin
     user_test_tester3 = testing3
+
+    # account "test_y" and user "tester_y" (note the lack of padding = chars)
+    user64_dGVzdF95_dGVzdGVyX3k = testing4 .admin
 
 ------------------------
 Memcached Considerations
@@ -744,6 +759,11 @@ For a standard swift install, all data drives are mounted directly under
 /srv/node/sda). If you choose to mount the drives in another directory,
 be sure to set the `devices` config option in all of the server configs to
 point to the correct directory.
+
+Swift uses system calls to reserve space for new objects being written into
+the system. If your filesystem does not support `fallocate()` or
+`posix_fallocate()`, be sure to set the `disable_fallocate = true` config
+parameter in account, container, and object server configs.
 
 ---------------------
 General System Tuning
