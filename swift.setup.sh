@@ -328,7 +328,7 @@ sudo mkdir -p /mnt/sdb1/1 /mnt/sdb1/2 /mnt/sdb1/3 /mnt/sdb1/4
 sudo chown $uname:$gname /mnt/sdb1/*
 mkdir -p /srv/1/node/sdb1 /srv/2/node/sdb2 /srv/3/node/sdb3 /srv/4/node/sdb4
 sudo rm -f /var/log/debug /var/log/messages /var/log/rsyncd.log /var/log/syslog
-find /var/cache/swift* -type f -name *.recon -exec -rm -f {} \;
+find /var/cache/swift* -type f -name *.recon -exec rm -f {} \;
 sudo service rsyslog restart
 sudo service memcached restart
 
