@@ -14,7 +14,7 @@ import unittest
 import os
 import cPickle as pickle
 from time import time, sleep
-from webob import Request
+from swift.common.swob import Request, HTTPNotFound, HTTPUnauthorized
 from hashlib import md5
 from test.unit import connect_tcp, readuntil2crlfs
 from tempfile import mkstemp, mkdtemp
@@ -22,7 +22,6 @@ from shutil import rmtree
 
 from nose import SkipTest
 from httplib import HTTPException
-from webob.exc import HTTPNotFound, HTTPUnauthorized
 from eventlet import sleep, spawn, Timeout, util, wsgi, listen, GreenPool
 from gzip import GzipFile
 from contextlib import contextmanager
@@ -621,7 +620,8 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         resp = [
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
+                #'body': '201 Created\n\n\n\n   ',
                 'name': 'sort',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -657,7 +657,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         resp = [
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -995,7 +995,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         resp = [
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'merge',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1003,7 +1003,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             },
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1054,7 +1054,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         resp = [
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'merge-1',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1062,7 +1062,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             },
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'merge-2',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1070,7 +1070,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             },
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-1',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1078,7 +1078,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             },
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-2',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1086,7 +1086,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             },
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-3',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1315,7 +1315,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         resp = [
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-1',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1323,7 +1323,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             },
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-2',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1361,7 +1361,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         resp = [
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-1',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1369,7 +1369,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             },
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-2',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1407,7 +1407,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         resp = [
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-1',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1415,7 +1415,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             },
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-2',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1423,7 +1423,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             },
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-3',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1431,7 +1431,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             },
                 {
                 'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
+                'body': '',
                 'name': 'sort-4',
                 'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
                 'nexe_status': 'ok.',
@@ -1479,8 +1479,9 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             req = self.zerovm_request()
             req.body = '12345'
             req.content_length = 10
+            print req.__dict__
             res = req.get_response(prosrv)
-            self.assertEqual(req.bytes_transferred, 5)
+            print req.__dict__
             self.assertEqual(res.status, '499 Client Disconnect')
 
     def test_QUERY_request_timed_out(self):

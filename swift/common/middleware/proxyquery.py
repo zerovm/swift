@@ -17,12 +17,8 @@ except ImportError:
     import json
 import uuid
 from urllib import unquote
-from webob import Request, Response
 from random import shuffle, randrange
 from eventlet.timeout import Timeout
-
-from webob.exc import HTTPNotFound, HTTPPreconditionFailed, \
-    HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest, HTTPUnprocessableEntity, HTTPServiceUnavailable
 
 from swift.common.utils import split_path, get_logger, TRUE_VALUES, get_remote_client
 from swift.proxy.server import Controller, ObjectController, ContainerController, AccountController
@@ -30,6 +26,9 @@ from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout, ChunkReadTimeout, \
     ChunkWriteTimeout
 from swift.common.constraints import check_utf8
+from swift.common.swob import Request, Response, HTTPNotFound, HTTPPreconditionFailed,\
+    HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest,\
+    HTTPUnprocessableEntity, HTTPServiceUnavailable
 
 ACCESS_WRITABLE = 0x1
 ACCESS_RANDOM = 0x2
@@ -522,6 +521,7 @@ class ClusterController(Controller):
                 dest_container_name, dest_obj_name = \
                     dest_header.split('/', 3)[2:]
                 dest_req = Request.blank(dest_header)
+                dest_req.method = 'PUT'
                 dest_req.environ['wsgi.input'] = seq_resp
                 #dest_req.app_iter = self._make_app_iter(node, seq_resp, dest_req)
                 dest_req.headers['Content-Length'] = seq_resp.get_content_length()
