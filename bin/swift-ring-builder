@@ -47,12 +47,10 @@ def format_device(dev):
 
 class Commands:
 
-    @staticmethod
     def unknown():
         print 'Unknown command: %s' % argv[2]
         exit(EXIT_ERROR)
 
-    @staticmethod
     def create():
         """
 swift-ring-builder <builder_file> create <part_power> <replicas>
@@ -76,7 +74,6 @@ swift-ring-builder <builder_file> create <part_power> <replicas>
         pickle.dump(builder.to_dict(), open(argv[1], 'wb'), protocol=2)
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def default():
         """
 swift-ring-builder <builder_file>
@@ -115,7 +112,6 @@ swift-ring-builder <builder_file>
                      dev['meta'])
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def search():
         """
 swift-ring-builder <builder_file> search <search-value>
@@ -149,7 +145,6 @@ swift-ring-builder <builder_file> search <search-value>
                  dev['meta'])
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def list_parts():
         """
 swift-ring-builder <builder_file> list_parts <search-value> [<search-value>] ..
@@ -184,7 +179,6 @@ swift-ring-builder <builder_file> list_parts <search-value> [<search-value>] ..
                 print '%9d   %7d' % (part, builder.replicas - index)
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def add():
         """
 swift-ring-builder <builder_file> add
@@ -289,7 +283,6 @@ swift-ring-builder <builder_file> add
         pickle.dump(builder.to_dict(), open(argv[1], 'wb'), protocol=2)
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def set_weight():
         """
 swift-ring-builder <builder_file> set_weight <search-value> <weight>
@@ -331,7 +324,6 @@ swift-ring-builder <builder_file> set_weight <search-value> <weight>
         pickle.dump(builder.to_dict(), open(argv[1], 'wb'), protocol=2)
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def set_info():
         """
 swift-ring-builder <builder_file> set_info
@@ -425,7 +417,6 @@ swift-ring-builder <builder_file> set_info
         pickle.dump(builder.to_dict(), open(argv[1], 'wb'), protocol=2)
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def remove():
         """
 swift-ring-builder <builder_file> remove <search-value> [search-value ...]
@@ -480,7 +471,6 @@ swift-ring-builder <builder_file> remove <search-value> [search-value ...]
         pickle.dump(builder.to_dict(), open(argv[1], 'wb'), protocol=2)
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def rebalance():
         """
 swift-ring-builder <builder_file> rebalance
@@ -540,7 +530,6 @@ swift-ring-builder <builder_file> rebalance
         pickle.dump(builder.to_dict(), open(argv[1], 'wb'), protocol=2)
         exit(status)
 
-    @staticmethod
     def validate():
         """
 swift-ring-builder <builder_file> validate
@@ -549,7 +538,6 @@ swift-ring-builder <builder_file> validate
         builder.validate()
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def write_ring():
         """
 swift-ring-builder <builder_file> write_ring
@@ -571,13 +559,11 @@ swift-ring-builder <builder_file> write_ring
         ring_data.save(ring_file)
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def pretend_min_part_hours_passed():
         builder.pretend_min_part_hours_passed()
         pickle.dump(builder.to_dict(), open(argv[1], 'wb'), protocol=2)
         exit(EXIT_SUCCESS)
 
-    @staticmethod
     def set_min_part_hours():
         """
 swift-ring-builder <builder_file> set_min_part_hours <hours>
