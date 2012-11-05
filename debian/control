@@ -1,0 +1,252 @@
+Source: zerocloud
+Section: net
+Priority: optional
+Maintainer: Constantine Peresypkin <constantine@bigdatacraft.com>
+Uploaders: Constantine Peresypkin <constantine@bigdatacraft.com>
+Build-Depends: debhelper (>= 7.0.50~),
+ python-all-dev (>= 2.6.6-3~),
+ python-openssl,
+ python-setuptools,
+ python-webob,
+ python-simplejson,
+ python-xattr,
+ python-netifaces,
+ python-greenlet (>= 0.3.1),
+ python-eventlet (>= 0.9.8),
+ python-mock,
+ python-nose,
+ python-paste,
+ python-pastedeploy,
+ python-sphinx (>= 1.0)
+Standards-Version: 3.9.3
+Homepage: http://litestack.com
+
+
+Package: python-zerocloud
+Architecture: all
+Section: python
+Depends: adduser, ${python:Depends}, ${misc:Depends},
+ python-openssl,
+ python-setuptools,
+ python-paste,
+ python-pastedeploy,
+ python-webob (>= 0.9.7.1~hg20100111-1~racklabs1),
+ python-simplejson,
+ python-xattr,
+ python-netifaces,
+ python-greenlet (>= 0.3.1),
+ python-eventlet (>= 0.9.8)
+Provides: ${python:Provides}
+Description: distributed virtual object store - Python libraries
+ OpenStack Object Storage (code-named Swift) is open source software for
+ creating redundant, scalable object storage using clusters of standardized
+ servers to store petabytes of accessible data. It is not a file system or
+ real-time data storage system, but rather a long-term storage system for a
+ more permanent type of static data that can be retrieved, leveraged, and then
+ updated if necessary. Primary examples of data that best fit this type of
+ storage model are virtual machine images, photo storage, email storage and
+ backup archiving. Having no central "brain" or master point of control
+ provides greater scalability, redundancy and permanence.
+ .
+ Objects are written to multiple hardware devices in the data center, with
+ the OpenStack software responsible for ensuring data replication and
+ integrity across the cluster. Storage clusters can scale horizontally by
+ adding new nodes. Should a node fail, OpenStack works to replicate its
+ content from other active nodes. Because OpenStack uses software logic to
+ ensure data replication and distribution across different devices,
+ inexpensive commodity hard drives and servers can be used in lieu of more
+ expensive equipment.
+ .
+ This package provides the Python libraries that actually implement
+ everything.
+
+Package: zerocloud
+Architecture: all
+Depends: python-zerocloud (=${binary:Version}), ${python:Depends}, ${shlibs:Depends}, ${misc:Depends}
+Provides: ${python:Provides}
+Replaces: swift (<< 1.6.0-0ubuntu1)
+Breaks: swift (<< 1.6.0-0ubuntu1)
+Description: distributed virtual object store - common files
+ OpenStack Object Storage (code-named Swift) is open source software for
+ creating redundant, scalable object storage using clusters of standardized
+ servers to store petabytes of accessible data. It is not a file system or
+ real-time data storage system, but rather a long-term storage system for a
+ more permanent type of static data that can be retrieved, leveraged, and then
+ updated if necessary. Primary examples of data that best fit this type of
+ storage model are virtual machine images, photo storage, email storage and
+ backup archiving. Having no central "brain" or master point of control
+ provides greater scalability, redundancy and permanence.
+ .
+ Objects are written to multiple hardware devices in the data center, with
+ the OpenStack software responsible for ensuring data replication and
+ integrity across the cluster. Storage clusters can scale horizontally by
+ adding new nodes. Should a node fail, OpenStack works to replicate its
+ content from other active nodes. Because OpenStack uses software logic to
+ ensure data replication and distribution across different devices,
+ inexpensive commodity hard drives and servers can be used in lieu of more
+ expensive equipment.
+ .
+ .
+ This package provides some core binaries and clients to control zerocloud.
+
+Package: zerocloud-proxy
+Architecture: all
+Depends: python-zerocloud (=${binary:Version}), ${python:Depends}, ${shlibs:Depends}, ${misc:Depends}
+Provides: ${python:Provides}
+Conflicts: zerocloud-saio
+Description: distributed virtual object store - proxy server
+ OpenStack Object Storage (code-named Swift) is open source software for
+ creating redundant, scalable object storage using clusters of standardized
+ servers to store petabytes of accessible data. It is not a file system or
+ real-time data storage system, but rather a long-term storage system for a
+ more permanent type of static data that can be retrieved, leveraged, and then
+ updated if necessary. Primary examples of data that best fit this type of
+ storage model are virtual machine images, photo storage, email storage and
+ backup archiving. Having no central "brain" or master point of control
+ provides greater scalability, redundancy and permanence.
+ .
+ Objects are written to multiple hardware devices in the data center, with
+ the OpenStack software responsible for ensuring data replication and
+ integrity across the cluster. Storage clusters can scale horizontally by
+ adding new nodes. Should a node fail, OpenStack works to replicate its
+ content from other active nodes. Because OpenStack uses software logic to
+ ensure data replication and distribution across different devices,
+ inexpensive commodity hard drives and servers can be used in lieu of more
+ expensive equipment.
+ .
+ This package provides a proxy server on which clients can connect to store
+ object into Swift.
+
+Package: zerocloud-object
+Architecture: all
+Depends: python-zerocloud (=${binary:Version}), rsync, ${python:Depends}, ${shlibs:Depends}, ${misc:Depends}
+Conflicts: zerocloud-saio
+Provides: zerovm-exec, ${python:Provides}
+Description: distributed virtual object store - object server
+ OpenStack Object Storage (code-named Swift) is open source software for
+ creating redundant, scalable object storage using clusters of standardized
+ servers to store petabytes of accessible data. It is not a file system or
+ real-time data storage system, but rather a long-term storage system for a
+ more permanent type of static data that can be retrieved, leveraged, and then
+ updated if necessary. Primary examples of data that best fit this type of
+ storage model are virtual machine images, photo storage, email storage and
+ backup archiving. Having no central "brain" or master point of control
+ provides greater scalability, redundancy and permanence.
+ .
+ Objects are written to multiple hardware devices in the data center, with
+ the OpenStack software responsible for ensuring data replication and
+ integrity across the cluster. Storage clusters can scale horizontally by
+ adding new nodes. Should a node fail, OpenStack works to replicate its
+ content from other active nodes. Because OpenStack uses software logic to
+ ensure data replication and distribution across different devices,
+ inexpensive commodity hard drives and servers can be used in lieu of more
+ expensive equipment.
+ .
+ This package provides the zerocloud object server.
+
+Package: zerocloud-container
+Architecture: all
+Depends: python-zerocloud (=${binary:Version}), rsync, ${python:Depends}, ${shlibs:Depends}, ${misc:Depends}
+Conflicts: zerocloud-saio
+Provides: ${python:Provides}
+Description: distributed virtual object store - container server
+ OpenStack Object Storage (code-named Swift) is open source software for
+ creating redundant, scalable object storage using clusters of standardized
+ servers to store petabytes of accessible data. It is not a file system or
+ real-time data storage system, but rather a long-term storage system for a
+ more permanent type of static data that can be retrieved, leveraged, and then
+ updated if necessary. Primary examples of data that best fit this type of
+ storage model are virtual machine images, photo storage, email storage and
+ backup archiving. Having no central "brain" or master point of control
+ provides greater scalability, redundancy and permanence.
+ .
+ Objects are written to multiple hardware devices in the data center, with
+ the OpenStack software responsible for ensuring data replication and
+ integrity across the cluster. Storage clusters can scale horizontally by
+ adding new nodes. Should a node fail, OpenStack works to replicate its
+ content from other active nodes. Because OpenStack uses software logic to
+ ensure data replication and distribution across different devices,
+ inexpensive commodity hard drives and servers can be used in lieu of more
+ expensive equipment.
+ .
+ This package provides the zerocloud container server.
+
+Package: zerocloud-account
+Architecture: all
+Depends: python-zerocloud (=${binary:Version}), rsync, ${python:Depends}, ${shlibs:Depends}, ${misc:Depends}
+Conflicts: zerocloud-saio
+Provides: ${python:Provides}
+Description: distributed virtual object store - account server
+ OpenStack Object Storage (code-named Swift) is open source software for
+ creating redundant, scalable object storage using clusters of standardized
+ servers to store petabytes of accessible data. It is not a file system or
+ real-time data storage system, but rather a long-term storage system for a
+ more permanent type of static data that can be retrieved, leveraged, and then
+ updated if necessary. Primary examples of data that best fit this type of
+ storage model are virtual machine images, photo storage, email storage and
+ backup archiving. Having no central "brain" or master point of control
+ provides greater scalability, redundancy and permanence.
+ .
+ Objects are written to multiple hardware devices in the data center, with
+ the OpenStack software responsible for ensuring data replication and
+ integrity across the cluster. Storage clusters can scale horizontally by
+ adding new nodes. Should a node fail, OpenStack works to replicate its
+ content from other active nodes. Because OpenStack uses software logic to
+ ensure data replication and distribution across different devices,
+ inexpensive commodity hard drives and servers can be used in lieu of more
+ expensive equipment.
+ .
+ This package provides the zerocloud account server.
+
+Package: zerocloud-saio
+Architecture: all
+Depends: python-zerocloud (=${binary:Version}), rsync, memcached, xfsprogs, git, sqlite3, ${python:Depends}, ${shlibs:Depends}, ${misc:Depends}
+Provides: zerovm-exec, ${python:Provides}
+Conflicts: zerocloud-account, zerocloud-proxy, zerocloud-object, zerocloud-container
+Description: distributed virtual object store - account server
+ OpenStack Object Storage (code-named Swift) is open source software for
+ creating redundant, scalable object storage using clusters of standardized
+ servers to store petabytes of accessible data. It is not a file system or
+ real-time data storage system, but rather a long-term storage system for a
+ more permanent type of static data that can be retrieved, leveraged, and then
+ updated if necessary. Primary examples of data that best fit this type of
+ storage model are virtual machine images, photo storage, email storage and
+ backup archiving. Having no central "brain" or master point of control
+ provides greater scalability, redundancy and permanence.
+ .
+ Objects are written to multiple hardware devices in the data center, with
+ the OpenStack software responsible for ensuring data replication and
+ integrity across the cluster. Storage clusters can scale horizontally by
+ adding new nodes. Should a node fail, OpenStack works to replicate its
+ content from other active nodes. Because OpenStack uses software logic to
+ ensure data replication and distribution across different devices,
+ inexpensive commodity hard drives and servers can be used in lieu of more
+ expensive equipment.
+ .
+ This package provides the zerocloud all-in-one test installation.
+
+Package: zerocloud-doc
+Architecture: all
+Section: doc
+Depends: libjs-jquery, ${misc:Depends}
+Description: distributed virtual object store - documentation
+ OpenStack Object Storage (code-named Swift) is open source software for
+ creating redundant, scalable object storage using clusters of standardized
+ servers to store petabytes of accessible data. It is not a file system or
+ real-time data storage system, but rather a long-term storage system for a
+ more permanent type of static data that can be retrieved, leveraged, and then
+ updated if necessary. Primary examples of data that best fit this type of
+ storage model are virtual machine images, photo storage, email storage and
+ backup archiving. Having no central "brain" or master point of control
+ provides greater scalability, redundancy and permanence.
+ .
+ Objects are written to multiple hardware devices in the data center, with
+ the OpenStack software responsible for ensuring data replication and
+ integrity across the cluster. Storage clusters can scale horizontally by
+ adding new nodes. Should a node fail, OpenStack works to replicate its
+ content from other active nodes. Because OpenStack uses software logic to
+ ensure data replication and distribution across different devices,
+ inexpensive commodity hard drives and servers can be used in lieu of more
+ expensive equipment.
+ .
+ This package provides the Sphinx generated documentation for Swift.
