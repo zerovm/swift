@@ -2,6 +2,7 @@ from _ctypes import POINTER
 from ctypes import *
 import hashlib
 
+
 class EVP_MD(Structure):
     _fields_ = [
         ('type', c_int),
@@ -15,10 +16,11 @@ class EVP_MD(Structure):
         ('cleanup', c_void_p),
         ('sign', c_void_p),
         ('verify', c_void_p),
-        ('required_pkey_type', c_int*5),
+        ('required_pkey_type', c_int * 5),
         ('block_size', c_int),
         ('ctx_size', c_int),
     ]
+
 
 class EVP_MD_CTX(Structure):
     _fields_ = [
@@ -37,11 +39,13 @@ class EVPobject(Structure):
         ('ctx', EVP_MD_CTX),
     ]
 
+
 class rmd5:
 
     def __init__(self, state=None):
         self.hash = hashlib.md5()
-        self.evp_ctx = cast(c_void_p(id(self.hash)), POINTER(EVPobject)).contents
+        self.evp_ctx = cast(c_void_p(id(self.hash)),
+            POINTER(EVPobject)).contents
         if not state is None:
             self.set_state(state)
 

@@ -118,14 +118,13 @@ import cgi
 import time
 from urllib import unquote, quote as urllib_quote
 
-from webob import Response
-from webob.exc import HTTPMovedPermanently, HTTPNotFound
 
 from swift.common.utils import cache_from_env, get_logger, human_readable, \
                                split_path, TRUE_VALUES
 from swift.common.wsgi import make_pre_authed_env, make_pre_authed_request, \
                               WSGIContext
 from swift.common.http import is_success, is_redirection, HTTP_NOT_FOUND
+from swift.common.swob import Response, HTTPMovedPermanently, HTTPNotFound
 
 
 def quote(value, safe='/'):
@@ -523,7 +522,7 @@ class StaticWeb(object):
         self.access_logger = get_logger(access_log_conf,
                                         log_route='staticweb-access')
         #: Indicates whether full HTTP headers should be logged or not.
-        self.log_headers = conf.get('log_headers', 'f').lower() in TRUE_VALUES
+        self.log_headers = conf.get('log_headers', 'no').lower() in TRUE_VALUES
 
     def __call__(self, env, start_response):
         """

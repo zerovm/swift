@@ -26,7 +26,7 @@ from webob.exc import HTTPBadRequest, HTTPNotFound,\
 from swift.common.utils import normalize_timestamp,\
     fallocate, split_path, drop_buffer_cache,\
     get_logger, mkdirs
-from swift.obj.server import DiskFile
+from swift.obj.server import DiskFile, write_metadata, read_metadata
 from swift.common.constraints import check_mount, check_utf8
 from swift.common.exceptions import DiskFileError, DiskFileNotExist
 
@@ -115,14 +115,78 @@ class ObjectQueryMiddleware(object):
         # green thread for zerovm execution
         self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
 
+    def execute_zerovm(self, zerovm_inputmnfst_fn):
+        cmdline = []
+        cmdline += self.zerovm_exename
+        #if len(self.zerovm_xparams) > 0:
+        #    cmdline += self.zerovm_xparams
+        cmdline += ['-M%s' % zerovm_inputmnfst_fn]
+        proc = subprocess.Popen(cmdline, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+
+        stdout_data = ''
+        stderr_data = ''
+        readable = [proc.stdout, proc.stderr]
+        start = time.time()
+        def get_output(stdout_data, stderr_data):
+            (data1, data2) = proc.communicate()
+            stdout_data += data1
+            stderr_data += data2
+            return stdout_data, stderr_data
+        while time.time() - start < self.zerovm_timeout:
+            rlist, wlist, xlist =\
+            select.select(readable, [], [], start - time.time() + self.zerovm_timeout)
+            if not rlist:
+                continue
+            for stream in rlist:
+                data = self.os_interface.read(stream.fileno(), 4096)
+                if not data:
+                    readable.remove(stream)
+                    continue
+                if stream == proc.stdout:
+                    stdout_data += data
+                elif stream == proc.stderr:
+                    stderr_data += data
+                if len(stdout_data) > self.zerovm_stdout_size\
+                or len(stderr_data) > self.zerovm_stderr_size:
+                    proc.kill()
+                    return 4, stdout_data, stderr_data
+            if proc.poll() is not None:
+                stdout_data, stderr_data = get_output(stdout_data, stderr_data)
+                ret = 0
+                if proc.returncode:
+                    ret = 1
+                return ret, stdout_data, stderr_data
+            sleep(0.1)
+        if proc.poll() is None:
+            proc.terminate()
+            start = time.time()
+            while time.time() - start\
+            < self.zerovm_kill_timeout:
+                if proc.poll() is not None:
+                    stdout_data, stderr_data = get_output(stdout_data, stderr_data)
+                    return 2, stdout_data, stderr_data
+                sleep(0.1)
+            proc.kill()
+            stdout_data, stderr_data = get_output(stdout_data, stderr_data)
+            return 3, stdout_data, stderr_data
+
     def zerovm_query(self, req):
         """Handle HTTP QUERY requests for the Swift Object Server."""
 
         nexe_headers = {
             'x-nexe-retcode': 0,
             'x-nexe-status': 'Zerovm did not run',
-            'x-nexe-etag': ''
+            'x-nexe-etag': '',
+            'x-nexe-validation': 0,
+            'x-nexe-cdr-line': '0 0 0 0 0 0 0 0 0 0 0 0'
         }
+        if 'x-validator-exec' in req.headers:
+            validator = str(req.headers.get('x-validator-exec', ''))
+            if 'skip' in validator:
+                self.zerovm_exename.append('-s')
+            #if 'fuzzy' in validator:
+            #    self.zerovm_exename.append('-z')
         if 'x-node-name' in req.headers:
             nexe_name = re.split('\s*,\s*', req.headers['x-node-name'])
             nexe_headers['x-nexe-name'] = nexe_name[0]
@@ -364,63 +428,7 @@ class ObjectQueryMiddleware(object):
                         zerovm_inputmnfst)
                     zerovm_inputmnfst = zerovm_inputmnfst[written:]
 
-                def ex_zerovm():
-                    cmdline = []
-                    cmdline += self.zerovm_exename
-                    #if len(self.zerovm_xparams) > 0:
-                    #    cmdline += self.zerovm_xparams
-                    cmdline += ['-M%s' % zerovm_inputmnfst_fn]
-                    proc = subprocess.Popen(cmdline, stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE)
-
-                    stdout_data = ''
-                    stderr_data = ''
-                    readable = [proc.stdout, proc.stderr]
-                    start = time.time()
-                    def get_output(stdout_data, stderr_data):
-                        (data1, data2) = proc.communicate()
-                        stdout_data += data1
-                        stderr_data += data2
-                        return stdout_data, stderr_data
-                    while time.time() - start < self.zerovm_timeout:
-                        rlist, wlist, xlist = \
-                        select.select(readable, [], [], start - time.time() + self.zerovm_timeout)
-                        if not rlist:
-                            continue
-                        for stream in rlist:
-                            data = self.os_interface.read(stream.fileno(), 4096)
-                            if not data:
-                                readable.remove(stream)
-                                continue
-                            if stream == proc.stdout:
-                                stdout_data += data
-                            elif stream == proc.stderr:
-                                stderr_data += data
-                            if len(stdout_data) > self.zerovm_stdout_size \
-                            or len(stderr_data) > self.zerovm_stderr_size:
-                                proc.kill()
-                                return 4, stdout_data, stderr_data
-                        if proc.poll() is not None:
-                            stdout_data, stderr_data = get_output(stdout_data, stderr_data)
-                            ret = 0
-                            if proc.returncode:
-                                ret = 1
-                            return ret, stdout_data, stderr_data
-                        sleep(0.1)
-                    if proc.poll() is None:
-                        proc.terminate()
-                        start = time.time()
-                        while time.time() - start\
-                        < self.zerovm_kill_timeout:
-                            if proc.poll() is not None:
-                                stdout_data, stderr_data = get_output(stdout_data, stderr_data)
-                                return 2, stdout_data, stderr_data
-                            sleep(0.1)
-                        proc.kill()
-                        stdout_data, stderr_data = get_output(stdout_data, stderr_data)
-                        return 3, stdout_data, stderr_data
-
-                thrd = self.zerovm_thrdpool.spawn(ex_zerovm)
+                thrd = self.zerovm_thrdpool.spawn(self.execute_zerovm, zerovm_inputmnfst_fn)
                 (zerovm_retcode, zerovm_stdout, zerovm_stderr) = thrd.wait()
                 if zerovm_retcode:
                     err = 'ERROR OBJ.QUERY retcode=%s, '\
@@ -435,22 +443,28 @@ class ObjectQueryMiddleware(object):
                 if zerovm_stderr:
                     self.logger.warning('zerovm stderr: '+zerovm_stderr)
                 report = zerovm_stdout.splitlines()
-                if len(report) < 3:
+                if len(report) < 5:
+                    nexe_validation = 0
                     nexe_retcode = 0
                     nexe_etag = ''
+                    nexe_cdr_line = '0 0 0 0 0 0 0 0 0 0 0 0'
                     nexe_status = 'Zerovm crashed'
                 else:
-                    nexe_retcode = int(report[0])
-                    nexe_etag = report[1]
-                    nexe_status = '\n'.join(report[2:])
+                    nexe_validation = int(report[0])
+                    nexe_retcode = int(report[1])
+                    nexe_etag = report[2]
+                    nexe_cdr_line = report[3]
+                    nexe_status = '\n'.join(report[4:])
 
+                self.logger.info('Zerovm CDR: %s' % nexe_cdr_line)
                 response = Response(app_iter=outputiter,
                     request=req, conditional_response=True)
                 response.headers['x-nexe-retcode'] = nexe_retcode
                 response.headers['x-nexe-status'] = nexe_status
                 response.headers['x-nexe-etag'] = nexe_etag
+                response.headers['x-nexe-validation'] = nexe_validation
                 response.headers['X-Timestamp'] =\
-                normalize_timestamp(time.time())
+                    normalize_timestamp(time.time())
                 content_length = 0
                 for fn in fn_list:
                     content_length += self.os_interface.path.getsize(fn)
@@ -471,8 +485,22 @@ class ObjectQueryMiddleware(object):
             res = HTTPPreconditionFailed(body='Invalid UTF8')
         else:
             try:
-                if req.method == 'POST' and 'x-zerovm-execute' in req.headers:
+                if 'x-zerovm-execute' in req.headers and req.method == 'POST':
                     res = self.zerovm_query(req)
+                elif 'x-validator-exec' in req.headers and req.method == 'PUT':
+                    def validate_resp(status, response_headers, exc_info=None):
+                        if 200 <= int(status.split(' ')[0]) < 300:
+                            valid = self.validate(req)
+                            response_headers.append(('x-nexe-validation',str(valid)))
+                        return start_response(status, response_headers, exc_info)
+                    return self.app(env, validate_resp)
+                elif 'x-nexe-validation' in req.headers and req.method == 'GET':
+                    def validate_resp(status, response_headers, exc_info=None):
+                        if 200 <= int(status.split(' ')[0]) < 300:
+                            valid = self.get_validation_status(req)
+                            response_headers.append(('x-nexe-validation',str(valid)))
+                        return start_response(status, response_headers, exc_info)
+                    return self.app(env, validate_resp)
                 else:
                     return self.app(env, start_response)
             except (Exception, Timeout):
@@ -494,6 +522,93 @@ class ObjectQueryMiddleware(object):
             self.logger.info(log_line)
 
         return res(env, start_response)
+
+    def validate(self, req):
+        validator = str(req.headers.get('x-validator-exec', ''))
+        if 'fuzzy' in validator:
+            self.zerovm_exename.append('-z')
+        else:
+            return 0
+        try:
+            (device, partition, account, container, obj) =\
+                split_path(unquote(req.path), 5, 5, True)
+        except ValueError:
+            return 0
+        if self.app.mount_check and not check_mount(self.app.devices, device):
+            return 0
+        file = DiskFile(
+            self.app.devices,
+            device,
+            partition,
+            account,
+            container,
+            obj,
+            self.logger,
+            disk_chunk_size=self.app.disk_chunk_size,
+        )
+        try:
+            nexe_size = os.path.getsize(file.data_file)
+        except (DiskFileError, DiskFileNotExist):
+            return 0
+        if nexe_size > self.zerovm_maxnexe:
+            return 0
+        if file.is_deleted():
+            return 0
+        with file.mkstemp() as (zerovm_inputmnfst_fd,
+                                zerovm_inputmnfst_fn):
+            zerovm_inputmnfst = (
+                'Version=%s\n'
+                'Nexe=%s\n'
+                % (
+                    self.zerovm_manifest_ver,
+                    file.data_file,
+                    ))
+            while zerovm_inputmnfst:
+                written = self.os_interface.write(zerovm_inputmnfst_fd,
+                    zerovm_inputmnfst)
+                zerovm_inputmnfst = zerovm_inputmnfst[written:]
+
+            thrd = self.zerovm_thrdpool.spawn(self.execute_zerovm, zerovm_inputmnfst_fn)
+            (zerovm_retcode, zerovm_stdout, zerovm_stderr) = thrd.wait()
+            if zerovm_retcode:
+                err = 'ERROR OBJ.QUERY retcode=%s, '\
+                      ' zerovm_stdout=%s'\
+                % (self.retcode_map[zerovm_retcode],
+                   zerovm_stdout)
+                self.logger.exception(err)
+                return 0
+            if zerovm_stderr:
+                self.logger.warning('zerovm stderr: '+zerovm_stderr)
+            report = zerovm_stdout.splitlines()
+            if len(report) < 5:
+                return 0
+            else:
+                metadata = file.metadata
+                metadata['Validation-Status'] = report[0]
+                write_metadata(file.data_file, metadata)
+                return int(report[0])
+
+    def get_validation_status(self, req):
+        try:
+            (device, partition, account, container, obj) =\
+            split_path(unquote(req.path), 5, 5, True)
+        except ValueError:
+            return 0
+        if self.app.mount_check and not check_mount(self.app.devices, device):
+            return 0
+        file = DiskFile(
+            self.app.devices,
+            device,
+            partition,
+            account,
+            container,
+            obj,
+            self.logger,
+            disk_chunk_size=self.app.disk_chunk_size,
+        )
+        metadata = read_metadata(file.data_file)
+        status = int(metadata.get('Validation-Status', '0'))
+        return status
 
 
 def filter_factory(global_conf, **local_conf):

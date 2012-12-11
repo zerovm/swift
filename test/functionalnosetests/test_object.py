@@ -550,7 +550,7 @@ class TestObject(unittest.TestCase):
         obj_content = body
         def put(url, token, parsed, conn, body=body):
             conn.request('PUT', '%s/%s' % (parsed.path, obj_path), body,
-                    {'X-Auth-Token': token})
+                    {'X-Auth-Token': token, 'X-Revision':'0'})
             return check_response(conn)
         resp = retry(put, body=body)
         contents = resp.read()
@@ -560,7 +560,7 @@ class TestObject(unittest.TestCase):
         def get(url, token, parsed, conn):
             conn.request('GET',
                 '%s/%s' % (parsed.path, obj_path),
-                '', {'X-Auth-Token': token})
+                '', {'X-Auth-Token': token, 'X-Revision':'-1'})
             return check_response(conn)
         resp = retry(get)
         contents = resp.read()

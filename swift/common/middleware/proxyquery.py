@@ -9,6 +9,7 @@ from hashlib import md5
 from eventlet import GreenPile, GreenPool, sleep
 import greenlet
 from swiftclient.client import quote
+from swift.proxy.controllers.base import update_headers
 
 try:
     import simplejson as json
@@ -16,28 +17,28 @@ except ImportError:
     import json
 import uuid
 from urllib import unquote
-from webob import Request, Response
 from random import shuffle, randrange
 from eventlet.timeout import Timeout
 
-from webob.exc import HTTPNotFound, HTTPPreconditionFailed, \
-    HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest, HTTPUnprocessableEntity, HTTPServiceUnavailable
-
 from swift.common.utils import split_path, get_logger, TRUE_VALUES, get_remote_client
-from swift.proxy.server import update_headers, Controller, ObjectController, delay_denial, ContainerController, AccountController
+from swift.proxy.server import Controller, ObjectController, ContainerController, AccountController
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout, ChunkReadTimeout, \
     ChunkWriteTimeout
 from swift.common.constraints import check_utf8
+from swift.common.swob import Request, Response, HTTPNotFound, HTTPPreconditionFailed,\
+    HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest,\
+    HTTPUnprocessableEntity, HTTPServiceUnavailable
 
-ACCESS_WRITABLE = 0x1
-ACCESS_RANDOM = 0x2
-ACCESS_NETWORK = 0x4
-ACCESS_CDR = 0x8
+ACCESS_READABLE = 0x1
+ACCESS_WRITABLE = 0x2
+ACCESS_RANDOM = 0x4
+ACCESS_NETWORK = 0x8
+ACCESS_CDR = 0x10
 
 device_map = {
-    'stdin': 0, 'stdout': ACCESS_WRITABLE, 'stderr': ACCESS_WRITABLE,
-    'input': ACCESS_RANDOM, 'output': ACCESS_RANDOM | ACCESS_WRITABLE,
+    'stdin': ACCESS_READABLE, 'stdout': ACCESS_WRITABLE, 'stderr': ACCESS_WRITABLE,
+    'input': ACCESS_RANDOM | ACCESS_READABLE, 'output': ACCESS_RANDOM | ACCESS_WRITABLE,
     'debug': ACCESS_NETWORK, 'image': ACCESS_CDR
     }
 
@@ -76,10 +77,10 @@ class NameService(object):
     def start(self, pool, peers):
         self.sock.bind(('', 0))
         self.peers = peers
-        self.thread = pool.spawn(self.run)
+        self.thread = pool.spawn(self._run)
         return self.sock.getsockname()[1]
 
-    def run(self):
+    def _run(self):
         bind_map = {}
         conn_map = {}
         peer_map = {}
@@ -217,9 +218,10 @@ class ZvmNode(object):
         for bind_name in connect_list:
             if nodes.get(bind_name):
                 bind_node = nodes.get(bind_name)
-                if not bind_node is self:
-                    bind_node.bind.append(self.name)
-                    self.connect.append(bind_name)
+                if bind_node is self:
+                    raise Exception('Cannot bind to itself: %s' % bind_name)
+                bind_node.bind.append(self.name)
+                self.connect.append(bind_name)
             elif nodes.get(bind_name + '-1'):
                 i = 1
                 bind_node = nodes.get(bind_name + '-' + str(i))
@@ -334,9 +336,9 @@ class ClusterController(Controller):
         }
         path_info = request.path_info
         top_path = node.channels[0].path
-        if top_path \
-           and not (node.channels[0].access & ACCESS_WRITABLE) \
-        and not (node.channels[0].access & ACCESS_NETWORK):
+        if top_path and \
+           ((node.channels[0].access & ACCESS_READABLE)
+           or (node.channels[0].access & ACCESS_CDR)):
             path_info += top_path
             account, container, obj = split_path(path_info, 1, 3, True)
             partition, obj_nodes = self.app.object_ring.get_nodes(account, container, obj)
@@ -520,6 +522,7 @@ class ClusterController(Controller):
                 dest_container_name, dest_obj_name = \
                     dest_header.split('/', 3)[2:]
                 dest_req = Request.blank(dest_header)
+                dest_req.method = 'PUT'
                 dest_req.environ['wsgi.input'] = seq_resp
                 #dest_req.app_iter = self._make_app_iter(node, seq_resp, dest_req)
                 dest_req.headers['Content-Length'] = seq_resp.get_content_length()
@@ -604,7 +607,7 @@ class ClusterController(Controller):
                         if access < 0:
                             return HTTPBadRequest(request=req,
                                 body='Unknown device %s in %s' % (device, node_name))
-                        if not access & ACCESS_WRITABLE or access & ACCESS_CDR:
+                        if access & ACCESS_READABLE or access & ACCESS_CDR:
                             if len(read_list) > 0:
                                 return HTTPBadRequest(request=req,
                                     body='More than one readable file in %s' % node_name)

@@ -23,7 +23,7 @@ import sys
 import time
 import functools
 from hashlib import md5
-from random import shuffle
+from random import random, shuffle
 from urllib import quote
 from contextlib import contextmanager, closing
 import ctypes
@@ -40,6 +40,8 @@ import cPickle as pickle
 import glob
 from urlparse import urlparse as stdlib_urlparse, ParseResult
 import socket
+import itertools
+import types
 
 import eventlet
 from eventlet import GreenPool, sleep, Timeout
@@ -63,6 +65,7 @@ logging._levelNames[NOTICE] = 'NOTICE'
 SysLogHandler.priority_map['NOTICE'] = 'notice'
 
 # These are lazily pulled from libc elsewhere
+_sys_fsync = None
 _sys_fallocate = None
 _posix_fadvise = None
 
@@ -99,7 +102,7 @@ def load_libc_function(func_name, log_error=True):
     :param func_name: name of the function to pull from libc.
     """
     try:
-        libc = ctypes.CDLL(ctypes.util.find_library('c'))
+        libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
         return getattr(libc, func_name)
     except AttributeError:
         if log_error:
@@ -113,7 +116,7 @@ def get_param(req, name, default=None):
     Get parameters from an HTTP request ensuring proper handling UTF-8
     encoding.
 
-    :param req: Webob request object
+    :param req: request object
     :param name: parameter name
     :param default: result to return if the parameter is not found
     :returns: HTTP request parameter value
@@ -126,7 +129,14 @@ def get_param(req, name, default=None):
 
 class FallocateWrapper(object):
 
-    def __init__(self):
+    def __init__(self, noop=False):
+        if noop:
+            self.func_name = 'posix_fallocate'
+            self.fallocate = noop_libc_function
+            return
+        ## fallocate is prefered because we need the on-disk size to match
+        ## the allocated size. Older versions of sqlite require that the
+        ## two sizes match. However, fallocate is Linux only.
         for func in ('fallocate', 'posix_fallocate'):
             self.func_name = func
             self.fallocate = load_libc_function(func, log_error=False)
@@ -144,9 +154,14 @@ class FallocateWrapper(object):
         return self.fallocate(*args[self.func_name])
 
 
+def disable_fallocate():
+    global _sys_fallocate
+    _sys_fallocate = FallocateWrapper(noop=True)
+
+
 def fallocate(fd, size):
     """
-    Pre-allocate disk space for a file file.
+    Pre-allocate disk space for a file.
 
     :param fd: file descriptor
     :param size: size to allocate (in bytes)
@@ -157,10 +172,52 @@ def fallocate(fd, size):
     if size > 0:
         # 1 means "FALLOC_FL_KEEP_SIZE", which means it pre-allocates invisibly
         ret = _sys_fallocate(fd, 1, 0, ctypes.c_uint64(size))
-        # XXX: in (not very thorough) testing, errno always seems to be 0?
         err = ctypes.get_errno()
-        if ret and err not in (0, errno.ENOSYS):
+        if ret and err not in (0, errno.ENOSYS, errno.EOPNOTSUPP,
+                               errno.EINVAL):
             raise OSError(err, 'Unable to fallocate(%s)' % size)
+
+
+class FsyncWrapper(object):
+
+    def __init__(self):
+        if hasattr(os, 'fdatasync'):
+            self.func_name = 'fdatasync'
+            self.fsync = os.fdatasync
+            self.fcntl_flag = None
+        elif hasattr(fcntl, 'F_FULLFSYNC'):
+            self.func_name = 'fcntl'
+            self.fsync = fcntl.fcntl
+            self.fcntl_flag = fcntl.F_FULLFSYNC
+        else:
+            self.func_name = 'fsync'
+            self.fsync = os.fsync
+            self.fcntl_flag = None
+
+    def __call__(self, fd):
+        args = {
+            'fdatasync': (fd, ),
+            'fsync': (fd, ),
+            'fcntl': (fd, self.fcntl_flag)
+        }
+        return self.fsync(*args[self.func_name])
+
+
+def fsync(fd):
+    """
+    Write buffered changes to disk.
+
+    :param fd: file descriptor
+    """
+
+    global _sys_fsync
+    if _sys_fsync is None:
+        _sys_fsync = FsyncWrapper()
+
+    ret = _sys_fsync(fd)
+    err = ctypes.get_errno()
+    if ret and err != 0:
+        raise OSError(err, 'Unable to fsync(%s)' % fd)
 
 
 def drop_buffer_cache(fd, offset, length):
@@ -176,7 +233,7 @@ def drop_buffer_cache(fd, offset, length):
         _posix_fadvise = load_libc_function('posix_fadvise64')
     # 4 means "POSIX_FADV_DONTNEED"
     ret = _posix_fadvise(fd, ctypes.c_uint64(offset),
-                        ctypes.c_uint64(length), 4)
+                         ctypes.c_uint64(length), 4)
     if ret != 0:
         logging.warn("posix_fadvise64(%s, %s, %s, 4) -> %s"
                      % (fd, offset, length, ret))
@@ -254,16 +311,17 @@ def split_path(path, minsegs=1, maxsegs=None, rest_with_last=False):
         minsegs += 1
         maxsegs += 1
         count = len(segs)
-        if segs[0] or count < minsegs or count > maxsegs or \
-           '' in segs[1:minsegs]:
+        if (segs[0] or count < minsegs or count > maxsegs or
+                '' in segs[1:minsegs]):
             raise ValueError('Invalid path: %s' % quote(path))
     else:
         minsegs += 1
         maxsegs += 1
         segs = path.split('/', maxsegs)
         count = len(segs)
-        if segs[0] or count < minsegs or count > maxsegs + 1 or \
-           '' in segs[1:minsegs] or (count == maxsegs + 1 and segs[maxsegs]):
+        if (segs[0] or count < minsegs or count > maxsegs + 1 or
+                '' in segs[1:minsegs] or
+                (count == maxsegs + 1 and segs[maxsegs])):
             raise ValueError('Invalid path: %s' % quote(path))
     segs = segs[1:maxsegs]
     segs.extend([None] * (maxsegs - 1 - len(segs)))
@@ -350,6 +408,7 @@ class StatsdClient(object):
         self.set_prefix(tail_prefix)
         self._default_sample_rate = default_sample_rate
         self._target = (self._host, self._port)
+        self.random = random
 
     def set_prefix(self, new_prefix):
         if new_prefix and self._base_prefix:
@@ -366,11 +425,17 @@ class StatsdClient(object):
             sample_rate = self._default_sample_rate
         parts = ['%s%s:%s' % (self._prefix, m_name, m_value), m_type]
         if sample_rate < 1:
-            parts.append('@%s' % (sample_rate,))
+            if self.random() < sample_rate:
+                parts.append('@%s' % (sample_rate,))
+            else:
+                return
         # Ideally, we'd cache a sending socket in self, but that
         # results in a socket getting shared by multiple green threads.
-        with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sock:
+        with closing(self._open_socket()) as sock:
             return sock.sendto('|'.join(parts), self._target)
+
+    def _open_socket(self):
+        return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def update_stats(self, m_name, m_value, sample_rate=None):
         return self._send(m_name, m_value, 'c', sample_rate)
@@ -530,10 +595,10 @@ class SwiftLogFormatter(logging.Formatter):
     def format(self, record):
         msg = logging.Formatter.format(self, record)
         if (record.txn_id and record.levelno != logging.INFO and
-            record.txn_id not in msg):
+                record.txn_id not in msg):
             msg = "%s (txn: %s)" % (msg, record.txn_id)
         if (record.client_ip and record.levelno != logging.INFO and
-            record.client_ip not in msg):
+                record.client_ip not in msg):
             msg = "%s (client_ip: %s)" % (msg, record.client_ip)
         return msg
 
@@ -550,9 +615,11 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
         log_name = swift
         log_udp_host = (disabled)
         log_udp_port = logging.handlers.SYSLOG_UDP_PORT
+        log_address = /dev/log
         log_statsd_host = (disabled)
         log_statsd_port = 8125
         log_statsd_default_sample_rate = 1
+        log_statsd_metric_prefix = (empty-string)
 
     :param conf: Configuration dict to read settings from
     :param name: Name of the logger
@@ -591,7 +658,8 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
         try:
             handler = SysLogHandler(address=log_address, facility=facility)
         except socket.error, e:
-            if e.errno != errno.ENOTSOCK:  # Socket operation on non-socket
+            # Either /dev/log isn't a UNIX socket or it does not exist at all
+            if e.errno not in [errno.ENOTSOCK,  errno.ENOENT]:
                 raise e
             handler = SysLogHandler(facility=facility)
     handler.setFormatter(formatter)
@@ -629,6 +697,20 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
         logger.statsd_client = None
 
     adapted_logger = LogAdapter(logger, name)
+    other_handlers = conf.get('log_custom_handlers', None)
+    if other_handlers:
+        log_custom_handlers = [s.strip() for s in other_handlers.split(',')
+                               if s.strip()]
+        for hook in log_custom_handlers:
+            try:
+                mod, fnc = hook.rsplit('.', 1)
+                logger_hook = getattr(__import__(mod, fromlist=[fnc]), fnc)
+                logger_hook(conf, name, log_to_console, log_route, fmt,
+                            logger, adapted_logger)
+            except (AttributeError, ImportError):
+                print >>sys.stderr, 'Error calling custom handler [%s]' % hook
+            except ValueError:
+                print >>sys.stderr, 'Invalid custom handler format [%s]' % hook
     return adapted_logger
 
 
@@ -670,7 +752,12 @@ def capture_stdio(logger, **kwargs):
     with open(os.devnull, 'r+b') as nullfile:
         # close stdio (excludes fds open for logging)
         for f in stdio_files:
-            f.flush()
+            # some platforms throw an error when attempting an stdin flush
+            try:
+                f.flush()
+            except IOError:
+                pass
+
             try:
                 os.dup2(nullfile.fileno(), f.fileno())
             except OSError:
@@ -833,7 +920,11 @@ def lock_file(filename, timeout=10, append=False, unlink=True):
     flags = os.O_CREAT | os.O_RDWR
     if append:
         flags |= os.O_APPEND
+        mode = 'a+'
+    else:
+        mode = 'r+'
     fd = os.open(filename, flags)
+    file_obj = os.fdopen(fd, mode)
     try:
         with LockTimeout(timeout, filename):
             while True:
@@ -844,10 +935,6 @@ def lock_file(filename, timeout=10, append=False, unlink=True):
                     if err.errno != errno.EAGAIN:
                         raise
                 sleep(0.01)
-        mode = 'r+'
-        if append:
-            mode = 'a+'
-        file_obj = os.fdopen(fd, mode)
         yield file_obj
     finally:
         try:
@@ -1005,7 +1092,7 @@ def readconf(conffile, section_name=None, log_name=None, defaults=None,
             conf = dict(c.items(section_name))
         else:
             print _("Unable to find %s config section in %s") % \
-                 (section_name, conffile)
+                (section_name, conffile)
             sys.exit(1)
         if "log_name" not in conf:
             if log_name is not None:
@@ -1219,6 +1306,8 @@ def urlparse(url):
 
 
 def validate_sync_to(value, allowed_sync_hosts):
+    if not value:
+        return None
     p = urlparse(value)
     if p.scheme not in ('http', 'https'):
         return _('Invalid scheme %r in X-Container-Sync-To, must be "http" '
@@ -1367,3 +1456,34 @@ def get_valid_utf8_str(str_or_unicode):
         (str_or_unicode, _len) = utf8_encoder(str_or_unicode, 'replace')
     (valid_utf8_str, _len) = utf8_decoder(str_or_unicode, 'replace')
     return valid_utf8_str.encode('utf-8')
+
+
+def list_from_csv(comma_separated_str):
+    """
+    Splits the str given and returns a properly stripped list of the comma
+    separated values.
+    """
+    if comma_separated_str:
+        return [v.strip() for v in comma_separated_str.split(',') if v.strip()]
+    return []
+
+
+def reiterate(iterable):
+    """
+    Consume the first item from an iterator, then re-chain it to the rest of
+    the iterator.  This is useful when you want to make sure the prologue to
+    downstream generators have been executed before continuing.
+
+    :param iterable: an iterable object
+    """
+    if isinstance(iterable, (list, tuple)):
+        return iterable
+    else:
+        iterator = iter(iterable)
+        try:
+            chunk = ''
+            while not chunk:
+                chunk = next(iterable)
+            return itertools.chain([chunk], iterable)
+        except StopIteration:
+            return []

@@ -33,7 +33,7 @@ import os
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
-sys.path.append([os.path.abspath('../swift'), os.path.abspath('..'),
+sys.path.extend([os.path.abspath('../swift'), os.path.abspath('..'),
                  os.path.abspath('../bin')])
 
 # -- General configuration ----------------------------------------------------
@@ -207,8 +207,8 @@ htmlhelp_basename = 'swiftdoc'
 # (source start file, target name, title, author, documentclass
 # [howto/manual]).
 latex_documents = [
-  ('index', 'Swift.tex', u'Swift Documentation',
-   u'Swift Team', 'manual'),
+    ('index', 'Swift.tex', u'Swift Documentation',
+     u'Swift Team', 'manual'),
 ]
 
 # The name of an image file (relative to this directory) to place at the top of

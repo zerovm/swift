@@ -20,6 +20,7 @@ from logging.handlers import SysLogHandler
 import os
 import sys
 import unittest
+import signal
 from ConfigParser import ConfigParser
 from contextlib import contextmanager
 from cStringIO import StringIO
@@ -27,7 +28,6 @@ from gzip import GzipFile
 from httplib import HTTPException
 from shutil import rmtree
 from time import time
-from unittest.case import SkipTest
 from urllib import unquote, quote
 from hashlib import md5
 from tempfile import mkdtemp
@@ -35,8 +35,6 @@ from tempfile import mkdtemp
 import eventlet
 from eventlet import sleep, spawn, Timeout, util, wsgi, listen
 import simplejson
-from webob import Request, Response
-from webob.exc import HTTPNotFound, HTTPUnauthorized
 
 from test.unit import connect_tcp, readuntil2crlfs, FakeLogger
 from swift.proxy import server as proxy_server
@@ -44,18 +42,46 @@ from swift.account import server as account_server
 from swift.container import server as container_server
 from swift.obj import server as object_server
 from swift.common import ring
+from swift.common.exceptions import ChunkReadTimeout
 from swift.common.constraints import MAX_META_NAME_LENGTH, \
-    MAX_META_VALUE_LENGTH, MAX_META_COUNT, MAX_META_OVERALL_SIZE, MAX_FILE_SIZE
+    MAX_META_VALUE_LENGTH, MAX_META_COUNT, MAX_META_OVERALL_SIZE, \
+    MAX_FILE_SIZE, MAX_ACCOUNT_NAME_LENGTH, MAX_CONTAINER_NAME_LENGTH
 from swift.common.utils import mkdirs, normalize_timestamp, NullLogger
 from swift.common.wsgi import monkey_patch_mimetools
+from swift.proxy.controllers.obj import SegmentedIterable
+from swift.proxy.controllers.base import get_container_memcache_key, \
+    get_account_memcache_key
+import swift.proxy.controllers
+from swift.common.swob import Request, Response, HTTPNotFound, \
+    HTTPUnauthorized
 
 # mocks
 logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
 
 
+_request_instances = 0
+
+
+def request_init(self, *args, **kwargs):
+    global _request_instances
+    self._orig_init(*args, **kwargs)
+    _request_instances += 1
+
+
+def request_del(self):
+    global _request_instances
+    if self._orig_del:
+        self._orig_del()
+    _request_instances -= 1
+
+
 def setup():
     global _testdir, _test_servers, _test_sockets, \
-            _orig_container_listing_limit, _test_coros
+        _orig_container_listing_limit, _test_coros
+    Request._orig_init = Request.__init__
+    Request.__init__ = request_init
+    Request._orig_del = getattr(Request, '__del__', None)
+    Request.__del__ = request_del
     monkey_patch_mimetools()
     # Since we're starting up a lot here, we're going to test more than
     # just chunked puts; we're also going to test parts of
@@ -68,7 +94,8 @@ def setup():
     mkdirs(os.path.join(_testdir, 'sda1', 'tmp'))
     mkdirs(os.path.join(_testdir, 'sdb1'))
     mkdirs(os.path.join(_testdir, 'sdb1', 'tmp'))
-    _orig_container_listing_limit = proxy_server.CONTAINER_LISTING_LIMIT
+    _orig_container_listing_limit = \
+        swift.proxy.controllers.obj.CONTAINER_LISTING_LIMIT
     conf = {'devices': _testdir, 'swift_dir': _testdir,
             'mount_check': 'false', 'allowed_headers':
             'content-encoding, x-object-manifest, content-disposition, foo',
@@ -83,23 +110,23 @@ def setup():
     _test_sockets = \
         (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis)
     pickle.dump(ring.RingData([[0, 1, 0, 1], [1, 0, 1, 0]],
-        [{'id': 0, 'zone': 0, 'device': 'sda1', 'ip': '127.0.0.1',
-          'port': acc1lis.getsockname()[1]},
-         {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
-          'port': acc2lis.getsockname()[1]}], 30),
-        GzipFile(os.path.join(_testdir, 'account.ring.gz'), 'wb'))
+                [{'id': 0, 'zone': 0, 'device': 'sda1', 'ip': '127.0.0.1',
+                  'port': acc1lis.getsockname()[1]},
+                 {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
+                  'port': acc2lis.getsockname()[1]}], 30),
+                GzipFile(os.path.join(_testdir, 'account.ring.gz'), 'wb'))
     pickle.dump(ring.RingData([[0, 1, 0, 1], [1, 0, 1, 0]],
-        [{'id': 0, 'zone': 0, 'device': 'sda1', 'ip': '127.0.0.1',
-          'port': con1lis.getsockname()[1]},
-         {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
-          'port': con2lis.getsockname()[1]}], 30),
-        GzipFile(os.path.join(_testdir, 'container.ring.gz'), 'wb'))
+                [{'id': 0, 'zone': 0, 'device': 'sda1', 'ip': '127.0.0.1',
+                  'port': con1lis.getsockname()[1]},
+                 {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
+                  'port': con2lis.getsockname()[1]}], 30),
+                GzipFile(os.path.join(_testdir, 'container.ring.gz'), 'wb'))
     pickle.dump(ring.RingData([[0, 1, 0, 1], [1, 0, 1, 0]],
-        [{'id': 0, 'zone': 0, 'device': 'sda1', 'ip': '127.0.0.1',
-          'port': obj1lis.getsockname()[1]},
-         {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
-          'port': obj2lis.getsockname()[1]}], 30),
-        GzipFile(os.path.join(_testdir, 'object.ring.gz'), 'wb'))
+                [{'id': 0, 'zone': 0, 'device': 'sda1', 'ip': '127.0.0.1',
+                  'port': obj1lis.getsockname()[1]},
+                 {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
+                  'port': obj2lis.getsockname()[1]}], 30),
+                GzipFile(os.path.join(_testdir, 'object.ring.gz'), 'wb'))
     prosrv = proxy_server.Application(conf, FakeMemcacheReturnsNone())
     acc1srv = account_server.AccountController(conf)
     acc2srv = account_server.AccountController(conf)
@@ -123,17 +150,20 @@ def setup():
     ts = normalize_timestamp(time())
     partition, nodes = prosrv.account_ring.get_nodes('a')
     for node in nodes:
-        conn = proxy_server.http_connect(node['ip'], node['port'],
-                node['device'], partition, 'PUT', '/a',
-                {'X-Timestamp': ts, 'x-trans-id': 'test'})
+        conn = swift.proxy.controllers.obj.http_connect(node['ip'],
+                                                        node['port'],
+                                                        node['device'],
+                                                        partition, 'PUT', '/a',
+                                                        {'X-Timestamp': ts,
+                                                         'x-trans-id': 'test'})
         resp = conn.getresponse()
         assert(resp.status == 201)
     # Create container
     sock = connect_tcp(('localhost', prolis.getsockname()[1]))
     fd = sock.makefile()
     fd.write('PUT /v1/a/c HTTP/1.1\r\nHost: localhost\r\n'
-        'Connection: close\r\nX-Auth-Token: t\r\n'
-        'Content-Length: 0\r\n\r\n')
+             'Connection: close\r\nX-Auth-Token: t\r\n'
+             'Content-Length: 0\r\n\r\n')
     fd.flush()
     headers = readuntil2crlfs(fd)
     exp = 'HTTP/1.1 201'
@@ -143,16 +173,25 @@ def setup():
 def teardown():
     for server in _test_coros:
         server.kill()
-    proxy_server.CONTAINER_LISTING_LIMIT = _orig_container_listing_limit
+    swift.proxy.controllers.obj.CONTAINER_LISTING_LIMIT = \
+        _orig_container_listing_limit
     rmtree(os.path.dirname(_testdir))
+    Request.__init__ = Request._orig_init
+    if Request._orig_del:
+        Request.__del__ = Request._orig_del
 
 
 def fake_http_connect(*code_iter, **kwargs):
 
     class FakeConn(object):
 
-        def __init__(self, status, etag=None, body='', timestamp='1'):
+        def __init__(self, status, etag=None, body='', timestamp='1',
+                     expect_status=None):
             self.status = status
+            if expect_status is None:
+                self.expect_status = self.status
+            else:
+                self.expect_status = expect_status
             self.reason = 'Fake'
             self.host = '1.2.3.4'
             self.port = '1234'
@@ -170,10 +209,12 @@ def fake_http_connect(*code_iter, **kwargs):
             return self
 
         def getexpect(self):
-            if self.status == -2:
+            if self.expect_status == -2:
                 raise HTTPException()
-            if self.status == -3:
+            if self.expect_status == -3:
                 return FakeConn(507)
+            if self.expect_status == -4:
+                return FakeConn(201)
             return FakeConn(100)
 
         def getheaders(self):
@@ -183,7 +224,7 @@ def fake_http_connect(*code_iter, **kwargs):
                        'last-modified': self.timestamp,
                        'x-object-meta-test': 'testing',
                        'etag':
-                            self.etag or '"68b329da9893e34099c7d8ad5cb9c940"',
+                       self.etag or '"68b329da9893e34099c7d8ad5cb9c940"',
                        'x-works': 'yes',
                        'x-account-container-count': 12345}
             if not self.timestamp:
@@ -235,12 +276,17 @@ def fake_http_connect(*code_iter, **kwargs):
         if 'give_connect' in kwargs:
             kwargs['give_connect'](*args, **ckwargs)
         status = code_iter.next()
+        if isinstance(status, tuple):
+            status, expect_status = status
+        else:
+            expect_status = status
         etag = etag_iter.next()
         timestamp = timestamps_iter.next()
+
         if status <= 0:
             raise HTTPException()
         return FakeConn(status, etag, body=kwargs.get('body', ''),
-                        timestamp=timestamp)
+                        timestamp=timestamp, expect_status=expect_status)
 
     return connect
 
@@ -312,13 +358,34 @@ class FakeMemcacheReturnsNone(FakeMemcache):
 
 @contextmanager
 def save_globals():
-    orig_http_connect = getattr(proxy_server, 'http_connect', None)
+    orig_http_connect = getattr(swift.proxy.controllers.base, 'http_connect',
+                                None)
     orig_account_info = getattr(proxy_server.Controller, 'account_info', None)
     try:
         yield True
     finally:
-        proxy_server.http_connect = orig_http_connect
         proxy_server.Controller.account_info = orig_account_info
+        swift.proxy.controllers.base.http_connect = orig_http_connect
+        swift.proxy.controllers.obj.http_connect = orig_http_connect
+        swift.proxy.controllers.account.http_connect = orig_http_connect
+        swift.proxy.controllers.container.http_connect = orig_http_connect
+
+
+def set_http_connect(*args, **kwargs):
+    new_connect = fake_http_connect(*args, **kwargs)
+    swift.proxy.controllers.base.http_connect = new_connect
+    swift.proxy.controllers.obj.http_connect = new_connect
+    swift.proxy.controllers.account.http_connect = new_connect
+    swift.proxy.controllers.container.http_connect = new_connect
+
+
+def set_shuffle():
+    shuffle = lambda l: None
+    proxy_server.shuffle = shuffle
+    swift.proxy.controllers.base.shuffle = shuffle
+    swift.proxy.controllers.obj.shuffle = shuffle
+    swift.proxy.controllers.account.shuffle = shuffle
+    swift.proxy.controllers.container.shuffle = shuffle
 
 
 # tests
@@ -330,9 +397,9 @@ class TestController(unittest.TestCase):
         self.memcache = FakeMemcache()
 
         app = proxy_server.Application(None, self.memcache,
-            account_ring=self.account_ring,
-            container_ring=self.container_ring,
-            object_ring=FakeRing())
+                                       account_ring=self.account_ring,
+                                       container_ring=self.container_ring,
+                                       object_ring=FakeRing())
         self.controller = proxy_server.Controller(app)
 
         self.account = 'some_account'
@@ -350,11 +417,10 @@ class TestController(unittest.TestCase):
 
     def test_make_requests(self):
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200)
+            set_http_connect(200)
             partition, nodes, count = \
                 self.controller.account_info(self.account)
-            proxy_server.http_connect = fake_http_connect(201,
-                                            raise_timeout_exc=True)
+            set_http_connect(201, raise_timeout_exc=True)
             self.controller._make_request(
                 nodes, partition, 'POST', '/', '', '',
                 self.controller.app.logger.thread_locals)
@@ -362,17 +428,17 @@ class TestController(unittest.TestCase):
     # tests if 200 is cached and used
     def test_account_info_200(self):
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200)
+            set_http_connect(200)
             partition, nodes, count = \
                 self.controller.account_info(self.account)
             self.check_account_info_return(partition, nodes)
             self.assertEquals(count, 12345)
 
-            cache_key = proxy_server.get_account_memcache_key(self.account)
+            cache_key = get_account_memcache_key(self.account)
             self.assertEquals({'status': 200, 'container_count': 12345},
                               self.memcache.get(cache_key))
 
-            proxy_server.http_connect = fake_http_connect()
+            set_http_connect()
             partition, nodes, count = \
                 self.controller.account_info(self.account)
             self.check_account_info_return(partition, nodes)
@@ -381,17 +447,17 @@ class TestController(unittest.TestCase):
     # tests if 404 is cached and used
     def test_account_info_404(self):
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(404, 404, 404)
+            set_http_connect(404, 404, 404)
             partition, nodes, count = \
                 self.controller.account_info(self.account)
             self.check_account_info_return(partition, nodes, True)
             self.assertEquals(count, None)
 
-            cache_key = proxy_server.get_account_memcache_key(self.account)
+            cache_key = get_account_memcache_key(self.account)
             self.assertEquals({'status': 404, 'container_count': 0},
                               self.memcache.get(cache_key))
 
-            proxy_server.http_connect = fake_http_connect()
+            set_http_connect()
             partition, nodes, count = \
                 self.controller.account_info(self.account)
             self.check_account_info_return(partition, nodes, True)
@@ -400,7 +466,7 @@ class TestController(unittest.TestCase):
     # tests if some http status codes are not cached
     def test_account_info_no_cache(self):
         def test(*status_list):
-            proxy_server.http_connect = fake_http_connect(*status_list)
+            set_http_connect(*status_list)
             partition, nodes, count = \
                 self.controller.account_info(self.account)
             self.assertEqual(len(self.memcache.keys()), 0)
@@ -416,60 +482,68 @@ class TestController(unittest.TestCase):
     def test_account_info_account_autocreate(self):
         with save_globals():
             self.memcache.store = {}
-            proxy_server.http_connect = \
-                fake_http_connect(404, 404, 404, 201, 201, 201)
+            set_http_connect(404, 404, 404, 201, 201, 201)
             partition, nodes, count = \
                 self.controller.account_info(self.account, autocreate=False)
             self.check_account_info_return(partition, nodes, is_none=True)
             self.assertEquals(count, None)
 
             self.memcache.store = {}
-            proxy_server.http_connect = \
-                fake_http_connect(404, 404, 404, 201, 201, 201)
+            set_http_connect(404, 404, 404, 201, 201, 201)
             partition, nodes, count = \
                 self.controller.account_info(self.account)
             self.check_account_info_return(partition, nodes, is_none=True)
             self.assertEquals(count, None)
 
             self.memcache.store = {}
-            proxy_server.http_connect = \
-                fake_http_connect(404, 404, 404, 201, 201, 201)
+            set_http_connect(404, 404, 404, 201, 201, 201)
             partition, nodes, count = \
                 self.controller.account_info(self.account, autocreate=True)
             self.check_account_info_return(partition, nodes)
             self.assertEquals(count, 0)
 
             self.memcache.store = {}
-            proxy_server.http_connect = \
-                fake_http_connect(404, 404, 404, 503, 201, 201)
+            set_http_connect(404, 404, 404, 503, 201, 201)
             partition, nodes, count = \
                 self.controller.account_info(self.account, autocreate=True)
             self.check_account_info_return(partition, nodes)
             self.assertEquals(count, 0)
 
             self.memcache.store = {}
-            proxy_server.http_connect = \
-                fake_http_connect(404, 404, 404, 503, 201, 503)
+            set_http_connect(404, 404, 404, 503, 201, 503)
             exc = None
-            try:
-                partition, nodes, count = \
-                    self.controller.account_info(self.account, autocreate=True)
-            except Exception, err:
-                exc = err
-            self.assertEquals(str(exc),
-                              "Could not autocreate account '/some_account'")
+            partition, nodes, count = \
+                self.controller.account_info(self.account, autocreate=True)
+            self.check_account_info_return(partition, nodes, is_none=True)
+            self.assertEquals(None, count)
+
+            self.memcache.store = {}
+            set_http_connect(404, 404, 404, 403, 403, 403)
+            exc = None
+            partition, nodes, count = \
+                self.controller.account_info(self.account, autocreate=True)
+            self.check_account_info_return(partition, nodes, is_none=True)
+            self.assertEquals(None, count)
+
+            self.memcache.store = {}
+            set_http_connect(404, 404, 404, 409, 409, 409)
+            exc = None
+            partition, nodes, count = \
+                self.controller.account_info(self.account, autocreate=True)
+            self.check_account_info_return(partition, nodes, is_none=True)
+            self.assertEquals(None, count)
 
     def check_container_info_return(self, ret, is_none=False):
         if is_none:
             partition, nodes, read_acl, write_acl = None, None, None, None
         else:
             partition, nodes = self.container_ring.get_nodes(self.account,
-                self.container)
+                                                             self.container)
             read_acl, write_acl = self.read_acl, self.write_acl
-        self.assertEqual(partition, ret[0])
-        self.assertEqual(nodes, ret[1])
-        self.assertEqual(read_acl, ret[2])
-        self.assertEqual(write_acl, ret[3])
+        self.assertEqual(partition, ret['partition'])
+        self.assertEqual(nodes, ret['nodes'])
+        self.assertEqual(read_acl, ret['read_acl'])
+        self.assertEqual(write_acl, ret['write_acl'])
 
     def test_container_info_invalid_account(self):
         def account_info(self, account, autocreate=False):
@@ -478,7 +552,7 @@ class TestController(unittest.TestCase):
         with save_globals():
             proxy_server.Controller.account_info = account_info
             ret = self.controller.container_info(self.account,
-                self.container)
+                                                 self.container)
             self.check_container_info_return(ret, True)
 
     # tests if 200 is cached and used
@@ -488,23 +562,22 @@ class TestController(unittest.TestCase):
 
         with save_globals():
             headers = {'x-container-read': self.read_acl,
-                'x-container-write': self.write_acl}
+                       'x-container-write': self.write_acl}
             proxy_server.Controller.account_info = account_info
-            proxy_server.http_connect = fake_http_connect(200,
-                headers=headers)
+            set_http_connect(200, headers=headers)
             ret = self.controller.container_info(self.account,
-                self.container)
+                                                 self.container)
             self.check_container_info_return(ret)
 
-            cache_key = proxy_server.get_container_memcache_key(self.account,
-                self.container)
+            cache_key = get_container_memcache_key(self.account,
+                                                   self.container)
             cache_value = self.memcache.get(cache_key)
             self.assertTrue(isinstance(cache_value, dict))
             self.assertEquals(200, cache_value.get('status'))
 
-            proxy_server.http_connect = fake_http_connect()
+            set_http_connect()
             ret = self.controller.container_info(self.account,
-                 self.container)
+                                                 self.container)
             self.check_container_info_return(ret)
 
     # tests if 404 is cached and used
@@ -514,28 +587,28 @@ class TestController(unittest.TestCase):
 
         with save_globals():
             proxy_server.Controller.account_info = account_info
-            proxy_server.http_connect = fake_http_connect(404, 404, 404)
+            set_http_connect(404, 404, 404)
             ret = self.controller.container_info(self.account,
-                self.container)
+                                                 self.container)
             self.check_container_info_return(ret, True)
 
-            cache_key = proxy_server.get_container_memcache_key(self.account,
-                self.container)
+            cache_key = get_container_memcache_key(self.account,
+                                                   self.container)
             cache_value = self.memcache.get(cache_key)
             self.assertTrue(isinstance(cache_value, dict))
             self.assertEquals(404, cache_value.get('status'))
 
-            proxy_server.http_connect = fake_http_connect()
+            set_http_connect()
             ret = self.controller.container_info(self.account,
-                 self.container)
+                                                 self.container)
             self.check_container_info_return(ret, True)
 
     # tests if some http status codes are not cached
     def test_container_info_no_cache(self):
         def test(*status_list):
-            proxy_server.http_connect = fake_http_connect(*status_list)
+            set_http_connect(*status_list)
             ret = self.controller.container_info(self.account,
-                self.container)
+                                                 self.container)
             self.assertEqual(len(self.memcache.keys()), 0)
             self.check_container_info_return(ret, True)
 
@@ -556,24 +629,28 @@ class TestProxyServer(unittest.TestCase):
                 raise Exception('this shouldnt be caught')
 
         app = MyApp(None, FakeMemcache(), account_ring=FakeRing(),
-                container_ring=FakeRing(), object_ring=FakeRing())
+                    container_ring=FakeRing(), object_ring=FakeRing())
         req = Request.blank('/account', environ={'REQUEST_METHOD': 'HEAD'})
         app.update_request(req)
         resp = app.handle_request(req)
         self.assertEquals(resp.status_int, 500)
 
     def test_internal_method_request(self):
-        baseapp = proxy_server.BaseApplication({},
-            FakeMemcache(), container_ring=FakeRing(), object_ring=FakeRing(),
-            account_ring=FakeRing())
+        baseapp = proxy_server.Application({},
+                                           FakeMemcache(),
+                                           container_ring=FakeRing(),
+                                           object_ring=FakeRing(),
+                                           account_ring=FakeRing())
         resp = baseapp.handle_request(
             Request.blank('/v1/a', environ={'REQUEST_METHOD': '__init__'}))
         self.assertEquals(resp.status, '405 Method Not Allowed')
 
     def test_inexistent_method_request(self):
-        baseapp = proxy_server.BaseApplication({},
-            FakeMemcache(), container_ring=FakeRing(), account_ring=FakeRing(),
-            object_ring=FakeRing())
+        baseapp = proxy_server.Application({},
+                                           FakeMemcache(),
+                                           container_ring=FakeRing(),
+                                           account_ring=FakeRing(),
+                                           object_ring=FakeRing())
         resp = baseapp.handle_request(
             Request.blank('/v1/a', environ={'REQUEST_METHOD': '!invalid'}))
         self.assertEquals(resp.status, '405 Method Not Allowed')
@@ -584,10 +661,11 @@ class TestProxyServer(unittest.TestCase):
         def authorize(req):
             called[0] = True
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200)
+            set_http_connect(200)
             app = proxy_server.Application(None, FakeMemcache(),
-                account_ring=FakeRing(), container_ring=FakeRing(),
-                object_ring=FakeRing())
+                                           account_ring=FakeRing(),
+                                           container_ring=FakeRing(),
+                                           object_ring=FakeRing())
             req = Request.blank('/v1/a')
             req.environ['swift.authorize'] = authorize
             app.update_request(req)
@@ -601,8 +679,9 @@ class TestProxyServer(unittest.TestCase):
             called[0] = True
             return HTTPUnauthorized(request=req)
         app = proxy_server.Application(None, FakeMemcache(),
-            account_ring=FakeRing(), container_ring=FakeRing(),
-            object_ring=FakeRing())
+                                       account_ring=FakeRing(),
+                                       container_ring=FakeRing(),
+                                       object_ring=FakeRing())
         req = Request.blank('/v1/a')
         req.environ['swift.authorize'] = authorize
         app.update_request(req)
@@ -612,9 +691,10 @@ class TestProxyServer(unittest.TestCase):
     def test_negative_content_length(self):
         swift_dir = mkdtemp()
         try:
-            baseapp = proxy_server.BaseApplication({'swift_dir': swift_dir},
-                FakeMemcache(), FakeLogger(), FakeRing(), FakeRing(),
-                FakeRing())
+            baseapp = proxy_server.Application({'swift_dir': swift_dir},
+                                               FakeMemcache(), FakeLogger(),
+                                               FakeRing(), FakeRing(),
+                                               FakeRing())
             resp = baseapp.handle_request(
                 Request.blank('/', environ={'CONTENT_LENGTH': '-1'}))
             self.assertEquals(resp.status, '400 Bad Request')
@@ -629,10 +709,12 @@ class TestProxyServer(unittest.TestCase):
     def test_denied_host_header(self):
         swift_dir = mkdtemp()
         try:
-            baseapp = proxy_server.BaseApplication({'swift_dir': swift_dir,
-                'deny_host_headers': 'invalid_host.com'},
-                FakeMemcache(), FakeLogger(), FakeRing(), FakeRing(),
-                FakeRing())
+            baseapp = proxy_server.Application({'swift_dir': swift_dir,
+                                                'deny_host_headers':
+                                                'invalid_host.com'},
+                                               FakeMemcache(), FakeLogger(),
+                                               FakeRing(), FakeRing(),
+                                               FakeRing())
             resp = baseapp.handle_request(
                 Request.blank('/v1/a/c/o',
                               environ={'HTTP_HOST': 'invalid_host.com'}))
@@ -640,16 +722,15 @@ class TestProxyServer(unittest.TestCase):
         finally:
             rmtree(swift_dir, ignore_errors=True)
 
+
 class TestObjectController(unittest.TestCase):
 
     def setUp(self):
         self.app = proxy_server.Application(None, FakeMemcache(),
-            account_ring=FakeRing(), container_ring=FakeRing(),
-            object_ring=FakeRing())
+                                            account_ring=FakeRing(),
+                                            container_ring=FakeRing(),
+                                            object_ring=FakeRing())
         monkey_patch_mimetools()
-
-    def tearDown(self):
-        proxy_server.CONTAINER_LISTING_LIMIT = _orig_container_listing_limit
 
     def assert_status_map(self, method, statuses, expected, raise_exc=False):
         with save_globals():
@@ -657,42 +738,135 @@ class TestObjectController(unittest.TestCase):
             if raise_exc:
                 kwargs['raise_exc'] = raise_exc
 
-            proxy_server.http_connect = fake_http_connect(*statuses, **kwargs)
+            set_http_connect(*statuses, **kwargs)
             self.app.memcache.store = {}
-            req = Request.blank('/a/c/o', headers={'Content-Length': '0',
-                    'Content-Type': 'text/plain'})
+            req = Request.blank('/a/c/o',
+                                headers={'Content-Length': '0',
+                                         'Content-Type': 'text/plain'})
             self.app.update_request(req)
             res = method(req)
             self.assertEquals(res.status_int, expected)
 
             # repeat test
-            proxy_server.http_connect = fake_http_connect(*statuses, **kwargs)
+            set_http_connect(*statuses, **kwargs)
             self.app.memcache.store = {}
-            req = Request.blank('/a/c/o', headers={'Content-Length': '0',
-                    'Content-Type': 'text/plain'})
+            req = Request.blank('/a/c/o',
+                                headers={'Content-Length': '0',
+                                         'Content-Type': 'text/plain'})
             self.app.update_request(req)
             res = method(req)
             self.assertEquals(res.status_int, expected)
 
+    def test_GET_newest_large_file(self):
+        calls = [0]
+
+        def handler(_junk1, _junk2):
+            calls[0] += 1
+
+        old_handler = signal.signal(signal.SIGPIPE, handler)
+        try:
+            prolis = _test_sockets[0]
+            prosrv = _test_servers[0]
+            sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+            fd = sock.makefile()
+            obj = 'a' * (1024 * 1024)
+            path = '/v1/a/c/o.large'
+            fd.write('PUT %s HTTP/1.1\r\n'
+                     'Host: localhost\r\n'
+                     'Connection: close\r\n'
+                     'X-Storage-Token: t\r\n'
+                     'Content-Length: %s\r\n'
+                     'Content-Type: application/octet-stream\r\n'
+                     '\r\n%s' % (path, str(len(obj)),  obj))
+            fd.flush()
+            headers = readuntil2crlfs(fd)
+            exp = 'HTTP/1.1 201'
+            self.assertEqual(headers[:len(exp)], exp)
+            req = Request.blank(path,
+                                environ={'REQUEST_METHOD': 'GET'},
+                                headers={'Content-Type':
+                                         'application/octet-stream',
+                                         'X-Newest': 'true'})
+            res = req.get_response(prosrv)
+            self.assertEqual(res.status_int, 200)
+            self.assertEqual(res.body, obj)
+            self.assertEqual(calls[0], 0)
+        finally:
+            signal.signal(signal.SIGPIPE, old_handler)
+
+    def test_PUT_expect_header_zero_content_length(self):
+        test_errors = []
+
+        def test_connect(ipaddr, port, device, partition, method, path,
+                         headers=None, query_string=None):
+            if path == '/a/c/o.jpg':
+                if 'expect' in headers or 'Expect' in headers:
+                    test_errors.append('Expect was in headers for object '
+                                       'server!')
+
+        with save_globals():
+            controller = proxy_server.ObjectController(self.app, 'account',
+                                                       'container', 'object')
+            # The (201, -4) tuples in there have the effect of letting the
+            # initial connect succeed, after which getexpect() gets called and
+            # then the -4 makes the response of that actually be 201 instead of
+            # 100.  Perfectly straightforward.
+            set_http_connect(200, 200, (201, -4), (201, -4), (201, -4),
+                             give_connect=test_connect)
+            req = Request.blank('/a/c/o.jpg', {})
+            req.content_length = 0
+            self.app.update_request(req)
+            self.app.memcache.store = {}
+            res = controller.PUT(req)
+            self.assertEqual(test_errors, [])
+            self.assertTrue(res.status.startswith('201 '), res.status)
+
+    def test_PUT_expect_header_nonzero_content_length(self):
+        test_errors = []
+
+        def test_connect(ipaddr, port, device, partition, method, path,
+                         headers=None, query_string=None):
+            if path == '/a/c/o.jpg':
+                if 'Expect' not in headers:
+                    test_errors.append('Expect was not in headers for '
+                                       'non-zero byte PUT!')
+
+        with save_globals():
+            controller = \
+                proxy_server.ObjectController(self.app, 'a', 'c', 'o.jpg')
+            set_http_connect(200, 200, 201, 201, 201,
+                             give_connect=test_connect)
+            req = Request.blank('/a/c/o.jpg', {})
+            req.content_length = 1
+            req.body = 'a'
+            self.app.update_request(req)
+            self.app.memcache.store = {}
+            res = controller.PUT(req)
+            self.assertTrue(res.status.startswith('201 '))
+
     def test_PUT_auto_content_type(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_content_type(filename, expected):
-                # The three responses here are for account_info() (HEAD to account server),
-                # container_info() (HEAD to container server) and three calls to
-                # _connect_put_node() (PUT to three object servers)
-                proxy_server.http_connect = fake_http_connect(201, 201, 201, 201, 201,
-                    give_content_type=lambda content_type:
-                        self.assertEquals(content_type, expected.next()))
+                # The three responses here are for account_info() (HEAD to
+                # account server), container_info() (HEAD to container server)
+                # and three calls to _connect_put_node() (PUT to three object
+                # servers)
+                set_http_connect(201, 201, 201, 201, 201,
+                                 give_content_type=lambda content_type:
+                                 self.assertEquals(content_type,
+                                                   expected.next()))
                 # We need into include a transfer-encoding to get past
                 # constraints.check_object_creation()
-                req = Request.blank('/a/c/%s' % filename, {}, headers={'transfer-encoding': 'chunked'})
+                req = Request.blank('/a/c/%s' % filename, {},
+                                    headers={'transfer-encoding': 'chunked'})
                 self.app.update_request(req)
                 self.app.memcache.store = {}
                 res = controller.PUT(req)
-                # If we don't check the response here we could miss problems in PUT()
+                # If we don't check the response here we could miss problems
+                # in PUT()
                 self.assertEquals(res.status_int, 201)
 
             test_content_type('test.jpg', iter(['', '', 'image/jpeg',
@@ -707,9 +881,10 @@ class TestObjectController(unittest.TestCase):
         try:
             with open(os.path.join(swift_dir, 'mime.types'), 'w') as fp:
                 fp.write('foo/bar foo\n')
-            ba = proxy_server.BaseApplication({'swift_dir': swift_dir},
-                FakeMemcache(), FakeLogger(), FakeRing(), FakeRing(),
-                FakeRing())
+            ba = proxy_server.Application({'swift_dir': swift_dir},
+                                          FakeMemcache(), FakeLogger(),
+                                          FakeRing(), FakeRing(),
+                                          FakeRing())
             self.assertEquals(proxy_server.mimetypes.guess_type('blah.foo')[0],
                               'foo/bar')
             self.assertEquals(proxy_server.mimetypes.guess_type('blah.jpg')[0],
@@ -720,10 +895,10 @@ class TestObjectController(unittest.TestCase):
     def test_PUT(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_status_map(statuses, expected):
-                proxy_server.http_connect = fake_http_connect(*statuses)
+                set_http_connect(*statuses)
                 req = Request.blank('/a/c/o.jpg', {})
                 req.content_length = 0
                 self.app.update_request(req)
@@ -739,10 +914,10 @@ class TestObjectController(unittest.TestCase):
     def test_PUT_connect_exceptions(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_status_map(statuses, expected):
-                proxy_server.http_connect = fake_http_connect(*statuses)
+                set_http_connect(*statuses)
                 self.app.memcache.store = {}
                 req = Request.blank('/a/c/o.jpg', {})
                 req.content_length = 0
@@ -759,13 +934,14 @@ class TestObjectController(unittest.TestCase):
     def test_PUT_send_exceptions(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_status_map(statuses, expected):
                 self.app.memcache.store = {}
-                proxy_server.http_connect = fake_http_connect(*statuses)
+                set_http_connect(*statuses)
                 req = Request.blank('/a/c/o.jpg',
-                    environ={'REQUEST_METHOD': 'PUT'}, body='some data')
+                                    environ={'REQUEST_METHOD': 'PUT'},
+                                    body='some data')
                 self.app.update_request(req)
                 res = controller.PUT(req)
                 expected = str(expected)
@@ -776,9 +952,9 @@ class TestObjectController(unittest.TestCase):
 
     def test_PUT_max_size(self):
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
             req = Request.blank('/a/c/o', {}, headers={
                 'Content-Length': str(MAX_FILE_SIZE + 1),
                 'Content-Type': 'foo/bar'})
@@ -790,11 +966,11 @@ class TestObjectController(unittest.TestCase):
 
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_status_map(statuses, expected):
                 self.app.memcache.store = {}
-                proxy_server.http_connect = fake_http_connect(*statuses)
+                set_http_connect(*statuses)
                 req = Request.blank('/a/c/o.jpg', {})
                 req.content_length = 0
                 self.app.update_request(req)
@@ -810,13 +986,13 @@ class TestObjectController(unittest.TestCase):
         with save_globals():
             self.app.object_post_as_copy = False
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_status_map(statuses, expected):
-                proxy_server.http_connect = fake_http_connect(*statuses)
+                set_http_connect(*statuses)
                 self.app.memcache.store = {}
-                req = Request.blank('/a/c/o', {}, headers={
-                                                'Content-Type': 'foo/bar'})
+                req = Request.blank('/a/c/o', {},
+                                    headers={'Content-Type': 'foo/bar'})
                 self.app.update_request(req)
                 res = controller.POST(req)
                 expected = str(expected)
@@ -829,16 +1005,57 @@ class TestObjectController(unittest.TestCase):
             test_status_map((200, 200, 404, 500, 500), 503)
             test_status_map((200, 200, 404, 404, 404), 404)
 
-    def test_POST_as_copy(self):
+    def test_POST_append(self):
         with save_globals():
+            self.app.object_post_as_copy = False
             controller = proxy_server.ObjectController(self.app, 'account',
                 'container', 'object')
 
             def test_status_map(statuses, expected):
-                proxy_server.http_connect = fake_http_connect(*statuses)
+                set_http_connect(*statuses)
                 self.app.memcache.store = {}
-                req = Request.blank('/a/c/o', {}, headers={
-                                                'Content-Type': 'foo/bar'})
+                req = Request.blank('/a/c/o', {},
+                    headers={'Content-Type': 'foo/bar',
+                             'Content-Length': '4',
+                             'X-Append-To': '-1'})
+                req.body = 'TEST'
+                self.app.update_request(req)
+                res = controller.POST(req)
+                expected = str(expected)
+                self.assertEquals(res.status[:len(expected)], expected)
+            test_status_map((200, 200, 202, 202, 202), 202)
+            test_status_map((200, 200, 202, 202, 500), 202)
+            test_status_map((200, 200, 202, 500, 500), 503)
+            test_status_map((200, 200, 202, 404, 500), 503)
+            test_status_map((200, 200, 202, 404, 404), 404)
+            test_status_map((200, 200, 404, 500, 500), 503)
+            test_status_map((200, 200, 404, 404, 404), 404)
+
+    def test_POST_append_invalid_revision(self):
+        with save_globals():
+            self.app.object_post_as_copy = False
+            controller = proxy_server.ObjectController(self.app, 'account',
+                'container', 'object')
+            req = Request.blank('/a/c/o', {},
+                headers={'Content-Type': 'foo/bar',
+                         'Content-Length': '4',
+                         'X-Append-To': 'new'})
+            req.body = 'TEST'
+            self.app.update_request(req)
+            res = controller.POST(req)
+            self.assertEqual(res.status_int, 400)
+            self.assertEqual(res.body, 'Non-integer X-Append-To')
+
+    def test_POST_as_copy(self):
+        with save_globals():
+            controller = proxy_server.ObjectController(self.app, 'account',
+                                                       'container', 'object')
+
+            def test_status_map(statuses, expected):
+                set_http_connect(*statuses)
+                self.app.memcache.store = {}
+                req = Request.blank('/a/c/o', {},
+                                    headers={'Content-Type': 'foo/bar'})
                 self.app.update_request(req)
                 res = controller.POST(req)
                 expected = str(expected)
@@ -854,10 +1071,10 @@ class TestObjectController(unittest.TestCase):
     def test_DELETE(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_status_map(statuses, expected):
-                proxy_server.http_connect = fake_http_connect(*statuses)
+                set_http_connect(*statuses)
                 self.app.memcache.store = {}
                 req = Request.blank('/a/c/o', {})
                 self.app.update_request(req)
@@ -874,10 +1091,10 @@ class TestObjectController(unittest.TestCase):
     def test_HEAD(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_status_map(statuses, expected):
-                proxy_server.http_connect = fake_http_connect(*statuses)
+                set_http_connect(*statuses)
                 self.app.memcache.store = {}
                 req = Request.blank('/a/c/o', {})
                 self.app.update_request(req)
@@ -900,12 +1117,11 @@ class TestObjectController(unittest.TestCase):
     def test_HEAD_newest(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_status_map(statuses, expected, timestamps,
                                 expected_timestamp):
-                proxy_server.http_connect = \
-                    fake_http_connect(*statuses, timestamps=timestamps)
+                set_http_connect(*statuses, timestamps=timestamps)
                 self.app.memcache.store = {}
                 req = Request.blank('/a/c/o', {}, headers={'x-newest': 'true'})
                 self.app.update_request(req)
@@ -916,22 +1132,27 @@ class TestObjectController(unittest.TestCase):
                                   expected_timestamp)
 
             #                acct cont obj  obj  obj
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1', '2', '3'), '3')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1', '3', '2'), '3')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1', '3', '1'), '3')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '3', '3', '1'), '3')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None, None, None), None)
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None, None, '1'), '1')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '2', '3'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '2'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '1'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '3',
+                                                             '3', '1'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None,
+                                                             None, None), None)
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None,
+                                                             None, '1'), '1')
 
     def test_GET_newest(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_status_map(statuses, expected, timestamps,
                                 expected_timestamp):
-                proxy_server.http_connect = \
-                    fake_http_connect(*statuses, timestamps=timestamps)
+                set_http_connect(*statuses, timestamps=timestamps)
                 self.app.memcache.store = {}
                 req = Request.blank('/a/c/o', {}, headers={'x-newest': 'true'})
                 self.app.update_request(req)
@@ -941,21 +1162,26 @@ class TestObjectController(unittest.TestCase):
                 self.assertEquals(res.headers.get('last-modified'),
                                   expected_timestamp)
 
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1', '2', '3'), '3')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1', '3', '2'), '3')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1', '3', '1'), '3')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '3', '3', '1'), '3')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None, None, None), None)
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None, None, '1'), '1')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '2', '3'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '2'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '1'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '3',
+                                                             '3', '1'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None,
+                                                             None, None), None)
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None,
+                                                             None, '1'), '1')
 
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
 
             def test_status_map(statuses, expected, timestamps,
                                 expected_timestamp):
-                proxy_server.http_connect = \
-                    fake_http_connect(*statuses, timestamps=timestamps)
+                set_http_connect(*statuses, timestamps=timestamps)
                 self.app.memcache.store = {}
                 req = Request.blank('/a/c/o', {})
                 self.app.update_request(req)
@@ -965,132 +1191,125 @@ class TestObjectController(unittest.TestCase):
                 self.assertEquals(res.headers.get('last-modified'),
                                   expected_timestamp)
 
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1', '2', '3'), '1')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1', '3', '2'), '1')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1', '3', '1'), '1')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '3', '3', '1'), '3')
-            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None, '1', '2'), None)
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '2', '3'), '1')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '2'), '1')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '1',
+                                                             '3', '1'), '1')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', '3',
+                                                             '3', '1'), '3')
+            test_status_map((200, 200, 200, 200, 200), 200, ('0', '0', None,
+                                                             '1', '2'), None)
 
-    def test_GET_newest_large_file(self):
-        prolis = _test_sockets[0]
-        prosrv = _test_servers[0]
-        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-        fd = sock.makefile()
-        obj = 'a' * (1024 * 1024)
-        path = '/v1/a/c/o.large'
-        fd.write('PUT %s HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'Connection: close\r\n'
-                 'X-Storage-Token: t\r\n'
-                 'Content-Length: %s\r\n'
-                 'Content-Type: application/octet-stream\r\n'
-                 '\r\n%s' % (path, str(len(obj)),  obj))
-        fd.flush()
-        headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
-        self.assertEqual(headers[:len(exp)], exp)
-        req = Request.blank(path,
-            environ={'REQUEST_METHOD': 'GET'},
-            headers={'Content-Type': 'application/octet-stream',
-                     'X-Newest': 'true'})
-        res = req.get_response(prosrv)
-        self.assertEqual(res.status_int, 200)
-        self.assertEqual(len(res.body), len(obj))
+    def test_GET_invalid_revision(self):
+        with save_globals():
+            controller = proxy_server.ObjectController(self.app, 'account',
+                'container', 'object')
+
+            req = Request.blank('/a/c/o', {}, headers={
+                'Content-Type': 'foo/bar',
+                'X-Revision': 'new'})
+            self.app.update_request(req)
+            res = controller.GET(req)
+            self.assertEqual(res.status_int, 400)
+            self.assertEqual(res.body, 'Non-integer X-Revision')
 
     def test_POST_meta_val_len(self):
         with save_globals():
+            limit = MAX_META_VALUE_LENGTH
             self.app.object_post_as_copy = False
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 202, 202, 202)
-                #                 acct cont obj  obj  obj
+                                                       'container', 'object')
+            set_http_connect(200, 200, 202, 202, 202)
+            #                acct cont obj  obj  obj
             req = Request.blank('/a/c/o', {}, headers={
-                                            'Content-Type': 'foo/bar',
-                                            'X-Object-Meta-Foo': 'x' * 256})
+                                'Content-Type': 'foo/bar',
+                                'X-Object-Meta-Foo': 'x' * limit})
             self.app.update_request(req)
             res = controller.POST(req)
             self.assertEquals(res.status_int, 202)
-            proxy_server.http_connect = fake_http_connect(202, 202, 202)
+            set_http_connect(202, 202, 202)
             req = Request.blank('/a/c/o', {}, headers={
-                                            'Content-Type': 'foo/bar',
-                                            'X-Object-Meta-Foo': 'x' * 257})
+                                'Content-Type': 'foo/bar',
+                                'X-Object-Meta-Foo': 'x' * (limit + 1)})
             self.app.update_request(req)
             res = controller.POST(req)
             self.assertEquals(res.status_int, 400)
 
     def test_POST_as_copy_meta_val_len(self):
         with save_globals():
+            limit = MAX_META_VALUE_LENGTH
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 202, 202, 202)
-                #                 acct cont objc objc objc obj  obj  obj
+                                                       'container', 'object')
+            set_http_connect(200, 200, 200, 200, 200, 202, 202, 202)
+            #                acct cont objc objc objc obj  obj  obj
             req = Request.blank('/a/c/o', {}, headers={
-                                            'Content-Type': 'foo/bar',
-                                            'X-Object-Meta-Foo': 'x' * 256})
+                                'Content-Type': 'foo/bar',
+                                'X-Object-Meta-Foo': 'x' * limit})
             self.app.update_request(req)
             res = controller.POST(req)
             self.assertEquals(res.status_int, 202)
-            proxy_server.http_connect = fake_http_connect(202, 202, 202)
+            set_http_connect(202, 202, 202)
             req = Request.blank('/a/c/o', {}, headers={
-                                            'Content-Type': 'foo/bar',
-                                            'X-Object-Meta-Foo': 'x' * 257})
+                                'Content-Type': 'foo/bar',
+                                'X-Object-Meta-Foo': 'x' * (limit + 1)})
             self.app.update_request(req)
             res = controller.POST(req)
             self.assertEquals(res.status_int, 400)
 
     def test_POST_meta_key_len(self):
         with save_globals():
+            limit = MAX_META_NAME_LENGTH
             self.app.object_post_as_copy = False
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 202, 202, 202)
-                #                 acct cont obj  obj  obj
+                                                       'container', 'object')
+            set_http_connect(200, 200, 202, 202, 202)
+            #                acct cont obj  obj  obj
             req = Request.blank('/a/c/o', {}, headers={
                 'Content-Type': 'foo/bar',
-                ('X-Object-Meta-' + 'x' * 128): 'x'})
+                ('X-Object-Meta-' + 'x' * limit): 'x'})
             self.app.update_request(req)
             res = controller.POST(req)
             self.assertEquals(res.status_int, 202)
-            proxy_server.http_connect = fake_http_connect(202, 202, 202)
+            set_http_connect(202, 202, 202)
             req = Request.blank('/a/c/o', {}, headers={
                 'Content-Type': 'foo/bar',
-                ('X-Object-Meta-' + 'x' * 129): 'x'})
+                ('X-Object-Meta-' + 'x' * (limit + 1)): 'x'})
             self.app.update_request(req)
             res = controller.POST(req)
             self.assertEquals(res.status_int, 400)
 
     def test_POST_as_copy_meta_key_len(self):
         with save_globals():
+            limit = MAX_META_NAME_LENGTH
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 202, 202, 202)
-                #                 acct cont objc objc objc obj  obj  obj
+                                                       'container', 'object')
+            set_http_connect(200, 200, 200, 200, 200, 202, 202, 202)
+            #                acct cont objc objc objc obj  obj  obj
             req = Request.blank('/a/c/o', {}, headers={
                 'Content-Type': 'foo/bar',
-                ('X-Object-Meta-' + 'x' * 128): 'x'})
+                ('X-Object-Meta-' + 'x' * limit): 'x'})
             self.app.update_request(req)
             res = controller.POST(req)
             self.assertEquals(res.status_int, 202)
-            proxy_server.http_connect = fake_http_connect(202, 202, 202)
+            set_http_connect(202, 202, 202)
             req = Request.blank('/a/c/o', {}, headers={
                 'Content-Type': 'foo/bar',
-                ('X-Object-Meta-' + 'x' * 129): 'x'})
+                ('X-Object-Meta-' + 'x' * (limit + 1)): 'x'})
             self.app.update_request(req)
             res = controller.POST(req)
             self.assertEquals(res.status_int, 400)
 
     def test_POST_meta_count(self):
         with save_globals():
+            limit = MAX_META_COUNT
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
             headers = dict(
-                (('X-Object-Meta-' + str(i), 'a') for i in xrange(91)))
+                (('X-Object-Meta-' + str(i), 'a') for i in xrange(limit + 1)))
             headers.update({'Content-Type': 'foo/bar'})
-            proxy_server.http_connect = fake_http_connect(202, 202, 202)
+            set_http_connect(202, 202, 202)
             req = Request.blank('/a/c/o', {}, headers=headers)
             self.app.update_request(req)
             res = controller.POST(req)
@@ -1098,12 +1317,15 @@ class TestObjectController(unittest.TestCase):
 
     def test_POST_meta_size(self):
         with save_globals():
+            limit = MAX_META_OVERALL_SIZE
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
+            count = limit / 256  # enough to cause the limit to be reched
             headers = dict(
-                (('X-Object-Meta-' + str(i), 'a' * 256) for i in xrange(1000)))
+                (('X-Object-Meta-' + str(i), 'a' * 256)
+                    for i in xrange(count + 1)))
             headers.update({'Content-Type': 'foo/bar'})
-            proxy_server.http_connect = fake_http_connect(202, 202, 202)
+            set_http_connect(202, 202, 202)
             req = Request.blank('/a/c/o', {}, headers=headers)
             self.app.update_request(req)
             res = controller.POST(req)
@@ -1137,24 +1359,26 @@ class TestObjectController(unittest.TestCase):
                     return ''
 
             req = Request.blank('/a/c/o',
-                environ={'REQUEST_METHOD': 'PUT', 'wsgi.input': SlowBody()},
-                headers={'Content-Length': '4', 'Content-Type': 'text/plain'})
+                                environ={'REQUEST_METHOD': 'PUT',
+                                         'wsgi.input': SlowBody()},
+                                headers={'Content-Length': '4',
+                                         'Content-Type': 'text/plain'})
             self.app.update_request(req)
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
-                #                 acct cont obj  obj  obj
+            set_http_connect(200, 200, 201, 201, 201)
+            #                acct cont obj  obj  obj
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
             self.app.client_timeout = 0.1
             req = Request.blank('/a/c/o',
-                environ={'REQUEST_METHOD': 'PUT', 'wsgi.input': SlowBody()},
-                headers={'Content-Length': '4', 'Content-Type': 'text/plain'})
+                                environ={'REQUEST_METHOD': 'PUT',
+                                         'wsgi.input': SlowBody()},
+                                headers={'Content-Length': '4',
+                                         'Content-Type': 'text/plain'})
             self.app.update_request(req)
-            proxy_server.http_connect = \
-                fake_http_connect(201, 201, 201)
-                #                 obj  obj  obj
+            set_http_connect(201, 201, 201)
+            #                obj  obj  obj
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 408)
 
@@ -1182,14 +1406,15 @@ class TestObjectController(unittest.TestCase):
                     raise Exception('Disconnected')
 
             req = Request.blank('/a/c/o',
-                environ={'REQUEST_METHOD': 'PUT', 'wsgi.input': SlowBody()},
-                headers={'Content-Length': '4', 'Content-Type': 'text/plain'})
+                                environ={'REQUEST_METHOD': 'PUT',
+                                         'wsgi.input': SlowBody()},
+                                headers={'Content-Length': '4',
+                                         'Content-Type': 'text/plain'})
             self.app.update_request(req)
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
-                #                 acct cont obj  obj  obj
+            set_http_connect(200, 200, 201, 201, 201)
+            #                acct cont obj  obj  obj
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 499)
 
@@ -1211,24 +1436,22 @@ class TestObjectController(unittest.TestCase):
             self.app.update_request(req)
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, slow=True)
+            set_http_connect(200, 200, 200, slow=True)
             req.sent_size = 0
             resp = controller.GET(req)
             got_exc = False
             try:
                 resp.body
-            except proxy_server.ChunkReadTimeout:
+            except ChunkReadTimeout:
                 got_exc = True
             self.assert_(not got_exc)
             self.app.node_timeout = 0.1
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, slow=True)
+            set_http_connect(200, 200, 200, slow=True)
             resp = controller.GET(req)
             got_exc = False
             try:
                 resp.body
-            except proxy_server.ChunkReadTimeout:
+            except ChunkReadTimeout:
                 got_exc = True
             self.assert_(got_exc)
 
@@ -1247,23 +1470,23 @@ class TestObjectController(unittest.TestCase):
                 dev['ip'] = '127.0.0.1'
                 dev['port'] = 1
             req = Request.blank('/a/c/o',
-                environ={'REQUEST_METHOD': 'PUT'},
-                headers={'Content-Length': '4', 'Content-Type': 'text/plain'},
-                body='    ')
+                                environ={'REQUEST_METHOD': 'PUT'},
+                                headers={'Content-Length': '4',
+                                         'Content-Type': 'text/plain'},
+                                body='    ')
             self.app.update_request(req)
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201, slow=True)
+            set_http_connect(200, 200, 201, 201, 201, slow=True)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
             self.app.node_timeout = 0.1
-            proxy_server.http_connect = \
-                fake_http_connect(201, 201, 201, slow=True)
+            set_http_connect(201, 201, 201, slow=True)
             req = Request.blank('/a/c/o',
-                environ={'REQUEST_METHOD': 'PUT'},
-                headers={'Content-Length': '4', 'Content-Type': 'text/plain'},
-                body='    ')
+                                environ={'REQUEST_METHOD': 'PUT'},
+                                headers={'Content-Length': '4',
+                                         'Content-Type': 'text/plain'},
+                                body='    ')
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 503)
@@ -1273,9 +1496,11 @@ class TestObjectController(unittest.TestCase):
             try:
                 self.app.object_ring.max_more_nodes = 2
                 controller = proxy_server.ObjectController(self.app, 'account',
-                                'container', 'object')
+                                                           'container',
+                                                           'object')
                 partition, nodes = self.app.object_ring.get_nodes('account',
-                                    'container', 'object')
+                                                                  'container',
+                                                                  'object')
                 collected_nodes = []
                 for node in controller.iter_nodes(partition, nodes,
                                                   self.app.object_ring):
@@ -1284,9 +1509,11 @@ class TestObjectController(unittest.TestCase):
 
                 self.app.object_ring.max_more_nodes = 20
                 controller = proxy_server.ObjectController(self.app, 'account',
-                                'container', 'object')
+                                                           'container',
+                                                           'object')
                 partition, nodes = self.app.object_ring.get_nodes('account',
-                                    'container', 'object')
+                                                                  'container',
+                                                                  'object')
                 collected_nodes = []
                 for node in controller.iter_nodes(partition, nodes,
                                                   self.app.object_ring):
@@ -1297,9 +1524,11 @@ class TestObjectController(unittest.TestCase):
                 self.app.logger = FakeLogger()
                 self.app.object_ring.max_more_nodes = 2
                 controller = proxy_server.ObjectController(self.app, 'account',
-                                'container', 'object')
+                                                           'container',
+                                                           'object')
                 partition, nodes = self.app.object_ring.get_nodes('account',
-                                    'container', 'object')
+                                                                  'container',
+                                                                  'object')
                 collected_nodes = []
                 for node in controller.iter_nodes(partition, nodes,
                                                   self.app.object_ring):
@@ -1314,9 +1543,11 @@ class TestObjectController(unittest.TestCase):
                 self.app.logger = FakeLogger()
                 self.app.object_ring.max_more_nodes = 2
                 controller = proxy_server.ObjectController(self.app, 'account',
-                                'container', 'object')
+                                                           'container',
+                                                           'object')
                 partition, nodes = self.app.object_ring.get_nodes('account',
-                                    'container', 'object')
+                                                                  'container',
+                                                                  'object')
                 collected_nodes = []
                 for node in controller.iter_nodes(partition, nodes,
                                                   self.app.object_ring):
@@ -1334,7 +1565,9 @@ class TestObjectController(unittest.TestCase):
                                         'Object')
         self.assertEquals(resp.etag, None)
         resp = controller.best_response(req, [200] * 3, ['OK'] * 3, [''] * 3,
-            'Object', etag='68b329da9893e34099c7d8ad5cb9c940')
+                                        'Object',
+                                        etag='68b329da9893e34099c7d8ad5cb9c940'
+                                        )
         self.assertEquals(resp.etag, '68b329da9893e34099c7d8ad5cb9c940')
 
     def test_proxy_passes_content_type(self):
@@ -1343,16 +1576,15 @@ class TestObjectController(unittest.TestCase):
             self.app.update_request(req)
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            proxy_server.http_connect = fake_http_connect(200, 200, 200)
+            set_http_connect(200, 200, 200)
             resp = controller.GET(req)
             self.assertEquals(resp.status_int, 200)
             self.assertEquals(resp.content_type, 'x-application/test')
-            proxy_server.http_connect = fake_http_connect(200, 200, 200)
+            set_http_connect(200, 200, 200)
             resp = controller.GET(req)
             self.assertEquals(resp.status_int, 200)
             self.assertEquals(resp.content_length, 0)
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, slow=True)
+            set_http_connect(200, 200, 200, slow=True)
             resp = controller.GET(req)
             self.assertEquals(resp.status_int, 200)
             self.assertEquals(resp.content_length, 4)
@@ -1363,40 +1595,46 @@ class TestObjectController(unittest.TestCase):
             self.app.update_request(req)
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            proxy_server.http_connect = fake_http_connect(200, 200, 200)
+            set_http_connect(200, 200, 200)
             resp = controller.HEAD(req)
             self.assertEquals(resp.status_int, 200)
             self.assertEquals(resp.content_length, 0)
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, slow=True)
+            set_http_connect(200, 200, 200, slow=True)
             resp = controller.HEAD(req)
             self.assertEquals(resp.status_int, 200)
             self.assertEquals(resp.content_length, 4)
 
     def test_error_limiting(self):
         with save_globals():
-            proxy_server.shuffle = lambda l: None
+            set_shuffle()
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            self.assert_status_map(controller.HEAD, (200, 200, 503, 200, 200), 200)
+            self.assert_status_map(controller.HEAD, (200, 200, 503, 200, 200),
+                                   200)
             self.assertEquals(controller.app.object_ring.devs[0]['errors'], 2)
             self.assert_('last_error' in controller.app.object_ring.devs[0])
             for _junk in xrange(self.app.error_suppression_limit):
-                self.assert_status_map(controller.HEAD, (200, 200, 503, 503, 503), 503)
+                self.assert_status_map(controller.HEAD, (200, 200, 503, 503,
+                                                         503), 503)
             self.assertEquals(controller.app.object_ring.devs[0]['errors'],
                               self.app.error_suppression_limit + 1)
-            self.assert_status_map(controller.HEAD, (200, 200, 200, 200, 200), 503)
+            self.assert_status_map(controller.HEAD, (200, 200, 200, 200, 200),
+                                   503)
             self.assert_('last_error' in controller.app.object_ring.devs[0])
-            self.assert_status_map(controller.PUT, (200, 200, 200, 201, 201, 201), 503)
+            self.assert_status_map(controller.PUT, (200, 200, 200, 201, 201,
+                                                    201), 503)
             self.assert_status_map(controller.POST,
-                                   (200, 200, 200, 200, 200, 200, 202, 202, 202), 503)
+                                   (200, 200, 200, 200, 200, 200, 202, 202,
+                                    202), 503)
             self.assert_status_map(controller.DELETE,
                                    (200, 200, 200, 204, 204, 204), 503)
             self.app.error_suppression_interval = -300
-            self.assert_status_map(controller.HEAD, (200, 200, 200, 200, 200), 200)
+            self.assert_status_map(controller.HEAD, (200, 200, 200, 200, 200),
+                                   200)
             self.assertRaises(BaseException,
-                self.assert_status_map, controller.DELETE,
-                (200, 200, 200, 204, 204, 204), 503, raise_exc=True)
+                              self.assert_status_map, controller.DELETE,
+                              (200, 200, 200, 204, 204, 204), 503,
+                              raise_exc=True)
 
     def test_acc_or_con_missing_returns_404(self):
         with save_globals():
@@ -1408,63 +1646,54 @@ class TestObjectController(unittest.TestCase):
                 del dev['errors']
                 del dev['last_error']
             controller = proxy_server.ObjectController(self.app, 'account',
-                                                     'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200)
+                                                       'container', 'object')
+            set_http_connect(200, 200, 200, 200, 200, 200)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'DELETE'})
             self.app.update_request(req)
             resp = getattr(controller, 'DELETE')(req)
             self.assertEquals(resp.status_int, 200)
 
-            proxy_server.http_connect = \
-                fake_http_connect(404, 404, 404)
-                #                 acct acct acct
+            set_http_connect(404, 404, 404)
+            #                acct acct acct
             resp = getattr(controller, 'DELETE')(req)
             self.assertEquals(resp.status_int, 404)
 
-            proxy_server.http_connect = \
-                fake_http_connect(503, 404, 404)
-                #                 acct acct acct
+            set_http_connect(503, 404, 404)
+            #                acct acct acct
             resp = getattr(controller, 'DELETE')(req)
             self.assertEquals(resp.status_int, 404)
 
-            proxy_server.http_connect = \
-                fake_http_connect(503, 503, 404)
-                #                 acct acct acct
+            set_http_connect(503, 503, 404)
+            #                acct acct acct
             resp = getattr(controller, 'DELETE')(req)
             self.assertEquals(resp.status_int, 404)
 
-            proxy_server.http_connect = \
-                fake_http_connect(503, 503, 503)
-                #                 acct acct acct
+            set_http_connect(503, 503, 503)
+            #                acct acct acct
             resp = getattr(controller, 'DELETE')(req)
             self.assertEquals(resp.status_int, 404)
 
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 204, 204, 204)
-                #                 acct cont obj  obj  obj
+            set_http_connect(200, 200, 204, 204, 204)
+            #                acct cont obj  obj  obj
             resp = getattr(controller, 'DELETE')(req)
             self.assertEquals(resp.status_int, 204)
 
-            proxy_server.http_connect = \
-                fake_http_connect(200, 404, 404, 404)
-                #                 acct cont cont cont
+            set_http_connect(200, 404, 404, 404)
+            #                acct cont cont cont
             resp = getattr(controller, 'DELETE')(req)
             self.assertEquals(resp.status_int, 404)
 
-            proxy_server.http_connect = \
-                fake_http_connect(200, 503, 503, 503)
-                #                 acct cont cont cont
+            set_http_connect(200, 503, 503, 503)
+            #                acct cont cont cont
             resp = getattr(controller, 'DELETE')(req)
             self.assertEquals(resp.status_int, 404)
 
             for dev in self.app.account_ring.devs.values():
                 dev['errors'] = self.app.error_suppression_limit + 1
                 dev['last_error'] = time()
-            proxy_server.http_connect = \
-                fake_http_connect(200)
-                #                 acct [isn't actually called since everything
-                #                       is error limited]
+            set_http_connect(200)
+            #                acct [isn't actually called since everything
+            #                      is error limited]
             resp = getattr(controller, 'DELETE')(req)
             self.assertEquals(resp.status_int, 404)
 
@@ -1473,10 +1702,9 @@ class TestObjectController(unittest.TestCase):
             for dev in self.app.container_ring.devs.values():
                 dev['errors'] = self.app.error_suppression_limit + 1
                 dev['last_error'] = time()
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200)
-                #                 acct cont [isn't actually called since
-                #                            everything is error limited]
+            set_http_connect(200, 200)
+            #                acct cont [isn't actually called since
+            #                           everything is error limited]
             resp = getattr(controller, 'DELETE')(req)
             self.assertEquals(resp.status_int, 404)
 
@@ -1487,15 +1715,13 @@ class TestObjectController(unittest.TestCase):
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
 
-            proxy_server.http_connect = \
-                fake_http_connect(200, 404, 404, 404, 200, 200, 200)
+            set_http_connect(200, 404, 404, 404, 200, 200, 200)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 404)
 
-            proxy_server.http_connect = \
-                fake_http_connect(200, 404, 404, 404, 200, 200)
+            set_http_connect(200, 404, 404, 404, 200, 200)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'POST'},
                                 headers={'Content-Type': 'text/plain'})
             self.app.update_request(req)
@@ -1507,16 +1733,13 @@ class TestObjectController(unittest.TestCase):
             self.app.memcache = FakeMemcacheReturnsNone()
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 404, 404, 404, 200, 200, 200)
+            set_http_connect(200, 404, 404, 404, 200, 200, 200)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 404)
 
-            proxy_server.http_connect = \
-                fake_http_connect(200, 404, 404, 404, 200, 200, 200, 200, 200,
-                                  200)
+            set_http_connect(200, 404, 404, 404, 200, 200, 200, 200, 200, 200)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'POST'},
                                 headers={'Content-Type': 'text/plain'})
             self.app.update_request(req)
@@ -1527,50 +1750,49 @@ class TestObjectController(unittest.TestCase):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
-                #                 acct cont obj  obj  obj
+            set_http_connect(200, 200, 201, 201, 201)
+            #                acct cont obj  obj  obj
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0'})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                headers={'Content-Length': '0',
-                         'X-Object-Meta-' + ('a' *
-                            MAX_META_NAME_LENGTH): 'v'})
+                                headers={'Content-Length': '0',
+                                         'X-Object-Meta-' + ('a' *
+                                         MAX_META_NAME_LENGTH): 'v'})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                headers={'Content-Length': '0',
-                         'X-Object-Meta-' + ('a' *
-                            (MAX_META_NAME_LENGTH + 1)): 'v'})
+                                headers={'Content-Length': '0',
+                                         'X-Object-Meta-' + ('a' *
+                                         (MAX_META_NAME_LENGTH + 1)): 'v'})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 400)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                headers={'Content-Length': '0',
-                         'X-Object-Meta-Too-Long': 'a' *
-                            MAX_META_VALUE_LENGTH})
+                                headers={'Content-Length': '0',
+                                         'X-Object-Meta-Too-Long': 'a' *
+                                         MAX_META_VALUE_LENGTH})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
-                headers={'Content-Length': '0',
-                         'X-Object-Meta-Too-Long': 'a' *
-                            (MAX_META_VALUE_LENGTH + 1)})
+                                headers={'Content-Length': '0',
+                                         'X-Object-Meta-Too-Long': 'a' *
+                                         (MAX_META_VALUE_LENGTH + 1)})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 400)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers = {'Content-Length': '0'}
             for x in xrange(MAX_META_COUNT):
                 headers['X-Object-Meta-%d' % x] = 'v'
@@ -1579,7 +1801,7 @@ class TestObjectController(unittest.TestCase):
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers = {'Content-Length': '0'}
             for x in xrange(MAX_META_COUNT + 1):
                 headers['X-Object-Meta-%d' % x] = 'v'
@@ -1589,7 +1811,7 @@ class TestObjectController(unittest.TestCase):
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 400)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers = {'Content-Length': '0'}
             header_value = 'a' * MAX_META_VALUE_LENGTH
             size = 0
@@ -1607,7 +1829,7 @@ class TestObjectController(unittest.TestCase):
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers['X-Object-Meta-a'] = \
                 'a' * (MAX_META_OVERALL_SIZE - size)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -1624,22 +1846,18 @@ class TestObjectController(unittest.TestCase):
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0'})
             self.app.update_request(req)
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
-                #                 acct cont obj  obj  obj
+            set_http_connect(200, 200, 201, 201, 201)
+            #                acct cont obj  obj  obj
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
 
             # basic copy
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0',
-                                          'X-Copy-From': 'c/o'})
+                                         'X-Copy-From': 'c/o'})
             self.app.update_request(req)
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201,
-                    201)
-                #                 acct cont acct cont objc objc objc obj  obj
-                #   obj
+            set_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
@@ -1648,11 +1866,10 @@ class TestObjectController(unittest.TestCase):
             # non-zero content length
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '5',
-                                          'X-Copy-From': 'c/o'})
+                                         'X-Copy-From': 'c/o'})
             self.app.update_request(req)
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200, 200)
-                #                 acct cont acct cont objc objc objc
+            set_http_connect(200, 200, 200, 200, 200, 200, 200)
+            #                acct cont acct cont objc objc objc
             self.app.memcache.store = {}
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 400)
@@ -1660,13 +1877,10 @@ class TestObjectController(unittest.TestCase):
             # extra source path parsing
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0',
-                                          'X-Copy-From': 'c/o/o2'})
+                                         'X-Copy-From': 'c/o/o2'})
             req.account = 'a'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201,
-                    201)
-                #                 acct cont acct cont objc objc objc obj  obj
-                #   obj
+            set_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
@@ -1675,13 +1889,10 @@ class TestObjectController(unittest.TestCase):
             # space in soure path
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0',
-                                          'X-Copy-From': 'c/o%20o2'})
+                                         'X-Copy-From': 'c/o%20o2'})
             req.account = 'a'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201,
-                    201)
-                #                 acct cont acct cont objc objc objc obj  obj
-                #   obj
+            set_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
@@ -1690,13 +1901,10 @@ class TestObjectController(unittest.TestCase):
             # repeat tests with leading /
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0',
-                                          'X-Copy-From': '/c/o'})
+                                         'X-Copy-From': '/c/o'})
             self.app.update_request(req)
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201,
-                    201)
-                #                 acct cont acct cont objc objc objc obj  obj
-                #   obj
+            set_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
@@ -1704,13 +1912,10 @@ class TestObjectController(unittest.TestCase):
 
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0',
-                                          'X-Copy-From': '/c/o/o2'})
+                                         'X-Copy-From': '/c/o/o2'})
             req.account = 'a'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201,
-                    201)
-                #                 acct cont acct cont objc objc objc obj  obj
-                #   obj
+            set_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
@@ -1721,7 +1926,7 @@ class TestObjectController(unittest.TestCase):
             # invalid x-copy-from path
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0',
-                                          'X-Copy-From': '/c'})
+                                         'X-Copy-From': '/c'})
             self.app.update_request(req)
             self.app.memcache.store = {}
             resp = controller.PUT(req)
@@ -1730,11 +1935,10 @@ class TestObjectController(unittest.TestCase):
             # server error
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0',
-                                          'X-Copy-From': '/c/o'})
+                                         'X-Copy-From': '/c/o'})
             self.app.update_request(req)
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 503, 503, 503)
-                #                 acct cont objc objc objc
+            set_http_connect(200, 200, 503, 503, 503)
+            #                acct cont objc objc objc
             self.app.memcache.store = {}
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 503)
@@ -1742,11 +1946,10 @@ class TestObjectController(unittest.TestCase):
             # not found
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0',
-                                          'X-Copy-From': '/c/o'})
+                                         'X-Copy-From': '/c/o'})
             self.app.update_request(req)
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 404, 404, 404)
-                #                 acct cont objc objc objc
+            set_http_connect(200, 200, 404, 404, 404)
+            #                acct cont objc objc objc
             self.app.memcache.store = {}
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 404)
@@ -1754,11 +1957,10 @@ class TestObjectController(unittest.TestCase):
             # some missing containers
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0',
-                                          'X-Copy-From': '/c/o'})
+                                         'X-Copy-From': '/c/o'})
             self.app.update_request(req)
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 404, 404, 200, 201, 201, 201)
-                #                 acct cont objc objc objc obj  obj  obj
+            set_http_connect(200, 200, 404, 404, 200, 201, 201, 201)
+            #                acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
@@ -1766,12 +1968,11 @@ class TestObjectController(unittest.TestCase):
             # test object meta data
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0',
-                                          'X-Copy-From': '/c/o',
-                                          'X-Object-Meta-Ours': 'okay'})
+                                         'X-Copy-From': '/c/o',
+                                         'X-Object-Meta-Ours': 'okay'})
             self.app.update_request(req)
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 201, 201, 201)
-                #                 acct cont objc objc objc obj  obj  obj
+            set_http_connect(200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
@@ -1785,20 +1986,16 @@ class TestObjectController(unittest.TestCase):
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0'})
             req.account = 'a'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
-                #                 acct cont obj  obj  obj
+            set_http_connect(200, 200, 201, 201, 201)
+            #                acct cont obj  obj  obj
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 201)
 
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'COPY'},
                                 headers={'Destination': 'c/o'})
             req.account = 'a'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201,
-                    201)
-                #                 acct cont acct cont objc objc objc obj  obj
-                #   obj
+            set_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.COPY(req)
             self.assertEquals(resp.status_int, 201)
@@ -1809,11 +2006,8 @@ class TestObjectController(unittest.TestCase):
                                 headers={'Destination': 'c/o'})
             req.account = 'a'
             controller.object_name = 'o/o2'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201,
-                    201)
-                #                 acct cont acct cont objc objc objc obj  obj
-                #   obj
+            set_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.COPY(req)
             self.assertEquals(resp.status_int, 201)
@@ -1823,11 +2017,8 @@ class TestObjectController(unittest.TestCase):
                                 headers={'Destination': '/c/o'})
             req.account = 'a'
             controller.object_name = 'o'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201,
-                    201)
-                #                 acct cont acct cont objc objc objc obj  obj
-                #   obj
+            set_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.COPY(req)
             self.assertEquals(resp.status_int, 201)
@@ -1838,11 +2029,8 @@ class TestObjectController(unittest.TestCase):
                                 headers={'Destination': '/c/o'})
             req.account = 'a'
             controller.object_name = 'o/o2'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201,
-                    201)
-                #                 acct cont acct cont objc objc objc obj  obj
-                #   obj
+            set_http_connect(200, 200, 200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.COPY(req)
             self.assertEquals(resp.status_int, 201)
@@ -1852,9 +2040,8 @@ class TestObjectController(unittest.TestCase):
                                 headers={'Destination': 'c_o'})
             req.account = 'a'
             controller.object_name = 'o'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200)
-                #                 acct cont
+            set_http_connect(200, 200)
+            #                acct cont
             self.app.memcache.store = {}
             resp = controller.COPY(req)
             self.assertEquals(resp.status_int, 412)
@@ -1863,9 +2050,8 @@ class TestObjectController(unittest.TestCase):
                                 headers={'Destination': '/c/o'})
             req.account = 'a'
             controller.object_name = 'o'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 503, 503, 503)
-                #                 acct cont objc objc objc
+            set_http_connect(200, 200, 503, 503, 503)
+            #                acct cont objc objc objc
             self.app.memcache.store = {}
             resp = controller.COPY(req)
             self.assertEquals(resp.status_int, 503)
@@ -1874,9 +2060,8 @@ class TestObjectController(unittest.TestCase):
                                 headers={'Destination': '/c/o'})
             req.account = 'a'
             controller.object_name = 'o'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 404, 404, 404)
-                #                 acct cont objc objc objc
+            set_http_connect(200, 200, 404, 404, 404)
+            #                acct cont objc objc objc
             self.app.memcache.store = {}
             resp = controller.COPY(req)
             self.assertEquals(resp.status_int, 404)
@@ -1885,21 +2070,19 @@ class TestObjectController(unittest.TestCase):
                                 headers={'Destination': '/c/o'})
             req.account = 'a'
             controller.object_name = 'o'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 404, 404, 200, 201, 201, 201)
-                #                 acct cont objc objc objc obj  obj  obj
+            set_http_connect(200, 200, 404, 404, 200, 201, 201, 201)
+            #                acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.COPY(req)
             self.assertEquals(resp.status_int, 201)
 
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'COPY'},
                                 headers={'Destination': '/c/o',
-                                          'X-Object-Meta-Ours': 'okay'})
+                                         'X-Object-Meta-Ours': 'okay'})
             req.account = 'a'
             controller.object_name = 'o'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 201, 201, 201)
-                #                 acct cont objc objc objc obj  obj  obj
+            set_http_connect(200, 200, 200, 200, 200, 201, 201, 201)
+            #                acct cont objc objc objc obj  obj  obj
             self.app.memcache.store = {}
             resp = controller.COPY(req)
             self.assertEquals(resp.status_int, 201)
@@ -1914,10 +2097,10 @@ class TestObjectController(unittest.TestCase):
                                 headers={'Destination': '/c/o'})
             req.account = 'a'
             controller.object_name = 'o'
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 201, 201, 201,
-                      timestamps=('1', '1', '1', '3', '2', '4', '4', '4'))
-                #                 acct cont objc objc objc obj  obj  obj
+            set_http_connect(200, 200, 200, 200, 200, 201, 201, 201,
+                             #act cont objc objc objc obj  obj  obj
+                             timestamps=('1', '1', '1', '3', '2', '4', '4',
+                                         '4'))
             self.app.memcache.store = {}
             resp = controller.COPY(req)
             self.assertEquals(resp.status_int, 201)
@@ -1946,12 +2129,12 @@ class TestObjectController(unittest.TestCase):
                 return data
 
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(201, 201, 201, 201)
+            set_http_connect(201, 201, 201, 201)
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'COPY'},
-                headers={'Transfer-Encoding': 'chunked',
-                'Content-Type': 'foo/bar'})
+                                headers={'Transfer-Encoding': 'chunked',
+                                         'Content-Type': 'foo/bar'})
 
             req.body_file = ChunkedFile(10)
             self.app.memcache.store = {}
@@ -1960,29 +2143,28 @@ class TestObjectController(unittest.TestCase):
             self.assertEquals(res.status_int // 100, 2)  # success
 
             # test 413 entity to large
-            from swift.proxy import server
-            proxy_server.http_connect = fake_http_connect(201, 201, 201, 201)
+            set_http_connect(201, 201, 201, 201)
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'COPY'},
-                headers={'Transfer-Encoding': 'chunked',
-                'Content-Type': 'foo/bar'})
+                                headers={'Transfer-Encoding': 'chunked',
+                                'Content-Type': 'foo/bar'})
             req.body_file = ChunkedFile(11)
             self.app.memcache.store = {}
             self.app.update_request(req)
             try:
-                server.MAX_FILE_SIZE = 10
+                swift.proxy.controllers.obj.MAX_FILE_SIZE = 10
                 res = controller.PUT(req)
                 self.assertEquals(res.status_int, 413)
             finally:
-                server.MAX_FILE_SIZE = MAX_FILE_SIZE
+                swift.proxy.controllers.obj.MAX_FILE_SIZE = MAX_FILE_SIZE
 
     def test_chunked_put_bad_version(self):
         # Check bad version
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = \
-                 _test_sockets
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
+         obj2lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v0 HTTP/1.1\r\nHost: localhost\r\n'
-            'Connection: close\r\nContent-Length: 0\r\n\r\n')
+                 'Connection: close\r\nContent-Length: 0\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 412'
@@ -1990,12 +2172,12 @@ class TestObjectController(unittest.TestCase):
 
     def test_chunked_put_bad_path(self):
         # Check bad path
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = \
-                 _test_sockets
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
+         obj2lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET invalid HTTP/1.1\r\nHost: localhost\r\n'
-            'Connection: close\r\nContent-Length: 0\r\n\r\n')
+                 'Connection: close\r\nContent-Length: 0\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 404'
@@ -2003,13 +2185,13 @@ class TestObjectController(unittest.TestCase):
 
     def test_chunked_put_bad_utf8(self):
         # Check invalid utf-8
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = \
-                 _test_sockets
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
+         obj2lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a%80 HTTP/1.1\r\nHost: localhost\r\n'
-            'Connection: close\r\nX-Auth-Token: t\r\n'
-            'Content-Length: 0\r\n\r\n')
+                 'Connection: close\r\nX-Auth-Token: t\r\n'
+                 'Content-Length: 0\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 412'
@@ -2017,13 +2199,13 @@ class TestObjectController(unittest.TestCase):
 
     def test_chunked_put_bad_path_no_controller(self):
         # Check bad path, no controller
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = \
-                 _test_sockets
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
+         obj2lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1 HTTP/1.1\r\nHost: localhost\r\n'
-            'Connection: close\r\nX-Auth-Token: t\r\n'
-            'Content-Length: 0\r\n\r\n')
+                 'Connection: close\r\nX-Auth-Token: t\r\n'
+                 'Content-Length: 0\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 412'
@@ -2031,13 +2213,13 @@ class TestObjectController(unittest.TestCase):
 
     def test_chunked_put_bad_method(self):
         # Check bad method
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = \
-                 _test_sockets
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
+         obj2lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('LICK /v1/a HTTP/1.1\r\nHost: localhost\r\n'
-            'Connection: close\r\nX-Auth-Token: t\r\n'
-            'Content-Length: 0\r\n\r\n')
+                 'Connection: close\r\nX-Auth-Token: t\r\n'
+                 'Content-Length: 0\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 405'
@@ -2045,10 +2227,10 @@ class TestObjectController(unittest.TestCase):
 
     def test_chunked_put_unhandled_exception(self):
         # Check unhandled exception
-        (prosrv, acc1srv, acc2srv, con1srv, con2srv, obj1srv, obj2srv) = \
-                _test_servers
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = \
-                 _test_sockets
+        (prosrv, acc1srv, acc2srv, con1srv, con2srv, obj1srv,
+         obj2srv) = _test_servers
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
+         obj2lis) = _test_sockets
         orig_update_request = prosrv.update_request
 
         def broken_update_request(*args, **kwargs):
@@ -2058,8 +2240,8 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('HEAD /v1/a HTTP/1.1\r\nHost: localhost\r\n'
-            'Connection: close\r\nX-Auth-Token: t\r\n'
-            'Content-Length: 0\r\n\r\n')
+                 'Connection: close\r\nX-Auth-Token: t\r\n'
+                 'Content-Length: 0\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 500'
@@ -2070,13 +2252,13 @@ class TestObjectController(unittest.TestCase):
         # Head account, just a double check and really is here to test
         # the part Application.log_request that 'enforces' a
         # content_length on the response.
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = \
-                 _test_sockets
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
+         obj2lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('HEAD /v1/a HTTP/1.1\r\nHost: localhost\r\n'
-            'Connection: close\r\nX-Auth-Token: t\r\n'
-            'Content-Length: 0\r\n\r\n')
+                 'Connection: close\r\nX-Auth-Token: t\r\n'
+                 'Content-Length: 0\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 204'
@@ -2093,8 +2275,8 @@ class TestObjectController(unittest.TestCase):
                '\xbf\x86.Test'
         ustr_short = '\xe1\xbc\xb8\xce\xbf\xe1\xbd\xbatest'
         # Create ustr container
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = \
-                 _test_sockets
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
+         obj2lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/%s HTTP/1.1\r\nHost: localhost\r\n'
@@ -2200,21 +2382,21 @@ class TestObjectController(unittest.TestCase):
         exp = 'HTTP/1.1 200'
         self.assertEquals(headers[:len(exp)], exp)
         self.assert_('\r\nX-Object-Meta-%s: %s\r\n' %
-            (quote(ustr_short).lower(), quote(ustr)) in headers)
+                     (quote(ustr_short).lower(), quote(ustr)) in headers)
 
     def test_chunked_put_chunked_put(self):
         # Do chunked object put
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = \
-                 _test_sockets
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
+         obj2lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         # Also happens to assert that x-storage-token is taken as a
         # replacement for x-auth-token.
         fd.write('PUT /v1/a/c/o/chunky HTTP/1.1\r\nHost: localhost\r\n'
-            'Connection: close\r\nX-Storage-Token: t\r\n'
-            'Transfer-Encoding: chunked\r\n\r\n'
-            '2\r\noh\r\n4\r\n hai\r\nf\r\n123456789abcdef\r\n'
-            '0\r\n\r\n')
+                 'Connection: close\r\nX-Storage-Token: t\r\n'
+                 'Transfer-Encoding: chunked\r\n\r\n'
+                 '2\r\noh\r\n4\r\n hai\r\nf\r\n123456789abcdef\r\n'
+                 '0\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
@@ -2234,8 +2416,8 @@ class TestObjectController(unittest.TestCase):
     def test_version_manifest(self):
         versions_to_create = 3
         # Create a container for our versioned object testing
-        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis) = \
-                 _test_sockets
+        (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis,
+         obj2lis) = _test_sockets
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/versions HTTP/1.1\r\nHost: localhost\r\n'
@@ -2269,9 +2451,9 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/versions/name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: '
-            't\r\nContent-Length: 5\r\nContent-Type: text/jibberish0\r\n'
-            'X-Object-Meta-Foo: barbaz\r\n\r\n00000\r\n')
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: 5\r\nContent-Type: text/jibberish0\r\n'
+                 'X-Object-Meta-Foo: barbaz\r\n\r\n00000\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
@@ -2282,9 +2464,9 @@ class TestObjectController(unittest.TestCase):
             sock = connect_tcp(('localhost', prolis.getsockname()[1]))
             fd = sock.makefile()
             fd.write('PUT /v1/a/versions/name HTTP/1.1\r\nHost: '
-                'localhost\r\nConnection: close\r\nX-Storage-Token: '
-                't\r\nContent-Length: 5\r\nContent-Type: text/jibberish%s'
-                '\r\n\r\n%05d\r\n' % (segment, segment))
+                     'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                     't\r\nContent-Length: 5\r\nContent-Type: text/jibberish%s'
+                     '\r\n\r\n%05d\r\n' % (segment, segment))
             fd.flush()
             headers = readuntil2crlfs(fd)
             exp = 'HTTP/1.1 201'
@@ -2293,7 +2475,8 @@ class TestObjectController(unittest.TestCase):
             sock = connect_tcp(('localhost', prolis.getsockname()[1]))
             fd = sock.makefile()
             fd.write('GET /v1/a/versions/name HTTP/1.1\r\nHost: '
-                'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
+                     'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n'
+                     '\r\n')
             fd.flush()
             headers = readuntil2crlfs(fd)
             exp = 'HTTP/1.1 200'
@@ -2306,7 +2489,7 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a/vers?prefix=004name/ HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
+                 'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 200'
@@ -2318,9 +2501,9 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('COPY /v1/a/versions/name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Auth-Token: '
-            't\r\nDestination: versions/copied_name\r\n'
-            'Content-Length: 0\r\n\r\n')
+                 'localhost\r\nConnection: close\r\nX-Auth-Token: '
+                 't\r\nDestination: versions/copied_name\r\n'
+                 'Content-Length: 0\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 2'  # 2xx series response to the COPY
@@ -2328,7 +2511,7 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a/versions/copied_name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
+                 'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 200'
@@ -2339,9 +2522,9 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('POST /v1/a/versions/name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Auth-Token: '
-            't\r\nContent-Type: foo/bar\r\nContent-Length: 0\r\n'
-            'X-Object-Meta-Bar: foo\r\n\r\n')
+                 'localhost\r\nConnection: close\r\nX-Auth-Token: '
+                 't\r\nContent-Type: foo/bar\r\nContent-Length: 0\r\n'
+                 'X-Object-Meta-Bar: foo\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 2'  # 2xx series response to the POST
@@ -2349,7 +2532,7 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a/versions/name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
+                 'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 200'
@@ -2362,8 +2545,8 @@ class TestObjectController(unittest.TestCase):
         for segment in xrange(versions_to_create - 1, 0, -1):
             sock = connect_tcp(('localhost', prolis.getsockname()[1]))
             fd = sock.makefile()
-            fd.write('DELETE /v1/a/versions/name HTTP/1.1\r\nHost: '
-                'localhost\r\nConnection: close\r\nX-Storage-Token: t\r\n\r\n')
+            fd.write('DELETE /v1/a/versions/name HTTP/1.1\r\nHost: localhost\r'
+                     '\nConnection: close\r\nX-Storage-Token: t\r\n\r\n')
             fd.flush()
             headers = readuntil2crlfs(fd)
             exp = 'HTTP/1.1 2'  # 2xx series response
@@ -2371,21 +2554,22 @@ class TestObjectController(unittest.TestCase):
             # Ensure retrieving the manifest file gets the latest version
             sock = connect_tcp(('localhost', prolis.getsockname()[1]))
             fd = sock.makefile()
-            fd.write('GET /v1/a/versions/name HTTP/1.1\r\nHost: '
-                'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
+            fd.write('GET /v1/a/versions/name HTTP/1.1\r\nHost: localhost\r\n'
+                     'Connection: close\r\nX-Auth-Token: t\r\n\r\n')
             fd.flush()
             headers = readuntil2crlfs(fd)
             exp = 'HTTP/1.1 200'
             self.assertEquals(headers[:len(exp)], exp)
             self.assert_('Content-Type: text/jibberish%s' % (segment - 1)
-                        in headers)
+                         in headers)
             body = fd.read()
             self.assertEquals(body, '%05d' % (segment - 1))
             # Ensure we have the right number of versions saved
             sock = connect_tcp(('localhost', prolis.getsockname()[1]))
             fd = sock.makefile()
             fd.write('GET /v1/a/vers?prefix=004name/ HTTP/1.1\r\nHost: '
-                'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
+                     'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r'
+                     '\n')
             fd.flush()
             headers = readuntil2crlfs(fd)
             exp = 'HTTP/1.1 2'  # 2xx series response
@@ -2398,7 +2582,7 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a/vers?prefix=004name/ HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
+                 'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 204 No Content'
@@ -2406,8 +2590,8 @@ class TestObjectController(unittest.TestCase):
         # delete the last verision
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
-        fd.write('DELETE /v1/a/versions/name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: t\r\n\r\n')
+        fd.write('DELETE /v1/a/versions/name HTTP/1.1\r\nHost: localhost\r\n'
+                 'Connection: close\r\nX-Storage-Token: t\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 2'  # 2xx series response
@@ -2416,7 +2600,7 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a/versions/name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
+                 'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 404'
@@ -2426,9 +2610,9 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/versions/name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: '
-            't\r\nContent-Length: 0\r\nContent-Type: text/jibberish0\r\n'
-            'Foo: barbaz\r\nX-Object-Manifest: vers/foo_\r\n\r\n')
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: 0\r\nContent-Type: text/jibberish0\r\n'
+                 'Foo: barbaz\r\nX-Object-Manifest: vers/foo_\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
@@ -2437,7 +2621,7 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a/vers?prefix=004name/ HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
+                 'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 204 No Content'
@@ -2447,9 +2631,9 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/versions/name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: '
-            't\r\nContent-Length: 5\r\nContent-Type: text/jibberish0\r\n'
-            'Foo: barbaz\r\n\r\n00000\r\n')
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: 5\r\nContent-Type: text/jibberish0\r\n'
+                 'Foo: barbaz\r\n\r\n00000\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
@@ -2457,9 +2641,9 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/versions/name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: '
-            't\r\nContent-Length: 5\r\nContent-Type: text/jibberish0\r\n'
-            'Foo: barbaz\r\n\r\n00001\r\n')
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: 5\r\nContent-Type: text/jibberish0\r\n'
+                 'Foo: barbaz\r\n\r\n00001\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
@@ -2467,9 +2651,9 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/versions/name/sub HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: '
-            't\r\nContent-Length: 4\r\nContent-Type: text/jibberish0\r\n'
-            'Foo: barbaz\r\n\r\nsub1\r\n')
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: 4\r\nContent-Type: text/jibberish0\r\n'
+                 'Foo: barbaz\r\n\r\nsub1\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
@@ -2477,17 +2661,17 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/versions/name/sub HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: '
-            't\r\nContent-Length: 4\r\nContent-Type: text/jibberish0\r\n'
-            'Foo: barbaz\r\n\r\nsub2\r\n')
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: 4\r\nContent-Type: text/jibberish0\r\n'
+                 'Foo: barbaz\r\n\r\nsub2\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
         self.assertEquals(headers[:len(exp)], exp)
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
-        fd.write('DELETE /v1/a/versions/name HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: t\r\n\r\n')
+        fd.write('DELETE /v1/a/versions/name HTTP/1.1\r\nHost: localhost\r\n'
+                 'Connection: close\r\nX-Storage-Token: t\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 2'  # 2xx series response
@@ -2495,7 +2679,7 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('GET /v1/a/vers?prefix=008name/sub/ HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
+                 'localhost\r\nConnection: close\r\nX-Auth-Token: t\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 2'  # 2xx series response
@@ -2518,8 +2702,8 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/whoops/foo HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: '
-            't\r\nContent-Length: 5\r\n\r\n00000\r\n')
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: 5\r\n\r\n00000\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 201'
@@ -2528,8 +2712,8 @@ class TestObjectController(unittest.TestCase):
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/whoops/foo HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: '
-            't\r\nContent-Length: 5\r\n\r\n00001\r\n')
+                 'localhost\r\nConnection: close\r\nX-Storage-Token: '
+                 't\r\nContent-Length: 5\r\n\r\n00001\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 412'
@@ -2537,8 +2721,8 @@ class TestObjectController(unittest.TestCase):
         # Delete the object
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
-        fd.write('DELETE /v1/a/whoops/foo HTTP/1.1\r\nHost: '
-            'localhost\r\nConnection: close\r\nX-Storage-Token: t\r\n\r\n')
+        fd.write('DELETE /v1/a/whoops/foo HTTP/1.1\r\nHost: localhost\r\n'
+                 'Connection: close\r\nX-Storage-Token: t\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
         exp = 'HTTP/1.1 2'  # 2xx response
@@ -2739,8 +2923,9 @@ class TestObjectController(unittest.TestCase):
         body = fd.read()
         self.assertEquals(body, '1234 1234 1234 1234 1234 ')
         # Do it again but exceeding the container listing limit
-        proxy_server.CONTAINER_LISTING_LIMIT = 2
+        swift.proxy.controllers.obj.CONTAINER_LISTING_LIMIT = 2
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+
         fd = sock.makefile()
         fd.write('GET /v1/a/segmented%20object/object%20name HTTP/1.1\r\n'
                  'Host: localhost\r\n'
@@ -2778,7 +2963,7 @@ class TestObjectController(unittest.TestCase):
         body = fd.read()
         # After adjusting the CONTAINER_LISTING_LIMIT, make a copy of
         # the manifested object which should consolidate the segments.
-        proxy_server.CONTAINER_LISTING_LIMIT = 10000
+        swift.proxy.controllers.obj.CONTAINER_LISTING_LIMIT = 10000
         sock = connect_tcp(('localhost', prolis.getsockname()[1]))
         fd = sock.makefile()
         fd.write('PUT /v1/a/segmented%20object/copy HTTP/1.1\r\n'
@@ -2945,11 +3130,11 @@ class TestObjectController(unittest.TestCase):
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '0'})
             self.app.update_request(req)
-            proxy_server.http_connect = fake_http_connect(200, 201, 201, 201,
-                etags=[None,
-                       '68b329da9893e34099c7d8ad5cb9c940',
-                       '68b329da9893e34099c7d8ad5cb9c940',
-                       '68b329da9893e34099c7d8ad5cb9c941'])
+            set_http_connect(200, 201, 201, 201,
+                             etags=[None,
+                                    '68b329da9893e34099c7d8ad5cb9c940',
+                                    '68b329da9893e34099c7d8ad5cb9c940',
+                                    '68b329da9893e34099c7d8ad5cb9c941'])
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int // 100, 5)  # server error
 
@@ -2960,11 +3145,11 @@ class TestObjectController(unittest.TestCase):
                                     'ETag': '68b329da9893e34099c7d8ad5cb9c940',
                                 })
             self.app.update_request(req)
-            proxy_server.http_connect = fake_http_connect(200, 422, 422, 503,
-                etags=['68b329da9893e34099c7d8ad5cb9c940',
-                       '68b329da9893e34099c7d8ad5cb9c941',
-                       None,
-                       None])
+            set_http_connect(200, 422, 422, 503,
+                             etags=['68b329da9893e34099c7d8ad5cb9c940',
+                                    '68b329da9893e34099c7d8ad5cb9c941',
+                                    None,
+                                    None])
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int // 100, 4)  # client error
 
@@ -2974,7 +3159,7 @@ class TestObjectController(unittest.TestCase):
             self.app.update_request(req)
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            proxy_server.http_connect = fake_http_connect(200, 200, 200)
+            set_http_connect(200, 200, 200)
             resp = controller.GET(req)
             self.assert_('accept-ranges' in resp.headers)
             self.assertEquals(resp.headers['accept-ranges'], 'bytes')
@@ -2985,7 +3170,7 @@ class TestObjectController(unittest.TestCase):
             self.app.update_request(req)
             controller = proxy_server.ObjectController(self.app, 'account',
                                                        'container', 'object')
-            proxy_server.http_connect = fake_http_connect(200, 200, 200)
+            set_http_connect(200, 200, 200)
             resp = controller.HEAD(req)
             self.assert_('accept-ranges' in resp.headers)
             self.assertEquals(resp.headers['accept-ranges'], 'bytes')
@@ -2997,10 +3182,9 @@ class TestObjectController(unittest.TestCase):
             called[0] = True
             return HTTPUnauthorized(request=req)
         with save_globals():
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
+            set_http_connect(200, 200, 201, 201, 201)
             controller = proxy_server.ObjectController(self.app, 'account',
-                            'container', 'object')
+                                                       'container', 'object')
             req = Request.blank('/a/c/o')
             req.environ['swift.authorize'] = authorize
             self.app.update_request(req)
@@ -3014,10 +3198,9 @@ class TestObjectController(unittest.TestCase):
             called[0] = True
             return HTTPUnauthorized(request=req)
         with save_globals():
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
+            set_http_connect(200, 200, 201, 201, 201)
             controller = proxy_server.ObjectController(self.app, 'account',
-                            'container', 'object')
+                                                       'container', 'object')
             req = Request.blank('/a/c/o', {'REQUEST_METHOD': 'HEAD'})
             req.environ['swift.authorize'] = authorize
             self.app.update_request(req)
@@ -3032,10 +3215,9 @@ class TestObjectController(unittest.TestCase):
             return HTTPUnauthorized(request=req)
         with save_globals():
             self.app.object_post_as_copy = False
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
+            set_http_connect(200, 200, 201, 201, 201)
             controller = proxy_server.ObjectController(self.app, 'account',
-                            'container', 'object')
+                                                       'container', 'object')
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'POST'},
                                 headers={'Content-Length': '5'}, body='12345')
             req.environ['swift.authorize'] = authorize
@@ -3050,10 +3232,9 @@ class TestObjectController(unittest.TestCase):
             called[0] = True
             return HTTPUnauthorized(request=req)
         with save_globals():
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 201, 201, 201)
+            set_http_connect(200, 200, 200, 200, 200, 201, 201, 201)
             controller = proxy_server.ObjectController(self.app, 'account',
-                            'container', 'object')
+                                                       'container', 'object')
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'POST'},
                                 headers={'Content-Length': '5'}, body='12345')
             req.environ['swift.authorize'] = authorize
@@ -3068,10 +3249,9 @@ class TestObjectController(unittest.TestCase):
             called[0] = True
             return HTTPUnauthorized(request=req)
         with save_globals():
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
+            set_http_connect(200, 200, 201, 201, 201)
             controller = proxy_server.ObjectController(self.app, 'account',
-                            'container', 'object')
+                                                       'container', 'object')
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                                 headers={'Content-Length': '5'}, body='12345')
             req.environ['swift.authorize'] = authorize
@@ -3086,10 +3266,9 @@ class TestObjectController(unittest.TestCase):
             called[0] = True
             return HTTPUnauthorized(request=req)
         with save_globals():
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 201, 201, 201)
+            set_http_connect(200, 200, 200, 200, 200, 201, 201, 201)
             controller = proxy_server.ObjectController(self.app, 'account',
-                            'container', 'object')
+                                                       'container', 'object')
             req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'COPY'},
                                 headers={'Destination': 'c/o'})
             req.environ['swift.authorize'] = authorize
@@ -3100,16 +3279,16 @@ class TestObjectController(unittest.TestCase):
     def test_POST_converts_delete_after_to_delete_at(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 202, 202, 202)
+                                                       'container', 'object')
+            set_http_connect(200, 200, 200, 200, 200, 202, 202, 202)
             self.app.memcache.store = {}
             orig_time = proxy_server.time.time
             try:
                 t = time()
                 proxy_server.time.time = lambda: t
                 req = Request.blank('/a/c/o', {},
-                   headers={'Content-Type': 'foo/bar', 'X-Delete-After': '60'})
+                                    headers={'Content-Type': 'foo/bar',
+                                             'X-Delete-After': '60'})
                 self.app.update_request(req)
                 res = controller.POST(req)
                 self.assertEquals(res.status, '202 Fake')
@@ -3118,12 +3297,13 @@ class TestObjectController(unittest.TestCase):
 
                 self.app.object_post_as_copy = False
                 controller = proxy_server.ObjectController(self.app, 'account',
-                    'container', 'object')
-                proxy_server.http_connect = \
-                    fake_http_connect(200, 200, 202, 202, 202)
+                                                           'container',
+                                                           'object')
+                set_http_connect(200, 200, 202, 202, 202)
                 self.app.memcache.store = {}
                 req = Request.blank('/a/c/o', {},
-                   headers={'Content-Type': 'foo/bar', 'X-Delete-After': '60'})
+                                    headers={'Content-Type': 'foo/bar',
+                                             'X-Delete-After': '60'})
                 self.app.update_request(req)
                 res = controller.POST(req)
                 self.assertEquals(res.status, '202 Fake')
@@ -3135,12 +3315,12 @@ class TestObjectController(unittest.TestCase):
     def test_POST_non_int_delete_after(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 202, 202, 202)
+                                                       'container', 'object')
+            set_http_connect(200, 200, 200, 200, 200, 202, 202, 202)
             self.app.memcache.store = {}
             req = Request.blank('/a/c/o', {},
-                headers={'Content-Type': 'foo/bar', 'X-Delete-After': '60.1'})
+                                headers={'Content-Type': 'foo/bar',
+                                         'X-Delete-After': '60.1'})
             self.app.update_request(req)
             res = controller.POST(req)
             self.assertEquals(res.status, '400 Bad Request')
@@ -3149,12 +3329,12 @@ class TestObjectController(unittest.TestCase):
     def test_POST_negative_delete_after(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 200, 200, 200, 202, 202, 202)
+                                                       'container', 'object')
+            set_http_connect(200, 200, 200, 200, 200, 202, 202, 202)
             self.app.memcache.store = {}
             req = Request.blank('/a/c/o', {},
-                headers={'Content-Type': 'foo/bar', 'X-Delete-After': '-60'})
+                                headers={'Content-Type': 'foo/bar',
+                                         'X-Delete-After': '-60'})
             self.app.update_request(req)
             res = controller.POST(req)
             self.assertEquals(res.status, '400 Bad Request')
@@ -3170,13 +3350,14 @@ class TestObjectController(unittest.TestCase):
 
             self.app.object_post_as_copy = False
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
             controller.make_requests = fake_make_requests
-            proxy_server.http_connect = fake_http_connect(200, 200)
+            set_http_connect(200, 200)
             self.app.memcache.store = {}
             t = str(int(time() + 100))
             req = Request.blank('/a/c/o', {},
-                headers={'Content-Type': 'foo/bar', 'X-Delete-At': t})
+                                headers={'Content-Type': 'foo/bar',
+                                         'X-Delete-At': t})
             self.app.update_request(req)
             controller.POST(req)
             self.assertEquals(given_headers.get('X-Delete-At'), t)
@@ -3186,7 +3367,8 @@ class TestObjectController(unittest.TestCase):
 
             t = str(int(time() + 100)) + '.1'
             req = Request.blank('/a/c/o', {},
-                headers={'Content-Type': 'foo/bar', 'X-Delete-At': t})
+                                headers={'Content-Type': 'foo/bar',
+                                         'X-Delete-At': t})
             self.app.update_request(req)
             resp = controller.POST(req)
             self.assertEquals(resp.status_int, 400)
@@ -3194,7 +3376,8 @@ class TestObjectController(unittest.TestCase):
 
             t = str(int(time() - 100))
             req = Request.blank('/a/c/o', {},
-                headers={'Content-Type': 'foo/bar', 'X-Delete-At': t})
+                                headers={'Content-Type': 'foo/bar',
+                                         'X-Delete-At': t})
             self.app.update_request(req)
             resp = controller.POST(req)
             self.assertEquals(resp.status_int, 400)
@@ -3203,17 +3386,17 @@ class TestObjectController(unittest.TestCase):
     def test_PUT_converts_delete_after_to_delete_at(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
+                                                       'container', 'object')
+            set_http_connect(200, 200, 201, 201, 201)
             self.app.memcache.store = {}
             orig_time = proxy_server.time.time
             try:
                 t = time()
                 proxy_server.time.time = lambda: t
                 req = Request.blank('/a/c/o', {},
-                    headers={'Content-Length': '0', 'Content-Type': 'foo/bar',
-                             'X-Delete-After': '60'})
+                                    headers={'Content-Length': '0',
+                                             'Content-Type': 'foo/bar',
+                                             'X-Delete-After': '60'})
                 self.app.update_request(req)
                 res = controller.PUT(req)
                 self.assertEquals(res.status, '201 Fake')
@@ -3225,13 +3408,13 @@ class TestObjectController(unittest.TestCase):
     def test_PUT_non_int_delete_after(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
+                                                       'container', 'object')
+            set_http_connect(200, 200, 201, 201, 201)
             self.app.memcache.store = {}
             req = Request.blank('/a/c/o', {},
-                headers={'Content-Length': '0', 'Content-Type': 'foo/bar',
-                         'X-Delete-After': '60.1'})
+                                headers={'Content-Length': '0',
+                                         'Content-Type': 'foo/bar',
+                                         'X-Delete-After': '60.1'})
             self.app.update_request(req)
             res = controller.PUT(req)
             self.assertEquals(res.status, '400 Bad Request')
@@ -3240,13 +3423,13 @@ class TestObjectController(unittest.TestCase):
     def test_PUT_negative_delete_after(self):
         with save_globals():
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
-            proxy_server.http_connect = \
-                fake_http_connect(200, 200, 201, 201, 201)
+                                                       'container', 'object')
+            set_http_connect(200, 200, 201, 201, 201)
             self.app.memcache.store = {}
             req = Request.blank('/a/c/o', {},
-                headers={'Content-Length': '0', 'Content-Type': 'foo/bar',
-                         'X-Delete-After': '-60'})
+                                headers={'Content-Length': '0',
+                                         'Content-Type': 'foo/bar',
+                                         'X-Delete-After': '-60'})
             self.app.update_request(req)
             res = controller.PUT(req)
             self.assertEquals(res.status, '400 Bad Request')
@@ -3257,18 +3440,19 @@ class TestObjectController(unittest.TestCase):
             given_headers = {}
 
             def fake_connect_put_node(nodes, part, path, headers,
-                                      logger_thread_locals, append=False):
+                                      logger_thread_locals, method):
                 given_headers.update(headers)
 
             controller = proxy_server.ObjectController(self.app, 'account',
-                'container', 'object')
+                                                       'container', 'object')
             controller._connect_put_node = fake_connect_put_node
-            proxy_server.http_connect = fake_http_connect(200, 200)
+            set_http_connect(200, 200)
             self.app.memcache.store = {}
             t = str(int(time() + 100))
             req = Request.blank('/a/c/o', {},
-                headers={'Content-Length': '0', 'Content-Type': 'foo/bar',
-                         'X-Delete-At': t})
+                                headers={'Content-Length': '0',
+                                         'Content-Type': 'foo/bar',
+                                         'X-Delete-At': t})
             self.app.update_request(req)
             controller.PUT(req)
             self.assertEquals(given_headers.get('X-Delete-At'), t)
@@ -3278,8 +3462,9 @@ class TestObjectController(unittest.TestCase):
 
             t = str(int(time() + 100)) + '.1'
             req = Request.blank('/a/c/o', {},
-                headers={'Content-Length': '0', 'Content-Type': 'foo/bar',
-                         'X-Delete-At': t})
+                                headers={'Content-Length': '0',
+                                         'Content-Type': 'foo/bar',
+                                         'X-Delete-At': t})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 400)
@@ -3287,12 +3472,120 @@ class TestObjectController(unittest.TestCase):
 
             t = str(int(time() - 100))
             req = Request.blank('/a/c/o', {},
-                headers={'Content-Length': '0', 'Content-Type': 'foo/bar',
-                         'X-Delete-At': t})
+                                headers={'Content-Length': '0',
+                                         'Content-Type': 'foo/bar',
+                                         'X-Delete-At': t})
             self.app.update_request(req)
             resp = controller.PUT(req)
             self.assertEquals(resp.status_int, 400)
             self.assertTrue('X-Delete-At in past' in resp.body)
+
+    def test_leak_1(self):
+        global _request_instances
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+        obj_len = prosrv.client_chunk_size * 2
+        # PUT test file
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('PUT /v1/a/c/test_leak_1 HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Auth-Token: t\r\n'
+                 'Content-Length: %s\r\n'
+                 'Content-Type: application/octet-stream\r\n'
+                 '\r\n%s' % (obj_len,  'a' * obj_len))
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 201'
+        self.assertEqual(headers[:len(exp)], exp)
+        # Remember Request instance count
+        before_request_instances = _request_instances
+        # GET test file, but disconnect early
+        sock = connect_tcp(('localhost', prolis.getsockname()[1]))
+        fd = sock.makefile()
+        fd.write('GET /v1/a/c/test_leak_1 HTTP/1.1\r\n'
+                 'Host: localhost\r\n'
+                 'Connection: close\r\n'
+                 'X-Auth-Token: t\r\n'
+                 '\r\n')
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        exp = 'HTTP/1.1 200'
+        self.assertEqual(headers[:len(exp)], exp)
+        fd.read(1)
+        fd.close()
+        sock.close()
+        self.assertEquals(before_request_instances, _request_instances)
+
+    def test_OPTIONS(self):
+        with save_globals():
+            controller = proxy_server.ObjectController(self.app, 'a',
+                                                       'c', 'o.jpg')
+
+            def my_empty_container_info(*args):
+                return {}
+            controller.container_info = my_empty_container_info
+            req = Request.blank(
+                '/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.com'})
+            resp = controller.OPTIONS(req)
+            self.assertEquals(401, resp.status_int)
+
+            def my_empty_origin_container_info(*args):
+                return {'cors': {'allow_origin': None}}
+            controller.container_info = my_empty_origin_container_info
+            req = Request.blank(
+                '/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.com'})
+            resp = controller.OPTIONS(req)
+            self.assertEquals(401, resp.status_int)
+
+            def my_container_info(*args):
+                return {
+                    'cors': {
+                        'allow_origin': 'http://foo.bar:8080 https://foo.bar',
+                        'allow_headers': 'x-foo',
+                        'max_age': 999,
+                    }
+                }
+            controller.container_info = my_container_info
+            req = Request.blank(
+                '/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'https://foo.bar'})
+            req.content_length = 0
+            resp = controller.OPTIONS(req)
+            self.assertEquals(200, resp.status_int)
+            self.assertEquals(
+                set(['http://foo.bar:8080', 'https://foo.bar']),
+                set(resp.headers['access-control-allow-origin'].split()))
+            self.assertEquals(
+                'GET, POST, PUT, DELETE, HEAD',
+                resp.headers['access-control-allow-methods'])
+            self.assertEquals('999', resp.headers['access-control-max-age'])
+            self.assertEquals(
+                'x-foo',
+                resp.headers['access-control-allow-headers'])
+            req = Request.blank('/a/c/o.jpg', {'REQUEST_METHOD': 'OPTIONS'})
+            req.content_length = 0
+            resp = controller.OPTIONS(req)
+            self.assertEquals(401, resp.status_int)
+            req = Request.blank(
+                '/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.com'})
+            resp = controller.OPTIONS(req)
+            self.assertEquals(401, resp.status_int)
+            req = Request.blank(
+                '/a/c/o.jpg',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.bar'})
+            controller.app.cors_allow_origin = ['http://foo.bar', ]
+            resp = controller.OPTIONS(req)
+            self.assertEquals(200, resp.status_int)
 
 
 class TestContainerController(unittest.TestCase):
@@ -3300,8 +3593,9 @@ class TestContainerController(unittest.TestCase):
 
     def setUp(self):
         self.app = proxy_server.Application(None, FakeMemcache(),
-            account_ring=FakeRing(), container_ring=FakeRing(),
-            object_ring=FakeRing())
+                                            account_ring=FakeRing(),
+                                            container_ring=FakeRing(),
+                                            object_ring=FakeRing())
 
     def assert_status_map(self, method, statuses, expected,
                           raise_exc=False, missing_container=False):
@@ -3310,17 +3604,17 @@ class TestContainerController(unittest.TestCase):
             if raise_exc:
                 kwargs['raise_exc'] = raise_exc
             kwargs['missing_container'] = missing_container
-            proxy_server.http_connect = fake_http_connect(*statuses, **kwargs)
+            set_http_connect(*statuses, **kwargs)
             self.app.memcache.store = {}
             req = Request.blank('/a/c', headers={'Content-Length': '0',
-                    'Content-Type': 'text/plain'})
+                                'Content-Type': 'text/plain'})
             self.app.update_request(req)
             res = method(req)
             self.assertEquals(res.status_int, expected)
-            proxy_server.http_connect = fake_http_connect(*statuses, **kwargs)
+            set_http_connect(*statuses, **kwargs)
             self.app.memcache.store = {}
             req = Request.blank('/a/c/', headers={'Content-Length': '0',
-                    'Content-Type': 'text/plain'})
+                                'Content-Type': 'text/plain'})
             self.app.update_request(req)
             res = method(req)
             self.assertEquals(res.status_int, expected)
@@ -3328,11 +3622,10 @@ class TestContainerController(unittest.TestCase):
     def test_HEAD(self):
         with save_globals():
             controller = proxy_server.ContainerController(self.app, 'account',
-                'container')
+                                                          'container')
 
             def test_status_map(statuses, expected, **kwargs):
-                proxy_server.http_connect = fake_http_connect(*statuses,
-                                                              **kwargs)
+                set_http_connect(*statuses, **kwargs)
                 self.app.memcache.store = {}
                 req = Request.blank('/a/c', {})
                 self.app.update_request(req)
@@ -3355,8 +3648,7 @@ class TestContainerController(unittest.TestCase):
                                                           'container')
 
             def test_status_map(statuses, expected, **kwargs):
-                proxy_server.http_connect = fake_http_connect(*statuses,
-                                                              **kwargs)
+                set_http_connect(*statuses, **kwargs)
                 self.app.memcache.store = {}
                 req = Request.blank('/a/c', {})
                 req.content_length = 0
@@ -3394,13 +3686,14 @@ class TestContainerController(unittest.TestCase):
 
     def test_PUT_max_container_name_length(self):
         with save_globals():
+            limit = MAX_CONTAINER_NAME_LENGTH
             controller = proxy_server.ContainerController(self.app, 'account',
-                                                              '1' * 256)
+                                                          '1' * limit)
             self.assert_status_map(controller.PUT,
                                    (200, 200, 200, 201, 201, 201), 201,
                                    missing_container=True)
             controller = proxy_server.ContainerController(self.app, 'account',
-                                                              '2' * 257)
+                                                          '2' * (limit + 1))
             self.assert_status_map(controller.PUT, (201, 201, 201), 400,
                                    missing_container=True)
 
@@ -3423,40 +3716,35 @@ class TestContainerController(unittest.TestCase):
                     del dev['errors']
                     del dev['last_error']
                 controller = proxy_server.ContainerController(self.app,
-                                'account', 'container')
+                                                              'account',
+                                                              'container')
                 if meth == 'PUT':
-                    proxy_server.http_connect = \
-                        fake_http_connect(200, 200, 200, 200, 200, 200,
-                                          missing_container=True)
+                    set_http_connect(200, 200, 200, 200, 200, 200,
+                                     missing_container=True)
                 else:
-                    proxy_server.http_connect = \
-                        fake_http_connect(200, 200, 200, 200)
+                    set_http_connect(200, 200, 200, 200)
                 self.app.memcache.store = {}
                 req = Request.blank('/a/c', environ={'REQUEST_METHOD': meth})
                 self.app.update_request(req)
                 resp = getattr(controller, meth)(req)
                 self.assertEquals(resp.status_int, 200)
 
-                proxy_server.http_connect = \
-                    fake_http_connect(404, 404, 404, 200, 200, 200)
+                set_http_connect(404, 404, 404, 200, 200, 200)
                 resp = getattr(controller, meth)(req)
                 self.assertEquals(resp.status_int, 404)
 
-                proxy_server.http_connect = \
-                    fake_http_connect(503, 404, 404)
+                set_http_connect(503, 404, 404)
                 resp = getattr(controller, meth)(req)
                 self.assertEquals(resp.status_int, 404)
 
-                proxy_server.http_connect = \
-                    fake_http_connect(503, 404, raise_exc=True)
+                set_http_connect(503, 404, raise_exc=True)
                 resp = getattr(controller, meth)(req)
                 self.assertEquals(resp.status_int, 404)
 
                 for dev in self.app.account_ring.devs.values():
                     dev['errors'] = self.app.error_suppression_limit + 1
                     dev['last_error'] = time()
-                proxy_server.http_connect = \
-                    fake_http_connect(200, 200, 200, 200, 200, 200)
+                set_http_connect(200, 200, 200, 200, 200, 200)
                 resp = getattr(controller, meth)(req)
                 self.assertEquals(resp.status_int, 404)
 
@@ -3479,8 +3767,8 @@ class TestContainerController(unittest.TestCase):
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             self.app.memcache = MockMemcache(allow_lock=True)
-            proxy_server.http_connect = fake_http_connect(
-                200, 200, 200, 201, 201, 201, missing_container=True)
+            set_http_connect(200, 200, 200, 201, 201, 201,
+                             missing_container=True)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': 'PUT'})
             self.app.update_request(req)
             res = controller.PUT(req)
@@ -3488,7 +3776,7 @@ class TestContainerController(unittest.TestCase):
 
     def test_error_limiting(self):
         with save_globals():
-            proxy_server.shuffle = lambda l: None
+            set_shuffle()
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             self.assert_status_map(controller.HEAD, (200, 503, 200, 200), 200,
@@ -3536,7 +3824,7 @@ class TestContainerController(unittest.TestCase):
 
     def test_response_get_accept_ranges_header(self):
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200, 200, body='{}')
+            set_http_connect(200, 200, body='{}')
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             req = Request.blank('/a/c?format=json')
@@ -3547,7 +3835,7 @@ class TestContainerController(unittest.TestCase):
 
     def test_response_head_accept_ranges_header(self):
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200, 200, body='{}')
+            set_http_connect(200, 200, body='{}')
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             req = Request.blank('/a/c?format=json')
@@ -3566,7 +3854,11 @@ class TestContainerController(unittest.TestCase):
         for test_header, test_value in (
                 ('X-Container-Meta-TestHeader', 'TestValue'),
                 ('X-Container-Meta-TestHeader', ''),
-                ('X-Remove-Container-Meta-TestHeader', 'anything')):
+                ('X-Remove-Container-Meta-TestHeader', 'anything'),
+                ('X-Container-Read', '.r:*'),
+                ('X-Remove-Container-Read', 'anything'),
+                ('X-Container-Write', 'anyone'),
+                ('X-Remove-Container-Write', 'anything')):
             test_errors = []
 
             def test_connect(ipaddr, port, device, partition, method, path,
@@ -3588,10 +3880,9 @@ class TestContainerController(unittest.TestCase):
             with save_globals():
                 controller = \
                     proxy_server.ContainerController(self.app, 'a', 'c')
-                proxy_server.http_connect = fake_http_connect(200, 201, 201,
-                    201, give_connect=test_connect)
+                set_http_connect(200, 201, 201, 201, give_connect=test_connect)
                 req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
-                        headers={test_header: test_value})
+                                    headers={test_header: test_value})
                 self.app.update_request(req)
                 res = getattr(controller, method)(req)
                 self.assertEquals(test_errors, [])
@@ -3605,43 +3896,43 @@ class TestContainerController(unittest.TestCase):
     def bad_metadata_helper(self, method):
         with save_globals():
             controller = proxy_server.ContainerController(self.app, 'a', 'c')
-            proxy_server.http_connect = fake_http_connect(200, 201, 201, 201)
+            set_http_connect(200, 201, 201, 201)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method})
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 201)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
-                    headers={'X-Container-Meta-' +
+                                headers={'X-Container-Meta-' +
                                 ('a' * MAX_META_NAME_LENGTH): 'v'})
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
-                    headers={'X-Container-Meta-' +
+                                headers={'X-Container-Meta-' +
                                 ('a' * (MAX_META_NAME_LENGTH + 1)): 'v'})
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 400)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
-                    headers={'X-Container-Meta-Too-Long':
+                                headers={'X-Container-Meta-Too-Long':
                                 'a' * MAX_META_VALUE_LENGTH})
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
-                    headers={'X-Container-Meta-Too-Long':
+                                headers={'X-Container-Meta-Too-Long':
                                 'a' * (MAX_META_VALUE_LENGTH + 1)})
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 400)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers = {}
             for x in xrange(MAX_META_COUNT):
                 headers['X-Container-Meta-%d' % x] = 'v'
@@ -3650,7 +3941,7 @@ class TestContainerController(unittest.TestCase):
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers = {}
             for x in xrange(MAX_META_COUNT + 1):
                 headers['X-Container-Meta-%d' % x] = 'v'
@@ -3660,7 +3951,7 @@ class TestContainerController(unittest.TestCase):
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 400)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers = {}
             header_value = 'a' * MAX_META_VALUE_LENGTH
             size = 0
@@ -3677,7 +3968,7 @@ class TestContainerController(unittest.TestCase):
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers['X-Container-Meta-a'] = \
                 'a' * (MAX_META_OVERALL_SIZE - size)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
@@ -3693,7 +3984,7 @@ class TestContainerController(unittest.TestCase):
             called[0] = True
             raise ValueError('fake error')
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200, 201, 201, 201)
+            set_http_connect(200, 201, 201, 201)
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': 'POST'},
@@ -3704,7 +3995,7 @@ class TestContainerController(unittest.TestCase):
         self.assert_(called[0])
         called[0] = False
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200, 201, 201, 201)
+            set_http_connect(200, 201, 201, 201)
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': 'POST'},
@@ -3721,7 +4012,7 @@ class TestContainerController(unittest.TestCase):
             called[0] = True
             raise ValueError('fake error')
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200, 201, 201, 201)
+            set_http_connect(200, 201, 201, 201)
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': 'PUT'},
@@ -3732,7 +4023,7 @@ class TestContainerController(unittest.TestCase):
         self.assert_(called[0])
         called[0] = False
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200, 201, 201, 201)
+            set_http_connect(200, 201, 201, 201)
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': 'PUT'},
@@ -3744,8 +4035,7 @@ class TestContainerController(unittest.TestCase):
 
     def test_GET_no_content(self):
         with save_globals():
-            proxy_server.http_connect = \
-                fake_http_connect(200, 204, 204, 204)
+            set_http_connect(200, 204, 204, 204)
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             req = Request.blank('/a/c')
@@ -3761,8 +4051,7 @@ class TestContainerController(unittest.TestCase):
             called[0] = True
             return HTTPUnauthorized(request=req)
         with save_globals():
-            proxy_server.http_connect = \
-                fake_http_connect(200, 201, 201, 201)
+            set_http_connect(200, 201, 201, 201)
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             req = Request.blank('/a/c')
@@ -3778,8 +4067,7 @@ class TestContainerController(unittest.TestCase):
             called[0] = True
             return HTTPUnauthorized(request=req)
         with save_globals():
-            proxy_server.http_connect = \
-                fake_http_connect(200, 201, 201, 201)
+            set_http_connect(200, 201, 201, 201)
             controller = proxy_server.ContainerController(self.app, 'account',
                                                           'container')
             req = Request.blank('/a/c', {'REQUEST_METHOD': 'HEAD'})
@@ -3788,22 +4076,91 @@ class TestContainerController(unittest.TestCase):
             res = controller.HEAD(req)
         self.assert_(called[0])
 
+    def test_OPTIONS(self):
+        with save_globals():
+            controller = proxy_server.ContainerController(self.app, 'a', 'c')
+
+            def my_empty_container_info(*args):
+                return {}
+            controller.container_info = my_empty_container_info
+            req = Request.blank(
+                '/a/c',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.com'})
+            resp = controller.OPTIONS(req)
+            self.assertEquals(401, resp.status_int)
+
+            def my_empty_origin_container_info(*args):
+                return {'cors': {'allow_origin': None}}
+            controller.container_info = my_empty_origin_container_info
+            req = Request.blank(
+                '/a/c',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.com'})
+            resp = controller.OPTIONS(req)
+            self.assertEquals(401, resp.status_int)
+
+            def my_container_info(*args):
+                return {
+                    'cors': {
+                        'allow_origin': 'http://foo.bar:8080 https://foo.bar',
+                        'allow_headers': 'x-foo',
+                        'max_age': 999,
+                    }
+                }
+            controller.container_info = my_container_info
+            req = Request.blank(
+                '/a/c',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'https://foo.bar'})
+            req.content_length = 0
+            resp = controller.OPTIONS(req)
+            self.assertEquals(200, resp.status_int)
+            self.assertEquals(
+                set(['http://foo.bar:8080', 'https://foo.bar']),
+                set(resp.headers['access-control-allow-origin'].split()))
+            self.assertEquals(
+                'GET, POST, PUT, DELETE, HEAD',
+                resp.headers['access-control-allow-methods'])
+            self.assertEquals('999', resp.headers['access-control-max-age'])
+            self.assertEquals(
+                'x-foo',
+                resp.headers['access-control-allow-headers'])
+            req = Request.blank('/a/c', {'REQUEST_METHOD': 'OPTIONS'})
+            req.content_length = 0
+            resp = controller.OPTIONS(req)
+            self.assertEquals(401, resp.status_int)
+            req = Request.blank(
+                '/a/c',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.bar'})
+            resp = controller.OPTIONS(req)
+            self.assertEquals(401, resp.status_int)
+            req = Request.blank(
+                '/a/c',
+                {'REQUEST_METHOD': 'OPTIONS'},
+                headers={'Origin': 'http://foo.bar'})
+            controller.app.cors_allow_origin = ['http://foo.bar', ]
+            resp = controller.OPTIONS(req)
+            self.assertEquals(200, resp.status_int)
+
 
 class TestAccountController(unittest.TestCase):
 
     def setUp(self):
         self.app = proxy_server.Application(None, FakeMemcache(),
-            account_ring=FakeRing(), container_ring=FakeRing(),
-            object_ring=FakeRing)
+                                            account_ring=FakeRing(),
+                                            container_ring=FakeRing(),
+                                            object_ring=FakeRing)
 
     def assert_status_map(self, method, statuses, expected):
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(*statuses)
+            set_http_connect(*statuses)
             req = Request.blank('/a', {})
             self.app.update_request(req)
             res = method(req)
             self.assertEquals(res.status_int, expected)
-            proxy_server.http_connect = fake_http_connect(*statuses)
+            set_http_connect(*statuses)
             req = Request.blank('/a/', {})
             self.app.update_request(req)
             res = method(req)
@@ -3835,10 +4192,14 @@ class TestAccountController(unittest.TestCase):
             controller = proxy_server.AccountController(self.app, 'account')
             self.app.memcache = FakeMemcacheReturnsNone()
             self.assert_status_map(controller.GET,
-                (404, 404, 404, 201, 201, 201, 204), 404)
+                                   (404, 404, 404, 201, 201, 201, 204), 404)
             controller.app.account_autocreate = True
             self.assert_status_map(controller.GET,
-                (404, 404, 404, 201, 201, 201, 204), 204)
+                                   (404, 404, 404, 201, 201, 201, 204), 204)
+            self.assert_status_map(controller.GET,
+                                   (404, 404, 404, 403, 403, 403, 403), 403)
+            self.assert_status_map(controller.GET,
+                                   (404, 404, 404, 409, 409, 409, 409), 409)
 
     def test_HEAD(self):
         with save_globals():
@@ -3863,20 +4224,28 @@ class TestAccountController(unittest.TestCase):
             controller = proxy_server.AccountController(self.app, 'account')
             self.app.memcache = FakeMemcacheReturnsNone()
             self.assert_status_map(controller.HEAD,
-                (404, 404, 404, 201, 201, 201, 204), 404)
+                                   (404, 404, 404, 201, 201, 201, 204), 404)
             controller.app.account_autocreate = True
             self.assert_status_map(controller.HEAD,
-                (404, 404, 404, 201, 201, 201, 204), 204)
+                                   (404, 404, 404, 201, 201, 201, 204), 204)
+            self.assert_status_map(controller.HEAD,
+                                   (404, 404, 404, 403, 403, 403, 403), 403)
+            self.assert_status_map(controller.HEAD,
+                                   (404, 404, 404, 409, 409, 409, 409), 409)
 
     def test_POST_autocreate(self):
         with save_globals():
             controller = proxy_server.AccountController(self.app, 'account')
             self.app.memcache = FakeMemcacheReturnsNone()
             self.assert_status_map(controller.POST,
-                (404, 404, 404, 201, 201, 201), 404)
+                                   (404, 404, 404, 201, 201, 201), 404)
             controller.app.account_autocreate = True
             self.assert_status_map(controller.POST,
-                (404, 404, 404, 201, 201, 201), 201)
+                                   (404, 404, 404, 201, 201, 201), 201)
+            self.assert_status_map(controller.POST,
+                                   (404, 404, 404, 403, 403, 403, 403), 403)
+            self.assert_status_map(controller.POST,
+                                   (404, 404, 404, 409, 409, 409, 409), 409)
 
     def test_connection_refused(self):
         self.app.account_ring.get_nodes('account')
@@ -3902,7 +4271,7 @@ class TestAccountController(unittest.TestCase):
 
     def test_response_get_accept_ranges_header(self):
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200, 200, body='{}')
+            set_http_connect(200, 200, body='{}')
             controller = proxy_server.AccountController(self.app, 'account')
             req = Request.blank('/a?format=json')
             self.app.update_request(req)
@@ -3912,7 +4281,7 @@ class TestAccountController(unittest.TestCase):
 
     def test_response_head_accept_ranges_header(self):
         with save_globals():
-            proxy_server.http_connect = fake_http_connect(200, 200, body='{}')
+            set_http_connect(200, 200, body='{}')
             controller = proxy_server.AccountController(self.app, 'account')
             req = Request.blank('/a?format=json')
             self.app.update_request(req)
@@ -3926,8 +4295,7 @@ class TestAccountController(unittest.TestCase):
             controller = proxy_server.AccountController(self.app, 'account')
 
             def test_status_map(statuses, expected, **kwargs):
-                proxy_server.http_connect = \
-                    fake_http_connect(*statuses, **kwargs)
+                set_http_connect(*statuses, **kwargs)
                 self.app.memcache.store = {}
                 req = Request.blank('/a', {})
                 req.content_length = 0
@@ -3945,9 +4313,11 @@ class TestAccountController(unittest.TestCase):
     def test_PUT_max_account_name_length(self):
         with save_globals():
             self.app.allow_account_management = True
-            controller = proxy_server.AccountController(self.app, '1' * 256)
+            limit = MAX_ACCOUNT_NAME_LENGTH
+            controller = proxy_server.AccountController(self.app, '1' * limit)
             self.assert_status_map(controller.PUT, (201, 201, 201), 201)
-            controller = proxy_server.AccountController(self.app, '2' * 257)
+            controller = proxy_server.AccountController(
+                self.app, '2' * (limit + 1))
             self.assert_status_map(controller.PUT, (201, 201, 201), 400)
 
     def test_PUT_connect_exceptions(self):
@@ -3991,10 +4361,9 @@ class TestAccountController(unittest.TestCase):
                 self.app.allow_account_management = True
                 controller = \
                     proxy_server.AccountController(self.app, 'a')
-                proxy_server.http_connect = fake_http_connect(201, 201, 201,
-                                                give_connect=test_connect)
+                set_http_connect(201, 201, 201, give_connect=test_connect)
                 req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
-                        headers={test_header: test_value})
+                                    headers={test_header: test_value})
                 self.app.update_request(req)
                 res = getattr(controller, method)(req)
                 self.assertEquals(test_errors, [])
@@ -4009,43 +4378,43 @@ class TestAccountController(unittest.TestCase):
         with save_globals():
             self.app.allow_account_management = True
             controller = proxy_server.AccountController(self.app, 'a')
-            proxy_server.http_connect = fake_http_connect(200, 201, 201, 201)
+            set_http_connect(200, 201, 201, 201)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method})
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 201)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
-                    headers={'X-Account-Meta-' +
+                                headers={'X-Account-Meta-' +
                                 ('a' * MAX_META_NAME_LENGTH): 'v'})
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
-                    headers={'X-Account-Meta-' +
+                                headers={'X-Account-Meta-' +
                                 ('a' * (MAX_META_NAME_LENGTH + 1)): 'v'})
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 400)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
-                    headers={'X-Account-Meta-Too-Long':
+                                headers={'X-Account-Meta-Too-Long':
                                 'a' * MAX_META_VALUE_LENGTH})
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
-                    headers={'X-Account-Meta-Too-Long':
+                                headers={'X-Account-Meta-Too-Long':
                                 'a' * (MAX_META_VALUE_LENGTH + 1)})
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 400)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers = {}
             for x in xrange(MAX_META_COUNT):
                 headers['X-Account-Meta-%d' % x] = 'v'
@@ -4054,7 +4423,7 @@ class TestAccountController(unittest.TestCase):
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers = {}
             for x in xrange(MAX_META_COUNT + 1):
                 headers['X-Account-Meta-%d' % x] = 'v'
@@ -4064,7 +4433,7 @@ class TestAccountController(unittest.TestCase):
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 400)
 
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers = {}
             header_value = 'a' * MAX_META_VALUE_LENGTH
             size = 0
@@ -4081,7 +4450,7 @@ class TestAccountController(unittest.TestCase):
             self.app.update_request(req)
             resp = getattr(controller, method)(req)
             self.assertEquals(resp.status_int, 201)
-            proxy_server.http_connect = fake_http_connect(201, 201, 201)
+            set_http_connect(201, 201, 201)
             headers['X-Account-Meta-a'] = \
                 'a' * (MAX_META_OVERALL_SIZE - size)
             req = Request.blank('/a/c', environ={'REQUEST_METHOD': method},
@@ -4095,8 +4464,7 @@ class TestAccountController(unittest.TestCase):
             controller = proxy_server.AccountController(self.app, 'account')
 
             def test_status_map(statuses, expected, **kwargs):
-                proxy_server.http_connect = \
-                    fake_http_connect(*statuses, **kwargs)
+                set_http_connect(*statuses, **kwargs)
                 self.app.memcache.store = {}
                 req = Request.blank('/a', {'REQUEST_METHOD': 'DELETE'})
                 req.content_length = 0
@@ -4123,8 +4491,8 @@ class FakeObjectController(object):
         self.trans_id = 'tx1'
         self.object_ring = FakeRing()
         self.node_timeout = 1
-        self.rate_limit_after_segment = 10
-        self.rate_limit_segments_per_sec = 1
+        self.rate_limit_after_segment = 3
+        self.rate_limit_segments_per_sec = 2
 
     def exception(self, *args):
         self.exception_args = args
@@ -4162,27 +4530,27 @@ class TestSegmentedIterable(unittest.TestCase):
     def test_load_next_segment_unexpected_error(self):
         # Iterator value isn't a dict
         self.assertRaises(Exception,
-            proxy_server.SegmentedIterable(self.controller, None,
-            [None])._load_next_segment)
+                          SegmentedIterable(self.controller, None,
+                                            [None])._load_next_segment)
         self.assert_(self.controller.exception_args[0].startswith(
-            'ERROR: While processing manifest'))
+                     'ERROR: While processing manifest'))
 
     def test_load_next_segment_with_no_segments(self):
         self.assertRaises(StopIteration,
-            proxy_server.SegmentedIterable(self.controller, 'lc',
-            [])._load_next_segment)
+                          SegmentedIterable(self.controller, 'lc',
+                                            [])._load_next_segment)
 
     def test_load_next_segment_with_one_segment(self):
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', [{'name':
-            'o1'}])
+        segit = SegmentedIterable(self.controller, 'lc', [{'name':
+                                  'o1'}])
         segit._load_next_segment()
         self.assertEquals(self.controller.GETorHEAD_base_args[4], '/a/lc/o1')
         data = ''.join(segit.segment_iter)
         self.assertEquals(data, '1')
 
     def test_load_next_segment_with_two_segments(self):
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', [{'name':
-            'o1'}, {'name': 'o2'}])
+        segit = SegmentedIterable(self.controller, 'lc', [{'name':
+                                  'o1'}, {'name': 'o2'}])
         segit._load_next_segment()
         self.assertEquals(self.controller.GETorHEAD_base_args[4], '/a/lc/o1')
         data = ''.join(segit.segment_iter)
@@ -4192,9 +4560,44 @@ class TestSegmentedIterable(unittest.TestCase):
         data = ''.join(segit.segment_iter)
         self.assertEquals(data, '22')
 
+    def test_load_next_segment_rate_limiting(self):
+        sleep_calls = []
+
+        def _stub_sleep(sleepy_time):
+            sleep_calls.append(sleepy_time)
+        orig_sleep = swift.proxy.controllers.obj.sleep
+        try:
+            swift.proxy.controllers.obj.sleep = _stub_sleep
+            segit = SegmentedIterable(
+                self.controller, 'lc', [
+                    {'name': 'o1'}, {'name': 'o2'}, {'name': 'o3'},
+                    {'name': 'o4'}, {'name': 'o5'}])
+
+            # rate_limit_after_segment == 3, so the first 3 segments should
+            # invoke no sleeping.
+            for _ in xrange(3):
+                segit._load_next_segment()
+            self.assertEquals([], sleep_calls)
+            self.assertEquals(self.controller.GETorHEAD_base_args[4],
+                              '/a/lc/o3')
+
+            # Loading of next (4th) segment starts rate-limiting.
+            segit._load_next_segment()
+            self.assertAlmostEqual(0.5, sleep_calls[0], places=2)
+            self.assertEquals(self.controller.GETorHEAD_base_args[4],
+                              '/a/lc/o4')
+
+            sleep_calls = []
+            segit._load_next_segment()
+            self.assertAlmostEqual(0.5, sleep_calls[0], places=2)
+            self.assertEquals(self.controller.GETorHEAD_base_args[4],
+                              '/a/lc/o5')
+        finally:
+            swift.proxy.controllers.obj.sleep = orig_sleep
+
     def test_load_next_segment_with_two_segments_skip_first(self):
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', [{'name':
-            'o1'}, {'name': 'o2'}])
+        segit = SegmentedIterable(self.controller, 'lc', [{'name':
+                                  'o1'}, {'name': 'o2'}])
         segit.segment = 0
         segit.listing.next()
         segit._load_next_segment()
@@ -4203,15 +4606,15 @@ class TestSegmentedIterable(unittest.TestCase):
         self.assertEquals(data, '22')
 
     def test_load_next_segment_with_seek(self):
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', [{'name':
-            'o1'}, {'name': 'o2'}])
+        segit = SegmentedIterable(self.controller, 'lc', [{'name':
+                                  'o1'}, {'name': 'o2'}])
         segit.segment = 0
         segit.listing.next()
         segit.seek = 1
         segit._load_next_segment()
         self.assertEquals(self.controller.GETorHEAD_base_args[4], '/a/lc/o2')
         self.assertEquals(str(self.controller.GETorHEAD_base_args[0].range),
-            'bytes=1-')
+                          'bytes=1-')
         data = ''.join(segit.segment_iter)
         self.assertEquals(data, '2')
 
@@ -4222,33 +4625,33 @@ class TestSegmentedIterable(unittest.TestCase):
 
         self.controller.GETorHEAD_base = local_GETorHEAD_base
         self.assertRaises(Exception,
-            proxy_server.SegmentedIterable(self.controller, 'lc', [{'name':
-            'o1'}])._load_next_segment)
+                          SegmentedIterable(self.controller, 'lc',
+                          [{'name': 'o1'}])._load_next_segment)
         self.assert_(self.controller.exception_args[0].startswith(
-            'ERROR: While processing manifest'))
+                     'ERROR: While processing manifest'))
         self.assertEquals(str(self.controller.exception_info[1]),
-            'Could not load object segment /a/lc/o1: 404')
+                          'Could not load object segment /a/lc/o1: 404')
 
     def test_iter_unexpected_error(self):
         # Iterator value isn't a dict
         self.assertRaises(Exception, ''.join,
-            proxy_server.SegmentedIterable(self.controller, None, [None]))
+                          SegmentedIterable(self.controller, None, [None]))
         self.assert_(self.controller.exception_args[0].startswith(
             'ERROR: While processing manifest'))
 
     def test_iter_with_no_segments(self):
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', [])
+        segit = SegmentedIterable(self.controller, 'lc', [])
         self.assertEquals(''.join(segit), '')
 
     def test_iter_with_one_segment(self):
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', [{'name':
-            'o1'}])
+        segit = SegmentedIterable(self.controller, 'lc', [{'name':
+                                  'o1'}])
         segit.response = Stub()
         self.assertEquals(''.join(segit), '1')
 
     def test_iter_with_two_segments(self):
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', [{'name':
-            'o1'}, {'name': 'o2'}])
+        segit = SegmentedIterable(self.controller, 'lc', [{'name':
+                                  'o1'}, {'name': 'o2'}])
         segit.response = Stub()
         self.assertEquals(''.join(segit), '122')
 
@@ -4259,99 +4662,100 @@ class TestSegmentedIterable(unittest.TestCase):
 
         self.controller.GETorHEAD_base = local_GETorHEAD_base
         self.assertRaises(Exception, ''.join,
-            proxy_server.SegmentedIterable(self.controller, 'lc', [{'name':
-            'o1'}]))
+                          SegmentedIterable(self.controller, 'lc', [{'name':
+                                                                    'o1'}]))
         self.assert_(self.controller.exception_args[0].startswith(
-            'ERROR: While processing manifest'))
+                     'ERROR: While processing manifest'))
         self.assertEquals(str(self.controller.exception_info[1]),
-            'Could not load object segment /a/lc/o1: 404')
+                          'Could not load object segment /a/lc/o1: 404')
 
     def test_app_iter_range_unexpected_error(self):
         # Iterator value isn't a dict
         self.assertRaises(Exception,
-            proxy_server.SegmentedIterable(self.controller, None,
-            [None]).app_iter_range(None, None).next)
+                          SegmentedIterable(self.controller, None,
+                                            [None]).app_iter_range(None,
+                                                                   None).next)
         self.assert_(self.controller.exception_args[0].startswith(
             'ERROR: While processing manifest'))
 
     def test_app_iter_range_with_no_segments(self):
-        self.assertEquals(''.join(proxy_server.SegmentedIterable(
+        self.assertEquals(''.join(SegmentedIterable(
             self.controller, 'lc', []).app_iter_range(None, None)), '')
-        self.assertEquals(''.join(proxy_server.SegmentedIterable(
+        self.assertEquals(''.join(SegmentedIterable(
             self.controller, 'lc', []).app_iter_range(3, None)), '')
-        self.assertEquals(''.join(proxy_server.SegmentedIterable(
+        self.assertEquals(''.join(SegmentedIterable(
             self.controller, 'lc', []).app_iter_range(3, 5)), '')
-        self.assertEquals(''.join(proxy_server.SegmentedIterable(
+        self.assertEquals(''.join(SegmentedIterable(
             self.controller, 'lc', []).app_iter_range(None, 5)), '')
 
     def test_app_iter_range_with_one_segment(self):
         listing = [{'name': 'o1', 'bytes': 1}]
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(None, None)), '1')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         self.assertEquals(''.join(segit.app_iter_range(3, None)), '')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         self.assertEquals(''.join(segit.app_iter_range(3, 5)), '')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(None, 5)), '1')
 
     def test_app_iter_range_with_two_segments(self):
         listing = [{'name': 'o1', 'bytes': 1}, {'name': 'o2', 'bytes': 2}]
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(None, None)), '122')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(1, None)), '22')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(1, 5)), '22')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(None, 2)), '12')
 
     def test_app_iter_range_with_many_segments(self):
         listing = [{'name': 'o1', 'bytes': 1}, {'name': 'o2', 'bytes': 2},
-            {'name': 'o3', 'bytes': 3}, {'name': 'o4', 'bytes': 4}, {'name':
-            'o5', 'bytes': 5}]
+                   {'name': 'o3', 'bytes': 3}, {'name': 'o4', 'bytes': 4},
+                   {'name': 'o5', 'bytes': 5}]
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(None, None)),
-            '122333444455555')
+                          '122333444455555')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(3, None)),
-            '333444455555')
+                          '333444455555')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(5, None)), '3444455555')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(None, 6)), '122333')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(None, 7)), '1223334')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(3, 7)), '3334')
 
-        segit = proxy_server.SegmentedIterable(self.controller, 'lc', listing)
+        segit = SegmentedIterable(self.controller, 'lc', listing)
         segit.response = Stub()
         self.assertEquals(''.join(segit.app_iter_range(5, 7)), '34')
 

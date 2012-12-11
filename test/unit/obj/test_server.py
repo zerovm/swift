@@ -18,8 +18,6 @@
 import cPickle as pickle
 import os
 from random import randrange
-import sys
-import shutil
 import unittest
 from shutil import rmtree
 from StringIO import StringIO
@@ -28,20 +26,22 @@ from tempfile import mkdtemp
 from hashlib import md5
 
 from eventlet import sleep, spawn, wsgi, listen, Timeout
-from swift.obj.server import read_metadata, REVSDATA_STRIDE
-from webob import Request
 from test.unit import FakeLogger
 from test.unit import _getxattr as getxattr
 from test.unit import _setxattr as setxattr
 from test.unit import connect_tcp, readuntil2crlfs
-from swift.obj import server as object_server
+from swift.obj import server as object_server, replicator
 from swift.common import utils
 from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
-                               NullLogger, storage_directory
-from swift.common.exceptions import DiskFileNotExist
-from swift.obj import replicator
-from eventlet import tpool
+                               NullLogger, storage_directory, renamer
 from swift.common.resumable_md5 import rmd5
+from swift.common.exceptions import DiskFileNotExist
+from swift.common import constraints
+from eventlet import tpool
+from swift.obj.server import read_metadata, REVSDATA_STRIDE, write_metadata
+from swift.obj.replicator import invalidate_hash
+from swift.common.swob import Request
+
 
 class TestDiskFile(unittest.TestCase):
     """Test swift.obj.server.DiskFile"""
@@ -94,6 +94,7 @@ class TestDiskFile(unittest.TestCase):
 
     def test_iter_hook(self):
         hook_call_count = [0]
+
         def hook():
             hook_call_count[0] += 1
 
@@ -106,24 +107,39 @@ class TestDiskFile(unittest.TestCase):
 
     def test_iter_hook_append(self):
         hook_call_count = [0]
+
         def hook():
             hook_call_count[0] += 1
 
-        df = self._get_data_file(fsize=64, csize=8, iter_hook=hook)
+        df = self._get_data_file(fsize=64, csize=8, iter_hook=hook,
+            appendable=True)
         self._append_to_file(df, appended_size=65)
         #print repr(df.__dict__)
         for _ in df:
             pass
         self.assertEquals(hook_call_count[0], 17)
 
+        # let's test partially appended file also
+        hook_call_count = [0]
+        fp = open(df.data_file, 'a')
+        fp.write('12345678')
+        fp.close()
+        df = object_server.DiskFile(self.testdir, 'sda1', '0', 'a', 'c',
+            'o', FakeLogger(),
+            keep_data_fp=True, disk_chunk_size=8,
+            iter_hook=hook)
+        for _ in df:
+            pass
+        self.assertEquals(hook_call_count[0], 17)
+
     def test_revision_key(self):
         size = 64
-        df = self._get_data_file(fsize=size, csize=8)
-        for i in range(REVSDATA_STRIDE+1):
+        df = self._get_data_file(fsize=size, csize=8, appendable=True)
+        for i in range(REVSDATA_STRIDE + 1):
             self._append_to_file(df, appended_size=64)
             size += 64
         self.assertEqual(df.get_data_file_size(), size)
-        ndf = self._get_data_file(fsize=size, csize=8)
+        ndf = self._get_data_file(fsize=size, csize=8, appendable=True)
         self.assertEqual(ndf.metadata['ETag'], df.metadata['ETag'])
 
     def test_quarantine(self):
@@ -173,10 +189,10 @@ class TestDiskFile(unittest.TestCase):
 
     def _get_data_file(self, invalid_type=None, obj_name='o',
                        fsize=1024, csize=8, extension='.data', ts=None,
-                       iter_hook=None):
+                       iter_hook=None, appendable=False):
         '''returns a DiskFile'''
         df = object_server.DiskFile(self.testdir, 'sda1', '0', 'a', 'c',
-                                    obj_name, FakeLogger())
+            obj_name, FakeLogger())
         data = '0' * fsize
         etag = rmd5()
         if ts:
@@ -186,20 +202,22 @@ class TestDiskFile(unittest.TestCase):
         with df.mkstemp() as (fd, tmppath):
             os.write(fd, data)
             etag.update(data)
-            state = etag.get_state()
-            etag = etag.hexdigest()
-            rev = None
-            if extension == '.data':
-                rev = {
-                    'md5state': state,
-                    'size': os.fstat(fd).st_size
-                }
             metadata = {
-                'ETag': etag,
+                'ETag': etag.hexdigest(),
                 'X-Timestamp': timestamp,
-                'Content-Length': str(os.fstat(fd).st_size)
+                'Content-Length': str(os.fstat(fd).st_size),
             }
-            df.put(fd, tmppath, metadata, extension=extension, revision=rev)
+            if appendable:
+                if extension == '.data':
+                    rev = {
+                        'md5state': etag.get_state(),
+                        'size': os.fstat(fd).st_size
+                    }
+                    df.put_appendable(fd, tmppath, metadata, revision=rev)
+                else:
+                    raise Exception('only .data files can be appendable')
+            else:
+                df.put(fd, tmppath, metadata, extension=extension)
             if invalid_type == 'ETag':
                 etag = md5()
                 etag.update('1' + '0' * (fsize - 1))
@@ -222,7 +240,7 @@ class TestDiskFile(unittest.TestCase):
         return df
 
     def _append_to_file(self, df, invalid_type=None,
-                       appended_size=1024, ts=None):
+                        appended_size=1024, ts=None):
         data = '0' * appended_size
         if ts:
             timestamp = ts
@@ -246,7 +264,8 @@ class TestDiskFile(unittest.TestCase):
                 'Content-Length': str(new_rev['size']),
                 'X-Revision': df.metadata['X-Revision']
             }
-            df.append(fd, metadata, new_rev)
+            df.put_appendable(fd, df.data_file, metadata, new_rev)
+            df.data_file = os.path.join(df.datadir, timestamp + '.data')
             if invalid_type == 'ETag':
                 etag = md5()
                 etag.update('1' + '0' * (appended_size - 1))
@@ -280,21 +299,21 @@ class TestDiskFile(unittest.TestCase):
         self.assertFalse(df.quarantined_dir)
 
     def test_quarantine_valids_apended(self):
-        df = self._get_data_file(obj_name='1')
+        df = self._get_data_file(obj_name='1', appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         for chunk in df:
             pass
         self.assertFalse(df.quarantined_dir)
 
-        df = self._get_data_file(obj_name='2', csize=1)
+        df = self._get_data_file(obj_name='2', csize=1, appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         for chunk in df:
             pass
         self.assertFalse(df.quarantined_dir)
 
-        df = self._get_data_file(obj_name='3', csize=100000)
+        df = self._get_data_file(obj_name='3', csize=100000, appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         for chunk in df:
@@ -345,40 +364,40 @@ class TestDiskFile(unittest.TestCase):
         self.assertEquals(bool(df.quarantined_dir), expected_quar)
 
     def run_quarantine_invalids_appended(self, invalid_type):
-        df = self._get_data_file(obj_name='1')
+        df = self._get_data_file(obj_name='1', appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         self._append_to_file(df, invalid_type=invalid_type)
         for chunk in df:
             pass
         self.assertTrue(df.quarantined_dir)
-        df = self._get_data_file(obj_name='2', csize=1)
+        df = self._get_data_file(obj_name='2', csize=1, appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         self._append_to_file(df, invalid_type=invalid_type)
         for chunk in df:
             pass
         self.assertTrue(df.quarantined_dir)
-        df = self._get_data_file(obj_name='3', csize=100000)
+        df = self._get_data_file(obj_name='3', csize=100000, appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         self._append_to_file(df, invalid_type=invalid_type)
         for chunk in df:
             pass
         self.assertTrue(df.quarantined_dir)
-        df = self._get_data_file(obj_name='4')
+        df = self._get_data_file(obj_name='4', appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         self._append_to_file(df, invalid_type=invalid_type)
         self.assertFalse(df.quarantined_dir)
-        df = self._get_data_file(obj_name='5')
+        df = self._get_data_file(obj_name='5', appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         self._append_to_file(df, invalid_type=invalid_type)
         for chunk in df.app_iter_range(0, df.unit_test_len):
             pass
         self.assertTrue(df.quarantined_dir)
-        df = self._get_data_file(obj_name='6')
+        df = self._get_data_file(obj_name='6', appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         self._append_to_file(df, invalid_type=invalid_type)
@@ -390,21 +409,21 @@ class TestDiskFile(unittest.TestCase):
         # in a quarantine, even if the whole file isn't check-summed
         if invalid_type in ('Zero-Byte', 'Content-Length'):
             expected_quar = True
-        df = self._get_data_file(obj_name='7')
+        df = self._get_data_file(obj_name='7', appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         self._append_to_file(df, invalid_type=invalid_type)
         for chunk in df.app_iter_range(1, df.unit_test_len):
             pass
         self.assertEquals(bool(df.quarantined_dir), expected_quar)
-        df = self._get_data_file(obj_name='8')
+        df = self._get_data_file(obj_name='8', appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         self._append_to_file(df, invalid_type=invalid_type)
         for chunk in df.app_iter_range(0, df.unit_test_len - 1):
             pass
         self.assertEquals(bool(df.quarantined_dir), expected_quar)
-        df = self._get_data_file(obj_name='8')
+        df = self._get_data_file(obj_name='8', appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         self._append_to_file(df, invalid_type=invalid_type)
@@ -423,11 +442,11 @@ class TestDiskFile(unittest.TestCase):
         self.run_quarantine_invalids_appended('Zero-Byte')
 
     def test_failed_append(self):
-        df = self._get_data_file(obj_name='1')
+        df = self._get_data_file(obj_name='1', appendable=True)
         for i in range(randrange(REVSDATA_STRIDE * 2)):
             self._append_to_file(df, appended_size=64)
         fp = open(df.data_file, 'a')
-        fp.write('0'*1024)
+        fp.write('0' * 1024)
         fp.close()
         for chunk in df:
             pass
@@ -784,15 +803,72 @@ class TestObjectController(unittest.TestCase):
                            'Content-Length': '6',
                            'ETag': '0b4c12d7e0a73840c1c4f148fda3b037',
                            'Content-Type': 'application/octet-stream',
-                           'name': '/a/c/o',
-                           'X-Revision': '0'})
+                           'name': '/a/c/o'})
+
+    def test_POST_append_errors(self):
+        timestamp1 = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp1,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Revision': '0'})
+        req.body = 'VERIFY'
+        resp = self.object_controller.PUT(req)
+        self.assertEqual(resp.status_int, 201)
+
+        timestamp2 = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': timestamp2,
+                     'Content-Length': '5',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Append-To': 'new'})
+        req.body = ' MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEqual(resp.status_int, 422)
+
+        timestamp2 = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': timestamp2,
+                     'Content-Length': '5',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Append-To': '1'})
+        req.body = ' MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEqual(resp.status_int, 400)
+        self.assertEqual(resp.body, 'Revision too new')
+
+        timestamp2 = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': timestamp2,
+                     'Content-Length': '5',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Append-To': '-1'})
+        req.body = ' MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEquals(resp.status_int, 202)
+
+        timestamp2 = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': timestamp2,
+                     'Content-Length': '5',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Append-To': '0'})
+        req.body = ' MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEqual(resp.status_int, 400)
+        self.assertEqual(resp.body, 'Revision too old')
 
     def test_POST_simple_append(self):
         timestamp1 = normalize_timestamp(time())
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
             headers={'X-Timestamp': timestamp1,
                      'Content-Length': '6',
-                     'Content-Type': 'application/octet-stream'})
+                     'Content-Type': 'application/octet-stream',
+                     'X-Revision': '0'})
         req.body = 'VERIFY'
         resp = self.object_controller.PUT(req)
         self.assertEquals(resp.status_int, 201)
@@ -811,7 +887,8 @@ class TestObjectController(unittest.TestCase):
                  'X-Revision': '0'})
 
         timestamp2 = normalize_timestamp(time())
-        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'POST'},
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
             headers={'X-Timestamp': timestamp2,
                      'Content-Length': '5',
                      'Content-Type': 'application/octet-stream',
@@ -834,7 +911,78 @@ class TestObjectController(unittest.TestCase):
                  'X-Revision': '1'})
 
         timestamp3 = normalize_timestamp(time())
-        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'POST'},
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': timestamp3,
+                     'Content-Length': '10',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Append-To': '1'})
+        req.body = ' EVEN MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEquals(resp.status_int, 202)
+        objfile = os.path.join(self.testdir, 'sda1',
+            storage_directory(object_server.DATADIR, 'p',
+                hash_path('a', 'c', 'o')),
+            timestamp3 + '.data')
+        self.assert_(os.path.isfile(objfile))
+        self.assertEquals(open(objfile).read(), 'VERIFY MORE EVEN MORE')
+        self.assertEquals(read_metadata(objfile),
+                {'X-Timestamp': timestamp3,
+                 'Content-Length': '21',
+                 'ETag': 'b6079cddce95bd0a52c52ab167351b96',
+                 'Content-Type': 'application/octet-stream',
+                 'name': '/a/c/o',
+                 'X-Revision': '2'})
+
+    def test_POST_append_to_old_file(self):
+        timestamp1 = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp1,
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream'})
+        req.body = 'VERIFY'
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+        objfile = os.path.join(self.testdir, 'sda1',
+            storage_directory(object_server.DATADIR, 'p',
+                hash_path('a', 'c', 'o')),
+            timestamp1 + '.data')
+        self.assert_(os.path.isfile(objfile))
+        self.assertEquals(open(objfile).read(), 'VERIFY')
+        self.assertEquals(read_metadata(objfile),
+                {'X-Timestamp': timestamp1,
+                 'Content-Length': '6',
+                 'ETag': '0b4c12d7e0a73840c1c4f148fda3b037',
+                 'Content-Type': 'application/octet-stream',
+                 'name': '/a/c/o'})
+
+        timestamp2 = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': timestamp2,
+                     'Content-Length': '5',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Append-To': '-1'})
+        req.body = ' MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEquals(resp.status_int, 202)
+        objfile = os.path.join(self.testdir, 'sda1',
+            storage_directory(object_server.DATADIR, 'p',
+                hash_path('a', 'c', 'o')),
+            timestamp2 + '.data')
+        self.assert_(os.path.isfile(objfile))
+        self.assertEquals(open(objfile).read(), 'VERIFY MORE')
+        self.assertEquals(read_metadata(objfile),
+                {'X-Timestamp': timestamp2,
+                 'Content-Length': '11',
+                 'ETag': 'b00eb050e3ed7f91dfe595c0f0051dd5',
+                 'Content-Type': 'application/octet-stream',
+                 'name': '/a/c/o',
+                 'X-Revision': '1'})
+
+        timestamp3 = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
             headers={'X-Timestamp': timestamp3,
                      'Content-Length': '10',
                      'Content-Type': 'application/octet-stream',
@@ -885,8 +1033,41 @@ class TestObjectController(unittest.TestCase):
                            'ETag': 'b381a4c5dab1eaa1eb9711fa647cd039',
                            'Content-Type': 'text/plain',
                            'name': '/a/c/o',
-                           'Content-Encoding': 'gzip',
-                           'X-Revision': '0'})
+                           'Content-Encoding': 'gzip'})
+
+    def test_PUT_overwrite_appendable(self):
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'Content-Length': '6',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Revision': '0'})
+        req.body = 'VERIFY'
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+        sleep(.00001)
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'text/plain',
+                     'Content-Encoding': 'gzip',
+                     'X-Revision': '0'})
+        req.body = 'VERIFY TWO'
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+        objfile = os.path.join(self.testdir, 'sda1',
+            storage_directory(object_server.DATADIR, 'p',
+                hash_path('a', 'c', 'o')),
+            timestamp + '.data')
+        self.assert_(os.path.isfile(objfile))
+        self.assertEquals(open(objfile).read(), 'VERIFY TWO')
+        self.assertEquals(read_metadata(objfile),
+                {'X-Timestamp': timestamp,
+                 'Content-Length': '10',
+                 'ETag': 'b381a4c5dab1eaa1eb9711fa647cd039',
+                 'Content-Type': 'text/plain',
+                 'name': '/a/c/o',
+                 'Content-Encoding': 'gzip',
+                 'X-Revision': '0'})
 
     def test_PUT_no_etag(self):
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -903,6 +1084,24 @@ class TestObjectController(unittest.TestCase):
                                     'ETag': 'invalid'})
         req.body = 'test'
         resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 422)
+
+    def test_append_invalid_etag(self):
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'Content-Type': 'text/plain'})
+        req.body = 'test'
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'Content-Type': 'text/plain',
+                     'ETag': 'invalid',
+                     'X-Append-To': '-1'})
+        req.body = 'test'
+        resp = self.object_controller.POST(req)
         self.assertEquals(resp.status_int, 422)
 
     def test_PUT_user_metadata(self):
@@ -929,8 +1128,7 @@ class TestObjectController(unittest.TestCase):
                            'Content-Type': 'text/plain',
                            'name': '/a/c/o',
                            'X-Object-Meta-1': 'One',
-                           'X-Object-Meta-Two': 'Two',
-                           'X-Revision':'0'})
+                           'X-Object-Meta-Two': 'Two'})
 
     def test_PUT_container_connection(self):
 
@@ -1064,6 +1262,74 @@ class TestObjectController(unittest.TestCase):
         resp = self.object_controller.HEAD(req)
         self.assertEquals(resp.status_int, 404)
 
+    def test_HEAD_revisions(self):
+        """ Test HEAD with revision info """
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'application/x-test'})
+        req.body = 'VERIFY'
+        resp = self.object_controller.PUT(req)
+        self.assertEqual(resp.status_int, 201)
+
+        req = Request.blank('/sda1/p/a/c/o',
+            headers={'x-revision': -1})
+        resp = self.object_controller.HEAD(req)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers['x-revision'], '0')
+        self.assertEquals(resp.content_length, 6)
+        self.assertEquals(resp.content_type, 'application/x-test')
+        self.assertEquals(resp.headers['content-length'], '6')
+        self.assertEquals(resp.headers['content-type'], 'application/x-test')
+        self.assertEquals(resp.headers['last-modified'],
+            strftime('%a, %d %b %Y %H:%M:%S GMT', gmtime(float(timestamp))))
+        self.assertEquals(resp.headers['etag'],
+            '"0b4c12d7e0a73840c1c4f148fda3b037"')
+
+        timestamp2 = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': timestamp2,
+                     'Content-Length': '5',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Append-To': '-1'})
+        req.body = ' MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEqual(resp.status_int, 202)
+
+        req = Request.blank('/sda1/p/a/c/o',
+            headers={'x-revision': 0})
+        resp = self.object_controller.HEAD(req)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.content_length, len('VERIFY'))
+        self.assertEqual(resp.headers['x-revision'], '0')
+
+        req = Request.blank('/sda1/p/a/c/o',
+            headers={'x-revision': -1})
+        resp = self.object_controller.HEAD(req)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers['x-revision'], '1')
+        self.assertEquals(resp.content_length, 11)
+        self.assertEquals(resp.content_type, 'application/x-test')
+        self.assertEquals(resp.headers['content-length'], '11')
+        self.assertEquals(resp.headers['content-type'], 'application/x-test')
+        self.assertEquals(resp.headers['last-modified'],
+            strftime('%a, %d %b %Y %H:%M:%S GMT', gmtime(float(timestamp2))))
+        self.assertEquals(resp.headers['etag'],
+            '"b00eb050e3ed7f91dfe595c0f0051dd5"')
+
+        req = Request.blank('/sda1/p/a/c/o',
+            headers={'x-revision': 1})
+        resp = self.object_controller.HEAD(req)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.content_length, len('VERIFY MORE'))
+        self.assertEqual(resp.headers['x-revision'], '1')
+
+        req = Request.blank('/sda1/p/a/c/o',
+            headers={'x-revision': 2})
+        resp = self.object_controller.HEAD(req)
+        self.assertEquals(resp.status_int, 404)
+
     def test_HEAD_quarantine_zbyte(self):
         """ Test swift.object_server.ObjectController.GET """
         timestamp = normalize_timestamp(time())
@@ -1177,6 +1443,82 @@ class TestObjectController(unittest.TestCase):
         self.assertEquals(resp.status_int, 204)
 
         req = Request.blank('/sda1/p/a/c/o')
+        resp = self.object_controller.GET(req)
+        self.assertEquals(resp.status_int, 404)
+
+    def test_GET_revisions(self):
+        """ Test GET with revision info """
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'application/x-test',
+                     'X-Object-Meta-1': 'One',
+                     'X-Object-Meta-Two': 'Two'})
+        req.body = 'VERIFY'
+        resp = self.object_controller.PUT(req)
+        self.assertEqual(resp.status_int, 201)
+
+        req = Request.blank('/sda1/p/a/c/o',
+            headers={'x-revision': -1})
+        resp = self.object_controller.GET(req)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers['x-revision'], '0')
+        self.assertEquals(resp.body, 'VERIFY')
+        self.assertEquals(resp.content_length, 6)
+        self.assertEquals(resp.content_type, 'application/x-test')
+        self.assertEquals(resp.headers['content-length'], '6')
+        self.assertEquals(resp.headers['content-type'], 'application/x-test')
+        self.assertEquals(resp.headers['last-modified'],
+            strftime('%a, %d %b %Y %H:%M:%S GMT', gmtime(float(timestamp))))
+        self.assertEquals(resp.headers['etag'],
+            '"0b4c12d7e0a73840c1c4f148fda3b037"')
+        self.assertEquals(resp.headers['x-object-meta-1'], 'One')
+        self.assertEquals(resp.headers['x-object-meta-two'], 'Two')
+
+        timestamp2 = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': timestamp2,
+                     'Content-Length': '5',
+                     'Content-Type': 'application/octet-stream',
+                     'X-Append-To': '-1'})
+        req.body = ' MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEqual(resp.status_int, 202)
+
+        req = Request.blank('/sda1/p/a/c/o',
+            headers={'x-revision': 0})
+        resp = self.object_controller.GET(req)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.content_length, len('VERIFY'))
+        self.assertEqual(resp.headers['x-revision'], '0')
+
+        req = Request.blank('/sda1/p/a/c/o',
+            headers={'x-revision': -1})
+        resp = self.object_controller.GET(req)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.headers['x-revision'], '1')
+        self.assertEquals(resp.body, 'VERIFY MORE')
+        self.assertEquals(resp.content_length, 11)
+        self.assertEquals(resp.content_type, 'application/x-test')
+        self.assertEquals(resp.headers['content-length'], '11')
+        self.assertEquals(resp.headers['content-type'], 'application/x-test')
+        self.assertEquals(resp.headers['last-modified'],
+            strftime('%a, %d %b %Y %H:%M:%S GMT', gmtime(float(timestamp2))))
+        self.assertEquals(resp.headers['etag'],
+            '"b00eb050e3ed7f91dfe595c0f0051dd5"')
+        self.assertEquals(resp.headers['x-object-meta-1'], 'One')
+        self.assertEquals(resp.headers['x-object-meta-two'], 'Two')
+
+        req = Request.blank('/sda1/p/a/c/o',
+            headers={'x-revision': 1})
+        resp = self.object_controller.GET(req)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.content_length, len('VERIFY MORE'))
+        self.assertEqual(resp.headers['x-revision'], '1')
+
+        req = Request.blank('/sda1/p/a/c/o',
+            headers={'x-revision': 2})
         resp = self.object_controller.GET(req)
         self.assertEquals(resp.status_int, 404)
 
@@ -1297,7 +1639,8 @@ class TestObjectController(unittest.TestCase):
         resp = self.object_controller.GET(req)
         self.assertEquals(resp.status_int, 200)
 
-        since = strftime('%a, %d %b %Y %H:%M:%S GMT', gmtime(float(timestamp)))
+        since = strftime('%a, %d %b %Y %H:%M:%S GMT',
+            gmtime(float(timestamp) + 1))
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'},
                             headers={'If-Modified-Since': since})
         resp = self.object_controller.GET(req)
@@ -1369,13 +1712,45 @@ class TestObjectController(unittest.TestCase):
         etag.update('VERIF')
         etag = etag.hexdigest()
         metadata = {'X-Timestamp': timestamp,
-                    'Content-Length': 6, 'ETag': etag, 'X-Revision': 0}
+                    'Content-Length': 6, 'ETag': etag}
         object_server.write_metadata(file.fp, metadata)
         self.assertEquals(os.listdir(file.datadir)[0], file_name)
         req = Request.blank('/sda1/p/a/c/o')
         resp = self.object_controller.GET(req)
         quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
                        os.path.basename(os.path.dirname(file.data_file)))
+        self.assertEquals(os.listdir(file.datadir)[0], file_name)
+        body = resp.body  # actually does quarantining
+        self.assertEquals(body, 'VERIFY')
+        self.assertEquals(os.listdir(quar_dir)[0], file_name)
+        req = Request.blank('/sda1/p/a/c/o')
+        resp = self.object_controller.GET(req)
+        self.assertEquals(resp.status_int, 404)
+
+    def test_GET_quarantine_appendable(self):
+        """ Test swift.object_server.ObjectController.GET """
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'application/x-test',
+                     'X-Revision': '0'})
+        req.body = 'VERIFY'
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+        file = object_server.DiskFile(self.testdir, 'sda1', 'p', 'a', 'c', 'o',
+            FakeLogger(), keep_data_fp=True)
+        file_name = os.path.basename(file.data_file)
+        etag = md5()
+        etag.update('VERIF')
+        etag = etag.hexdigest()
+        metadata = {'X-Timestamp': timestamp,
+                    'Content-Length': 6, 'ETag': etag, 'X-Revision': 0}
+        object_server.write_metadata(file.fp, metadata)
+        self.assertEquals(os.listdir(file.datadir)[0], file_name)
+        req = Request.blank('/sda1/p/a/c/o')
+        resp = self.object_controller.GET(req)
+        quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
+            os.path.basename(os.path.dirname(file.data_file)))
         self.assertEquals(os.listdir(file.datadir)[0], file_name)
         body = resp.body  # actually does quarantining
         self.assertEquals(body, 'VERIFY')
@@ -1427,7 +1802,7 @@ class TestObjectController(unittest.TestCase):
         etag.update('VERIF')
         etag = etag.hexdigest()
         metadata = {'X-Timestamp': timestamp,
-                    'Content-Length': 6, 'ETag': etag, 'X-Revision': 0}
+                    'Content-Length': 6, 'ETag': etag}
         object_server.write_metadata(file.fp, metadata)
         self.assertEquals(os.listdir(file.datadir)[0], file_name)
         req = Request.blank('/sda1/p/a/c/o')
@@ -1456,6 +1831,59 @@ class TestObjectController(unittest.TestCase):
         resp = self.object_controller.GET(req)
         quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
                        os.path.basename(os.path.dirname(file.data_file)))
+        self.assertEquals(os.listdir(file.datadir)[0], file_name)
+        body = resp.body
+        self.assertTrue(os.path.isdir(quar_dir))
+        req = Request.blank('/sda1/p/a/c/o')
+        resp = self.object_controller.GET(req)
+        self.assertEquals(resp.status_int, 404)
+
+    def test_GET_quarantine_range_appendable(self):
+        """ Test swift.object_server.ObjectController.GET """
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'application/x-test',
+                     'X-Revision': '0'})
+        req.body = 'VERIFY'
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+        file = object_server.DiskFile(self.testdir, 'sda1', 'p', 'a', 'c', 'o',
+            FakeLogger(), keep_data_fp=True)
+        file_name = os.path.basename(file.data_file)
+        etag = md5()
+        etag.update('VERIF')
+        etag = etag.hexdigest()
+        metadata = {'X-Timestamp': timestamp,
+                    'Content-Length': 6, 'ETag': etag, 'X-Revision': 0}
+        object_server.write_metadata(file.fp, metadata)
+        self.assertEquals(os.listdir(file.datadir)[0], file_name)
+        req = Request.blank('/sda1/p/a/c/o')
+        req.range = 'bytes=0-4'  # partial
+        resp = self.object_controller.GET(req)
+        quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
+            os.path.basename(os.path.dirname(file.data_file)))
+        body = resp.body
+        self.assertEquals(os.listdir(file.datadir)[0], file_name)
+        self.assertFalse(os.path.isdir(quar_dir))
+        req = Request.blank('/sda1/p/a/c/o')
+        resp = self.object_controller.GET(req)
+        self.assertEquals(resp.status_int, 200)
+
+        req = Request.blank('/sda1/p/a/c/o')
+        req.range = 'bytes=1-6'  # partial
+        resp = self.object_controller.GET(req)
+        quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
+            os.path.basename(os.path.dirname(file.data_file)))
+        body = resp.body
+        self.assertEquals(os.listdir(file.datadir)[0], file_name)
+        self.assertFalse(os.path.isdir(quar_dir))
+
+        req = Request.blank('/sda1/p/a/c/o')
+        req.range = 'bytes=0-14'  # full
+        resp = self.object_controller.GET(req)
+        quar_dir = os.path.join(self.testdir, 'sda1', 'quarantined', 'objects',
+            os.path.basename(os.path.dirname(file.data_file)))
         self.assertEquals(os.listdir(file.datadir)[0], file_name)
         body = resp.body
         self.assertTrue(os.path.isdir(quar_dir))
@@ -1594,11 +2022,14 @@ class TestObjectController(unittest.TestCase):
         inbuf = StringIO()
         errbuf = StringIO()
         outbuf = StringIO()
+
         def start_response(*args):
             outbuf.writelines(args)
-        self.object_controller.__call__({'REQUEST_METHOD': 'method_doesnt_exist',
-                                         'PATH_INFO': '/sda1/p/a/c/o'},
-                                        start_response)
+
+        self.object_controller.__call__(
+            {'REQUEST_METHOD': 'method_doesnt_exist',
+             'PATH_INFO': '/sda1/p/a/c/o'},
+            start_response)
         self.assertEquals(errbuf.getvalue(), '')
         self.assertEquals(outbuf.getvalue()[:4], '405 ')
 
@@ -1606,8 +2037,10 @@ class TestObjectController(unittest.TestCase):
         inbuf = StringIO()
         errbuf = StringIO()
         outbuf = StringIO()
+
         def start_response(*args):
             outbuf.writelines(args)
+
         self.object_controller.__call__({'REQUEST_METHOD': '__init__',
                                          'PATH_INFO': '/sda1/p/a/c/o'},
                                         start_response)
@@ -1640,7 +2073,8 @@ class TestObjectController(unittest.TestCase):
 
     def test_max_object_name_length(self):
         timestamp = normalize_timestamp(time())
-        req = Request.blank('/sda1/p/a/c/' + ('1' * 1024),
+        max_name_len = constraints.MAX_OBJECT_NAME_LENGTH
+        req = Request.blank('/sda1/p/a/c/' + ('1' * max_name_len),
                 environ={'REQUEST_METHOD': 'PUT'},
                 headers={'X-Timestamp': timestamp,
                          'Content-Length': '4',
@@ -1648,7 +2082,7 @@ class TestObjectController(unittest.TestCase):
         req.body = 'DATA'
         resp = self.object_controller.PUT(req)
         self.assertEquals(resp.status_int, 201)
-        req = Request.blank('/sda1/p/a/c/' + ('2' * 1025),
+        req = Request.blank('/sda1/p/a/c/' + ('2' * (max_name_len + 1)),
                 environ={'REQUEST_METHOD': 'PUT'},
                 headers={'X-Timestamp': timestamp,
                          'Content-Length': '4',
@@ -1685,6 +2119,14 @@ class TestObjectController(unittest.TestCase):
         resp = self.object_controller.PUT(req)
         self.assertEquals(resp.status_int, 408)
 
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST', 'wsgi.input': SlowBody()},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'Content-Length': '4', 'Content-Type': 'text/plain',
+                     'X-Append-To': '-1'})
+        resp = self.object_controller.POST(req)
+        self.assertEquals(resp.status_int, 408)
+
     def test_short_body(self):
 
         class ShortBody():
@@ -1703,6 +2145,22 @@ class TestObjectController(unittest.TestCase):
             headers={'X-Timestamp': normalize_timestamp(time()),
                      'Content-Length': '4', 'Content-Type': 'text/plain'})
         resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 499)
+
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'Content-Length': '4', 'Content-Type': 'text/plain'})
+        req.body = 'TEST'
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST', 'wsgi.input': ShortBody()},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'Content-Length': '4', 'Content-Type': 'text/plain',
+                     'X-Append-To': '-1'})
+        resp = self.object_controller.POST(req)
         self.assertEquals(resp.status_int, 499)
 
     def test_bad_sinces(self):
@@ -1763,12 +2221,53 @@ class TestObjectController(unittest.TestCase):
         self.assertEquals(read_metadata(objfile), {'X-Timestamp': timestamp,
             'Content-Length': '0', 'Content-Type': 'text/plain', 'name':
             '/a/c/o', 'X-Object-Manifest': 'c/o/', 'ETag':
-            'd41d8cd98f00b204e9800998ecf8427e',
-            'X-Revision':'0'})
+            'd41d8cd98f00b204e9800998ecf8427e'})
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
         resp = self.object_controller.GET(req)
         self.assertEquals(resp.status_int, 200)
         self.assertEquals(resp.headers.get('x-object-manifest'), 'c/o/')
+
+    def test_manifest_header(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': timestamp,
+                     'Content-Type': 'text/plain',
+                     'Content-Length': '0',
+                     'X-Object-Manifest': 'c/o/',
+                     'X-Revision': '0'})
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+        objfile = os.path.join(self.testdir, 'sda1',
+            storage_directory(object_server.DATADIR, 'p', hash_path('a', 'c',
+                'o')), timestamp + '.data')
+        self.assert_(os.path.isfile(objfile))
+        self.assertEquals(read_metadata(objfile), {'X-Timestamp': timestamp,
+            'Content-Length': '0', 'Content-Type': 'text/plain', 'name':
+            '/a/c/o', 'X-Object-Manifest': 'c/o/', 'ETag':
+            'd41d8cd98f00b204e9800998ecf8427e',
+            'X-Revision': '0'})
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+        resp = self.object_controller.GET(req)
+        self.assertEquals(resp.status_int, 200)
+        self.assertEquals(resp.headers.get('x-object-manifest'), 'c/o/')
+
+    def test_manifest_head_request(self):
+        timestamp = normalize_timestamp(time())
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                headers={'X-Timestamp': timestamp,
+                         'Content-Type': 'text/plain',
+                         'Content-Length': '0',
+                         'X-Object-Manifest': 'c/o/'})
+        req.body = 'hi'
+        resp = self.object_controller.PUT(req)
+        objfile = os.path.join(self.testdir, 'sda1',
+            storage_directory(object_server.DATADIR, 'p', hash_path('a', 'c',
+            'o')), timestamp + '.data')
+        self.assert_(os.path.isfile(objfile))
+        req = Request.blank('/sda1/p/a/c/o',
+                            environ={'REQUEST_METHOD': 'HEAD'})
+        resp = self.object_controller.GET(req)
+        self.assertEquals(resp.body, '')
 
     def test_async_update_http_connect(self):
         given_args = []
@@ -1889,6 +2388,41 @@ class TestObjectController(unittest.TestCase):
              'x-trans-id': '-'},
             'sda1'])
 
+    def test_delete_at_negative(self):
+        # Test negative is reset to 0
+        given_args = []
+
+        def fake_async_update(*args):
+            given_args.extend(args)
+
+        self.object_controller.async_update = fake_async_update
+        self.object_controller.delete_at_update(
+            'PUT', -2, 'a', 'c', 'o', {'x-timestamp': '1'}, 'sda1')
+        self.assertEquals(given_args, [
+            'PUT', '.expiring_objects', '0', '0-a/c/o', None, None, None,
+            {'x-size': '0', 'x-etag': 'd41d8cd98f00b204e9800998ecf8427e',
+             'x-content-type': 'text/plain', 'x-timestamp': '1',
+             'x-trans-id': '-'},
+            'sda1'])
+
+    def test_delete_at_cap(self):
+        # Test past cap is reset to cap
+        given_args = []
+
+        def fake_async_update(*args):
+            given_args.extend(args)
+
+        self.object_controller.async_update = fake_async_update
+        self.object_controller.delete_at_update(
+            'PUT', 12345678901, 'a', 'c', 'o', {'x-timestamp': '1'}, 'sda1')
+        self.assertEquals(given_args, [
+            'PUT', '.expiring_objects', '9999936000', '9999999999-a/c/o', None,
+            None, None,
+            {'x-size': '0', 'x-etag': 'd41d8cd98f00b204e9800998ecf8427e',
+             'x-content-type': 'text/plain', 'x-timestamp': '1',
+             'x-trans-id': '-'},
+            'sda1'])
+
     def test_delete_at_update_put_with_info(self):
         given_args = []
 
@@ -1990,6 +2524,91 @@ class TestObjectController(unittest.TestCase):
             {'X-Delete-At': delete_at_timestamp2,
              'Content-Type': 'application/x-test',
              'X-Timestamp': timestamp2, 'Host': 'localhost:80'},
+            'sda1'])
+
+    def test_append_calls_delete_at(self):
+        given_args = []
+
+        def fake_delete_at_update(*args):
+            given_args.extend(args)
+
+        self.object_controller.delete_at_update = fake_delete_at_update
+
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'Content-Length': '4',
+                     'Content-Type': 'application/x-test'})
+        req.body = 'TEST'
+        resp = self.object_controller.PUT(req)
+        self.assertEquals(resp.status_int, 201)
+        self.assertEquals(given_args, [])
+
+        sleep(.00001)
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': normalize_timestamp(time()),
+                     'Content-Type': 'application/octet-stream',
+                     'Content-Length': '5',
+                     'X-Append-To': '-1'})
+        req.body = ' MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEquals(resp.status_int, 202)
+        self.assertEquals(given_args, [])
+
+        sleep(.00001)
+        timestamp1 = normalize_timestamp(time())
+        delete_at_timestamp1 = str(int(time() + 1000))
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': timestamp1,
+                     'X-Delete-At': delete_at_timestamp1,
+                     'Content-Type': 'application/octet-stream',
+                     'Content-Length': '5',
+                     'X-Append-To': '-1'})
+        req.body = ' MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEquals(resp.status_int, 202)
+        self.assertEquals(given_args, [
+            'PUT', int(delete_at_timestamp1), 'a', 'c', 'o',
+            {'X-Delete-At': delete_at_timestamp1,
+             'Content-Type': 'application/octet-stream',
+             'X-Timestamp': timestamp1,
+             'Host': 'localhost:80',
+             'Content-Length': '5',
+             'X-Append-To': '-1'},
+            'sda1'])
+
+        while given_args:
+            given_args.pop()
+
+        sleep(.00001)
+        timestamp2 = normalize_timestamp(time())
+        delete_at_timestamp2 = str(int(time() + 2000))
+        req = Request.blank('/sda1/p/a/c/o',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': timestamp2,
+                     'X-Delete-At': delete_at_timestamp2,
+                     'Content-Type': 'application/octet-stream',
+                     'Content-Length': '5',
+                     'X-Append-To': '-1'})
+        req.body = ' MORE'
+        resp = self.object_controller.POST(req)
+        self.assertEquals(resp.status_int, 202)
+        self.assertEquals(given_args, [
+            'PUT', int(delete_at_timestamp2), 'a', 'c', 'o',
+            {'X-Delete-At': delete_at_timestamp2,
+             'Content-Type': 'application/octet-stream',
+             'X-Timestamp': timestamp2, 'Host': 'localhost:80',
+             'Content-Length': '5', 'X-Append-To': '-1'},
+            'sda1',
+            'DELETE', int(delete_at_timestamp1), 'a', 'c', 'o',
+            # This 2 timestamp is okay because it's ignored since it's just
+            # part of the current request headers. The above 1 timestamp is the
+            # important one.
+            {'X-Delete-At': delete_at_timestamp2,
+             'Content-Type': 'application/octet-stream',
+             'X-Timestamp': timestamp2, 'Host': 'localhost:80',
+             'Content-Length': '5', 'X-Append-To': '-1'},
             'sda1'])
 
     def test_PUT_calls_delete_at(self):
@@ -2337,13 +2956,11 @@ class TestObjectController(unittest.TestCase):
         def fake_get_hashes(*args, **kwargs):
             return 0, {1: 2}
 
-        def my_tpool_execute(*args, **kwargs):
-            func = args[0]
-            args = args[1:]
+        def my_tpool_execute(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        was_get_hashes = replicator.get_hashes
-        replicator.get_hashes = fake_get_hashes
+        was_get_hashes = object_server.get_hashes
+        object_server.get_hashes = fake_get_hashes
         was_tpool_exe = tpool.execute
         tpool.execute = my_tpool_execute
         try:
@@ -2356,20 +2973,18 @@ class TestObjectController(unittest.TestCase):
             self.assertEquals(p_data, {1: 2})
         finally:
             tpool.execute = was_tpool_exe
-            replicator.get_hashes = was_get_hashes
+            object_server.get_hashes = was_get_hashes
 
     def test_REPLICATE_timeout(self):
 
         def fake_get_hashes(*args, **kwargs):
             raise Timeout()
 
-        def my_tpool_execute(*args, **kwargs):
-            func = args[0]
-            args = args[1:]
+        def my_tpool_execute(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        was_get_hashes = replicator.get_hashes
-        replicator.get_hashes = fake_get_hashes
+        was_get_hashes = object_server.get_hashes
+        object_server.get_hashes = fake_get_hashes
         was_tpool_exe = tpool.execute
         tpool.execute = my_tpool_execute
         try:
@@ -2379,7 +2994,41 @@ class TestObjectController(unittest.TestCase):
             self.assertRaises(Timeout, self.object_controller.REPLICATE, req)
         finally:
             tpool.execute = was_tpool_exe
-            replicator.get_hashes = was_get_hashes
+            object_server.get_hashes = was_get_hashes
+
+    def test_PUT_with_full_drive(self):
+
+        class IgnoredBody():
+
+            def __init__(self):
+                self.read_called = False
+
+            def read(self, size=-1):
+                if not self.read_called:
+                    self.read_called = True
+                    return 'VERIFY'
+                return ''
+
+        def fake_fallocate(fd, size):
+            raise OSError(42, 'Unable to fallocate(%d)' % size)
+
+        orig_fallocate = object_server.fallocate
+        try:
+            object_server.fallocate = fake_fallocate
+            timestamp = normalize_timestamp(time())
+            body_reader = IgnoredBody()
+            req = Request.blank('/sda1/p/a/c/o',
+                    environ={'REQUEST_METHOD': 'PUT',
+                             'wsgi.input': body_reader},
+                    headers={'X-Timestamp': timestamp,
+                             'Content-Length': '6',
+                             'Content-Type': 'application/octet-stream',
+                             'Expect': '100-continue'})
+            resp = self.object_controller.PUT(req)
+            self.assertEquals(resp.status_int, 507)
+            self.assertFalse(body_reader.read_called)
+        finally:
+            object_server.fallocate = orig_fallocate
 
 if __name__ == '__main__':
     unittest.main()

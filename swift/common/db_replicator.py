@@ -21,22 +21,23 @@ import time
 import shutil
 import uuid
 import errno
+import re
 
 from eventlet import GreenPool, sleep, Timeout
 from eventlet.green import subprocess
 import simplejson
-from webob import Response
-from webob.exc import HTTPNotFound, HTTPNoContent, HTTPAccepted, \
-    HTTPInsufficientStorage, HTTPBadRequest
 
 import swift.common.db
 from swift.common.utils import get_logger, whataremyips, storage_directory, \
     renamer, mkdirs, lock_parent_directory, TRUE_VALUES, unlink_older_than, \
     dump_recon_cache, rsync_ip
 from swift.common import ring
+from swift.common.http import HTTP_NOT_FOUND, HTTP_INSUFFICIENT_STORAGE
 from swift.common.bufferedhttp import BufferedHTTPConnection
 from swift.common.exceptions import DriveNotMounted, ConnectionTimeout
 from swift.common.daemon import Daemon
+from swift.common.swob import Response, HTTPNotFound, HTTPNoContent, \
+    HTTPAccepted, HTTPInsufficientStorage, HTTPBadRequest
 
 
 DEBUG_TIMINGS_THRESHOLD = 10
@@ -130,6 +131,8 @@ class Replicator(Daemon):
         self.recon_replicator = '%s.recon' % self.server_type
         self.rcache = os.path.join(self.recon_cache_path,
                                    self.recon_replicator)
+        self.extract_device_re = re.compile('%s%s([^%s]+)' % (
+            self.root, os.path.sep, os.path.sep))
 
     def _zero_stats(self):
         """Zero out the stats."""
@@ -321,11 +324,11 @@ class Replicator(Daemon):
                 info['delete_timestamp'], info['metadata'])
         if not response:
             return False
-        elif response.status == HTTPNotFound.code:  # completely missing, rsync
+        elif response.status == HTTP_NOT_FOUND:  # completely missing, rsync
             self.stats['rsync'] += 1
             self.logger.increment('rsyncs')
             return self._rsync_db(broker, node, http, info['id'])
-        elif response.status == HTTPInsufficientStorage.code:
+        elif response.status == HTTP_INSUFFICIENT_STORAGE:
             raise DriveNotMounted()
         elif response.status >= 200 and response.status < 300:
             rinfo = simplejson.loads(response.data)
@@ -388,10 +391,7 @@ class Replicator(Daemon):
                 delete_timestamp > put_timestamp and \
                 info['count'] in (None, '', 0, '0'):
             if self.report_up_to_date(full_info):
-                with lock_parent_directory(object_file):
-                    shutil.rmtree(os.path.dirname(object_file), True)
-                    self.stats['remove'] += 1
-                    self.logger.increment('removes')
+                self.delete_db(object_file)
             self.logger.timing_since('timing', start_time)
             return
         responses = []
@@ -419,11 +419,35 @@ class Replicator(Daemon):
         if not shouldbehere and all(responses):
             # If the db shouldn't be on this node and has been successfully
             # synced to all of its peers, it can be removed.
-            with lock_parent_directory(object_file):
-                shutil.rmtree(os.path.dirname(object_file), True)
-                self.stats['remove'] += 1
-                self.logger.increment('removes')
+            self.delete_db(object_file)
         self.logger.timing_since('timing', start_time)
+
+    def delete_db(self, object_file):
+        hash_dir = os.path.dirname(object_file)
+        suf_dir = os.path.dirname(hash_dir)
+        with lock_parent_directory(object_file):
+            shutil.rmtree(hash_dir, True)
+        try:
+            os.rmdir(suf_dir)
+        except OSError, err:
+            if err.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+                self.logger.exception(
+                    _('ERROR while trying to clean up %s') % suf_dir)
+        self.stats['remove'] += 1
+        device_name = self.extract_device(object_file)
+        self.logger.increment('removes.' + device_name)
+
+    def extract_device(self, object_file):
+        """
+        Extract the device name from an object path.  Returns "UNKNOWN" if the
+        path could not be extracted successfully for some reason.
+
+        :param object_file: the path to a database file.
+        """
+        match = self.extract_device_re.match(object_file)
+        if match:
+            return match.groups()[0]
+        return "UNKNOWN"
 
     def report_up_to_date(self, full_info):
         return True

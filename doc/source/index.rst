@@ -52,6 +52,7 @@ Overview and Concepts
     overview_object_versioning
     overview_container_sync
     overview_expiring_objects
+    overview_object_append
     associated_projects
 
 Developer Documentation
