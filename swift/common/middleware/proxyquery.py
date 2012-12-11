@@ -30,14 +30,15 @@ from swift.common.swob import Request, Response, HTTPNotFound, HTTPPreconditionF
     HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest,\
     HTTPUnprocessableEntity, HTTPServiceUnavailable
 
-ACCESS_WRITABLE = 0x1
-ACCESS_RANDOM = 0x2
-ACCESS_NETWORK = 0x4
-ACCESS_CDR = 0x8
+ACCESS_READABLE = 0x1
+ACCESS_WRITABLE = 0x2
+ACCESS_RANDOM = 0x4
+ACCESS_NETWORK = 0x8
+ACCESS_CDR = 0x10
 
 device_map = {
-    'stdin': 0, 'stdout': ACCESS_WRITABLE, 'stderr': ACCESS_WRITABLE,
-    'input': ACCESS_RANDOM, 'output': ACCESS_RANDOM | ACCESS_WRITABLE,
+    'stdin': ACCESS_READABLE, 'stdout': ACCESS_WRITABLE, 'stderr': ACCESS_WRITABLE,
+    'input': ACCESS_RANDOM | ACCESS_READABLE, 'output': ACCESS_RANDOM | ACCESS_WRITABLE,
     'debug': ACCESS_NETWORK, 'image': ACCESS_CDR
     }
 
@@ -335,9 +336,9 @@ class ClusterController(Controller):
         }
         path_info = request.path_info
         top_path = node.channels[0].path
-        if top_path \
-           and not (node.channels[0].access & ACCESS_WRITABLE) \
-        and not (node.channels[0].access & ACCESS_NETWORK):
+        if top_path and \
+           ((node.channels[0].access & ACCESS_READABLE)
+           or (node.channels[0].access & ACCESS_CDR)):
             path_info += top_path
             account, container, obj = split_path(path_info, 1, 3, True)
             partition, obj_nodes = self.app.object_ring.get_nodes(account, container, obj)
@@ -606,7 +607,7 @@ class ClusterController(Controller):
                         if access < 0:
                             return HTTPBadRequest(request=req,
                                 body='Unknown device %s in %s' % (device, node_name))
-                        if not access & ACCESS_WRITABLE or access & ACCESS_CDR:
+                        if access & ACCESS_READABLE or access & ACCESS_CDR:
                             if len(read_list) > 0:
                                 return HTTPBadRequest(request=req,
                                     body='More than one readable file in %s' % node_name)
