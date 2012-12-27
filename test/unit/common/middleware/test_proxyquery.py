@@ -5,6 +5,7 @@ from eventlet.green import socket
 from swiftclient.client import quote
 import random
 import swift
+from swift.common.middleware.proxyquery import ZvmNode, ZvmChannel, NodeEncoder
 
 try:
     import simplejson as json
@@ -1711,6 +1712,30 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             self.proxy_app.update_request(req)
             res = controller.zerovm_query(req)
             self.assertEqual(res.status_int, 200)
+
+    def test_QUERY_config_parser(self):
+
+        fake_controller = proxyquery.ProxyQueryMiddleware(
+            self.proxy_app,{}).get_controller('a')
+        conf = [
+            {
+                'name':'script',
+                'exec':{'path':'boot/lua','args':'my_script.lua'},
+                'file_list':[
+                    {'device':'image', 'path':'/images/lua.img'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = Request.blank('/a', environ={'REQUEST_METHOD': 'POST'},
+            headers={'Content-Type': 'application/json'})
+        error = fake_controller.parse_cluster_config(req, conf)
+        if error:
+            print [error.status,error.body]
+        else:
+            print json.dumps(fake_controller.nodes,
+                cls=NodeEncoder, indent='  ')
+
 
     '''
     def test_QUERY_connect_exceptions(self):

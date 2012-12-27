@@ -1,17 +1,17 @@
 from __future__ import with_statement
 import ctypes
 import re
-from sphinx.application import CONFIG_FILENAME
 import struct
 import traceback
 from eventlet.green import socket
 import time
 from hashlib import md5
-from eventlet import GreenPile, GreenPool, sleep
+from eventlet import GreenPile, GreenPool, sleep, Queue
 import greenlet
+from swift.common.http import HTTP_CONTINUE, is_success, HTTP_INSUFFICIENT_STORAGE
 from swiftclient.client import quote
 from swift.proxy.controllers.base import update_headers
-from swift.common.tarstream import StringBuffer, UntarStream, RECORDSIZE
+from swift.common.tarstream import StringBuffer, UntarStream, RECORDSIZE, TarStream, REGTYPE, BLOCKSIZE, NUL
 
 try:
     import simplejson as json
@@ -22,15 +22,15 @@ from urllib import unquote
 from random import shuffle, randrange
 from eventlet.timeout import Timeout
 
-from swift.common.utils import split_path, get_logger, TRUE_VALUES, get_remote_client
+from swift.common.utils import split_path, get_logger, TRUE_VALUES, get_remote_client, ContextPool
 from swift.proxy.server import Controller, ObjectController, ContainerController, AccountController
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout, ChunkReadTimeout, \
     ChunkWriteTimeout
-from swift.common.constraints import check_utf8
+from swift.common.constraints import check_utf8, MAX_FILE_SIZE
 from swift.common.swob import Request, Response, HTTPNotFound, HTTPPreconditionFailed,\
     HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest,\
-    HTTPUnprocessableEntity, HTTPServiceUnavailable
+    HTTPUnprocessableEntity, HTTPServiceUnavailable, HTTPClientDisconnect
 
 ACCESS_READABLE = 0x1
 ACCESS_WRITABLE = 0x2
@@ -47,6 +47,56 @@ device_map = {
 TAR_MIMES = ['application/x-tar', 'application/x-gtar', 'application/x-ustar']
 CLUSTER_CONFIG_FILENAME = 'boot/cluster.map'
 NODE_CONFIG_FILENAME = 'boot/system.map'
+CONFIG_BYTE_SIZE = 128 * 1024
+
+def merge_headers(current, new):
+    if hasattr(new, 'keys'):
+        for key in new.keys():
+            if not current[key.lower()]:
+                current[key.lower()] = new[key]
+            else:
+                current[key.lower()] += ',' + new[key]
+    else:
+        for key, value in new:
+            if not current[key.lower()]:
+                current[key.lower()] = value
+            else:
+                current[key.lower()] += ',' + value
+
+class CachedBody(object):
+
+    def __init__(self, read_iter, cache=None, cache_size=CONFIG_BYTE_SIZE):
+        self.read_iter = read_iter
+        if cache:
+            self.cache = cache
+        else:
+            self.cache = []
+            size = 0
+            for chunk in read_iter:
+                self.cache.append(chunk)
+                size += len(chunk)
+                if size >= cache_size:
+                    break
+
+    def __iter__(self):
+        for chunk in self.cache:
+            yield chunk
+        for chunk in self.read_iter:
+            yield chunk
+
+class FinalBody(object):
+
+    def __init__(self, app_iter):
+        self.app_iters = [app_iter]
+
+    def __iter__(self):
+        for app_iter in self.app_iters:
+            for chunk in app_iter:
+                yield chunk
+
+    def append(self, app_iter):
+        self.app_iters.append(app_iter)
+
 
 class SequentialResponseBody(object):
 
@@ -220,6 +270,17 @@ class ZvmNode(object):
         channel = ZvmChannel(device, access, path)
         self.channels.append(channel)
 
+    def get_channel(self, device=None, path=None):
+        if device:
+            for chan in self.channels:
+                if chan.device == device:
+                    return chan
+        if path:
+            for chan in self.channels:
+                if chan.path == path:
+                    return chan
+        return None
+
     def add_connections(self, nodes, connect_list):
         for bind_name in connect_list:
             if nodes.get(bind_name):
@@ -249,13 +310,22 @@ class ZvmChannel(object):
 
 
 class ZvmResponse(object):
-    def __init__(self, name, status, body, nexe_status, nexe_retcode, nexe_etag):
+    def __init__(self, name, status,
+                 nexe_status, nexe_retcode, nexe_etag):
         self.name = name
         self.status = status
-        self.body = body
+        #self.body = body
         self.nexe_status = nexe_status
         self.nexe_retcode = nexe_retcode
         self.nexe_etag = nexe_etag
+
+
+class NodeEncoder(json.JSONEncoder):
+
+    def default(self, o):
+        if isinstance(o, ZvmNode) or isinstance(o, ZvmChannel):
+            return o.__dict__
+        return json.JSONEncoder.default(self, o)
 
 
 class ClusterController(Controller):
@@ -267,6 +337,10 @@ class ClusterController(Controller):
         Controller.__init__(self, app)
         self.account_name = unquote(account_name)
         self.nodes = {}
+
+    def copy_request(self, request):
+        env = request.environ.copy()
+        return Request(env)
 
     def get_local_address(self, node):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -624,11 +698,13 @@ class ClusterController(Controller):
                             return HTTPBadRequest(request=req,
                                 body='Unknown device %s in %s'
                                 % (device, node_name))
-                        if access & (ACCESS_READABLE | ACCESS_CDR):
-                            if len(read_list) > 0:
-                                return HTTPBadRequest(request=req,
-                                    body='More than one readable file in %s'
-                                    % node_name)
+                        if access & ACCESS_READABLE:
+                            #if len(read_list) > 0:
+                            #    return HTTPBadRequest(request=req,
+                            #        body='More than one readable file in %s'
+                            #        % node_name)
+                            read_list.insert(0, f)
+                        elif access & ACCESS_CDR:
                             read_list.append(f)
                         elif access & ACCESS_WRITABLE:
                             write_list.append(f)
@@ -778,15 +854,18 @@ class ClusterController(Controller):
                                     body='Immediate response is not available '
                                          'for device %s' % device)
                             if node_count > 1:
-                                for i in range(1, node_count + 1):
-                                    new_name = self.create_name(node_name, i)
-                                    new_node = self.nodes.get(new_name)
-                                    if not new_node:
-                                        new_node = ZvmNode(nid, new_name,
-                                            nexe_path, nexe_args, nexe_env)
-                                        nid += 1
-                                        self.nodes[new_name] = new_node
-                                    new_node.add_channel(device, access)
+                                return HTTPBadRequest(request=req,
+                                    body='Immediate response is not available '
+                                         'for multiple nodes')
+#                                for i in range(1, node_count + 1):
+#                                    new_name = self.create_name(node_name, i)
+#                                    new_node = self.nodes.get(new_name)
+#                                    if not new_node:
+#                                        new_node = ZvmNode(nid, new_name,
+#                                            nexe_path, nexe_args, nexe_env)
+#                                        nid += 1
+#                                        self.nodes[new_name] = new_node
+#                                    new_node.add_channel(device, access)
                             else:
                                 new_node = self.nodes.get(node_name)
                                 if not new_node:
@@ -870,33 +949,31 @@ class ClusterController(Controller):
         etag = md5()
         cluster_config = ''
         req.bytes_transferred = 0
-        path_list = []
-        cache = []
+        path_list = [StringBuffer(CLUSTER_CONFIG_FILENAME),
+                     StringBuffer(NODE_CONFIG_FILENAME)]
+        user_image = None
         read_iter = iter(lambda:
-            req.environ['wsgi.input'].read(self.app.network_chunk_size), '')
-
-        def cached_request(cache, body):
-            for chunk in cache:
-                yield chunk
-            for chunk in body:
-                yield chunk
-
+            req.environ['wsgi.input'].read(self.app.network_chunk_size),
+            '')
         if req.headers['content-type'] in TAR_MIMES:
-            untar_stream = UntarStream(read_iter, path_list,
-                create_path_list=True)
+            if not 'content-length' in req.headers:
+                return HTTPBadRequest(request=req,
+                    body='Must specify Content-Length')
+
+            cached_body = CachedBody(read_iter)
+            user_image = iter(cached_body)
+            untar_stream = UntarStream(cached_body.cache, path_list)
             for chunk in untar_stream:
                 req.bytes_transferred += len(chunk)
                 etag.update(chunk)
-                cache.append(chunk)
-                for path in path_list:
-                    if path.name in CLUSTER_CONFIG_FILENAME:
-                        cluster_config = path.body
-                        break
-                if req.bytes_transferred > self.app.zerovm_maxconfig \
-                        + RECORDSIZE:
-                    return HTTPBadRequest(request=req,
-                        body='Cannot find boot map in the system image')
-            untar_stream = None
+            for buffer in path_list:
+                if buffer.is_closed:
+                    cluster_config = buffer.body
+                    break
+            if not cluster_config:
+                return HTTPBadRequest(request=req,
+                    body='System boot map was not found in request')
+
         elif req.headers['content-type'] in 'application/json':
             for chunk in read_iter:
                 req.bytes_transferred += len(chunk)
@@ -908,13 +985,14 @@ class ClusterController(Controller):
                 cluster_config += chunk
             if 'content-length' in req.headers and \
                int(req.headers['content-length']) != req.bytes_transferred:
-                return Response(status='499 Client Disconnect')
+                return HTTPClientDisconnect(request=req)
             etag = etag.hexdigest()
             if 'etag' in req.headers and\
                req.headers['etag'].lower() != etag:
                 return HTTPUnprocessableEntity(request=req)
         else:
-            return HTTPBadRequest(request=req, body='Unsupported Content-Type')
+            return HTTPBadRequest(request=req,
+                body='Unsupported Content-Type')
 
         error = self.parse_cluster_config(req, cluster_config)
         if error:
@@ -932,34 +1010,381 @@ class ClusterController(Controller):
                 request=req, content_type='text/plain')
         ns_port = ns_server.start(self.app.zerovm_ns_thrdpool, len(self.nodes))
 
+        image_resp = None
+        if user_image:
+            image_resp = Response(app_iter=user_image,
+                headers={'Content-Length':req.headers['content-length']})
+            image_resp.nodes = []
+
+        data_sources = []
         pile = GreenPile(len(node_list))
         for node in node_list:
-            pile.spawn(self.make_request, node, req, ns_port)
-        for resp in pile:
-            node_name = resp.headers.get('x-node-name')
-            nexe_status = resp.headers.get('x-nexe-status')
-            nexe_retcode = resp.headers.get('x-nexe-retcode')
-            if nexe_retcode:
-                nexe_retcode = int(nexe_retcode)
-            nexe_etag = resp.headers.get('x-nexe-etag')
-            node = self.nodes.get(node_name)
-            if node:
-                node.resp = ZvmResponse(node_name, resp.status, resp.body,
-                    nexe_status, nexe_retcode, nexe_etag)
-        resp_list = []
-        for node in node_list:
-            if getattr(node, 'resp', None):
-                resp_list.append(node.resp.__dict__)
+            sysmap = json.dumps(node)
+            sysmap_iter = iter([sysmap])
+            sysmap_resp = Response(app_iter=sysmap_iter,
+            headers={'Content-Length':str(len(sysmap))})
+            data_sources.insert(0, sysmap_resp)
+            node.last_data = sysmap_resp
+            sysmap_resp.nodes = [{'node':node, 'dev':'sysmap'}]
+            nexe_headers = {
+                'x-nexe-system': node.name,
+                'x-nexe-status': 'ZeroVM did not run',
+                'x-nexe-retcode' : 0,
+                'x-nexe-etag': ''
+            }
+            path_info = req.path_info
+            top_channel = node.channels[0]
+            if top_channel.path and top_channel.path[0] == '/' and \
+               (top_channel.access & (ACCESS_READABLE | ACCESS_CDR)):
+                path_info += top_channel.path
+                account, container, obj = split_path(path_info, 1, 3, True)
+                partition, obj_nodes = self.app.object_ring.get_nodes(
+                    account, container, obj)
             else:
-                resp_list.append(ZvmResponse(node.name, 503, '','','','').__dict__)
-        final_response = Response(request=req, content_type='application/json')
-        final_response.body = json.dumps(resp_list)
+                partition, obj_nodes = self.get_random_nodes()
+            exec_request = Request.blank(path_info,
+                environ=req.environ, headers=req.headers)
+            #exec_request.content_length = None
+            #exec_request.etag = None
+            #exec_request.headers['Content-Type'] =\
+            #    req.headers['Content-Type']
+
+            channels = []
+            if node.exe[0] == '/':
+                channels.append(ZvmChannel('boot', None, node.exe))
+            if len(node.channels) > 1:
+                for ch in node.channels[1:]:
+                    if ch.path[0] == '/' and \
+                       (ch.access & (ACCESS_READABLE | ACCESS_CDR)):
+                        channels.append(ch)
+
+            for ch in channels:
+                source_resp = None
+                load_from = req.path_info + ch.path
+                for resp in data_sources:
+                    if load_from == resp.request.path_info:
+                        source_resp = resp
+                        break
+                if not source_resp:
+                    source_req = req.copy_get()
+                    source_req.path_info = load_from
+                    #source_req.headers['X-Newest'] = 'true'
+                    acct, src_container_name, src_obj_name =\
+                        split_path(load_from, 1, 3, True)
+                    source_resp =\
+                        ObjectController(self.app, acct,
+                            src_container_name, src_obj_name)\
+                        .GET(source_req)
+                    if source_resp.status_int >= 300:
+                        update_headers(source_resp.headers, nexe_headers)
+                        return source_resp
+                    source_resp.nodes = []
+                    data_sources.append(source_resp)
+                    #exec_request.content_length = \
+                    #    source_resp.content_length
+                    #exec_request.etag = source_resp.etag
+                    #exec_request.headers['Content-Type'] = \
+                    #    source_resp.headers['Content-Type']
+                node.last_data = source_resp
+                source_resp.nodes.append({'node':node, 'dev':ch.device})
+            if image_resp:
+                node.last_data = image_resp
+                image_resp.nodes.append({'node':node, 'dev':'image'})
+                data_sources.append(image_resp)
+#            stdlist = []
+#            for ch in node.channels:
+#                if 'stdout' in ch.device or 'stderr' in ch.device:
+#                    if ch.path:
+#                        stdlist.insert(0, ch)
+#                    else:
+#                        stdlist.append(ch)
+#            if stdlist:
+#                exec_request.headers['x-nexe-stdlist'] = ','.join(
+#                    [s.device for s in stdlist])
+#            i = 0
+#            for dst in node.bind:
+#                dst_id = self.nodes.get(dst).id
+#                exec_request.headers['x-nexe-channel-' + str(i)] =\
+#                ','.join(['tcp:%d:0' % dst_id,
+#                          '/dev/in/' + dst,
+#                          '0',
+#                          str(self.app.zerovm_maxiops),
+#                          str(self.app.zerovm_maxinput),
+#                          '0,0'])
+#                i += 1
+#            for dst in node.connect:
+#                dst_id = self.nodes.get(dst).id
+#                exec_request.headers['x-nexe-channel-' + str(i)] =\
+#                ','.join(['tcp:%d:' % dst_id,
+#                          '/dev/out/' + dst,
+#                          '0,0,0',
+#                          str(self.app.zerovm_maxiops),
+#                          str(self.app.zerovm_maxoutput)]
+#                )
+#                i += 1
+#            exec_request.headers['x-nexe-channels'] = str(i)
+#
+#            exec_request.headers['x-node-name'] = '%s,%d' % (node.name, node.id)
+
+            if self.app.zerovm_ns_hostname:
+                addr = self.app.zerovm_ns_hostname
+            else:
+                for n in obj_nodes:
+                    addr = self.get_local_address(n)
+                    if addr:
+                        break
+            if not addr:
+                return HTTPServiceUnavailable(
+                    body='Cannot find own address, check zerovm_ns_hostname')
+            #exec_request.headers['x-name-service'] = 'udp:%s:%d' % (addr, ns_port)
+            node.name_service = 'udp:%s:%d' % (addr, ns_port)
+#            if node.args:
+#                exec_request.headers['x-nexe-args'] = node.args
+#            if node.env:
+#                exec_request.headers['x-nexe-env'] = ','.join(
+#                    reduce(lambda x, y: x + y, node.env.items()))
+
+            #exec_request.path_info = path_info
+            node_iter = self.iter_nodes(partition, obj_nodes, self.app.object_ring)
+            pile.spawn(self._connect_exec_node, node_iter, partition,
+                exec_request, self.app.logger.thread_locals, node,
+                nexe_headers)
+
+        conns = [conn for conn in pile if conn]
+        if len(conns) < len(node_list):
+            self.app.logger.exception(
+                _('ERROR Cannot find suitable node to execute code on'))
+            return HTTPServiceUnavailable(
+                body='Cannot find suitable node to execute code on')
+
+        for data_src in data_sources:
+            data_src.conns = []
+            for node in data_src.nodes:
+                for conn in conns:
+                    if conn.cnode is node['node']:
+                        conn.last_data = node['node'].last_data
+                        data_src.conns.append({'conn':conn, 'dev':node['dev']})
+
+        chunked = req.headers.get('transfer-encoding')
+        try:
+            with ContextPool(len(node_list)) as pool:
+                for conn in conns:
+                    conn.failed = False
+                    conn.queue = Queue(self.app.put_queue_depth)
+                    pool.spawn(self._send_file, conn, req.path)
+
+                for data_src in data_sources:
+                    data_src.bytes_transferred = 0
+                    tar_stream = TarStream()
+                    for conn in data_src.conns:
+                        info = tar_stream.create_tarinfo(
+                            REGTYPE, conn['dev'],
+                            data_src.content_length)
+                        if not conn['conn'].failed:
+                            conn['conn'].queue.put('%x\r\n%s\r\n' %
+                                                   (len(info), info)
+                            if chunked else info)
+                    while True:
+                        with ChunkReadTimeout(self.app.client_timeout):
+                            try:
+                                chunk = next(data_src.app_iter)
+                            except StopIteration:
+                                if chunked:
+                                    for conn in data_src.conns:
+                                        if conn['conn'].last_data is data_src:
+                                            conn['conn'].queue.put('0\r\n\r\n')
+                                break
+                        data_src.bytes_transferred += len(chunk)
+                        if data_src.bytes_transferred > MAX_FILE_SIZE:
+                            return HTTPRequestEntityTooLarge(request=req)
+                        for conn in data_src.conns:
+                            if not conn['conn'].failed:
+                                conn['conn'].queue.put('%x\r\n%s\r\n' % (len(chunk), chunk)
+                                if chunked else chunk)
+                            else:
+                                return HTTPServiceUnavailable(request=req)
+                    if data_src.bytes_transferred < data_src.content_length:
+                        return HTTPClientDisconnect(request=req)
+                    blocks, remainder = divmod(data_src.bytes_transferred,
+                        BLOCKSIZE)
+                    if remainder > 0:
+                        nulls = NUL * (BLOCKSIZE - remainder)
+                        for conn in data_src.conns:
+                            if not conn['conn'].failed:
+                                conn['conn'].queue.put('%x\r\n%s\r\n' % (len(nulls), nulls)
+                                if chunked else nulls)
+                            else:
+                                return HTTPServiceUnavailable(request=req)
+                for conn in conns:
+                    if conn.queue.unfinished_tasks:
+                        conn.queue.join()
+        except ChunkReadTimeout, err:
+            self.app.logger.warn(
+                _('ERROR Client read timeout (%ss)'), err.seconds)
+            self.app.logger.increment('client_timeouts')
+            return HTTPRequestTimeout(request=req)
+        except (Exception, Timeout):
+            self.app.logger.exception(
+                _('ERROR Exception causing client disconnect'))
+            return HTTPClientDisconnect(request=req)
+
+        for conn in conns:
+            try:
+                with Timeout(self.app.node_timeout):
+                    if conn.resp:
+                        server_response = conn.resp
+                    else:
+                        server_response = conn.getresponse()
+            except (Exception, Timeout):
+                self.exception_occurred(conn.node, _('Object'),
+                    _('Trying to get final status of POST to %s')
+                    % req.path_info)
+                return HTTPClientDisconnect(body=conn.path,
+                    headers=conn.nexe_headers)
+            if server_response.status != 200:
+                resp = Response(status='%d %s' %
+                                       (server_response.status,
+                                        server_response.reason),
+                    body=server_response.read(),
+                    headers = conn.nexe_headers)
+                return resp
+            conn.resp = Response(status='%d %s' %
+                                   (server_response.status,
+                                    server_response.reason),
+                    app_iter=iter(lambda:
+                    server_response.read(self.app.network_chunk_size),''),
+                    headers = dict(server_response.getheaders()))
+            pile.spawn(self._process_response, conn, req)
+
+        conns = [conn for conn in pile if conn]
+        final_body = None
+        final_response = Response(request=req)
+        for conn in conns:
+            resp = conn.resp
+            for key in conn.nexe_headers.keys():
+                if resp.headers.get(key):
+                    conn.nexe_headers[key] = resp.headers.get(key)
+            if conn.error:
+                conn.nexe_headers['x-nexe-error'] = conn.error
+            merge_headers(final_response.headers, conn.nexe_headers)
+            if resp.content_length > 0:
+                if final_body:
+                    final_body.append(resp.app_iter)
+                    final_response.content_length += resp.content_length
+                else:
+                    final_body = FinalBody(resp.app_iter)
+                    final_response.app_iter = final_body
+                    final_response.content_length = resp.content_length
         ns_server.stop()
         return final_response
 
     def create_name(self, node_name, i):
         return node_name + '-' + str(i)
 
+    def _untar_file_iter(self, untar_stream):
+        while untar_stream.to_write:
+            yield untar_stream.get_file_chunk()
+            if untar_stream.to_write:
+                untar_stream.block = None
+                try:
+                    data = next(untar_stream.tar_iter)
+                except StopIteration:
+                    break
+                untar_stream.update_buffer(data)
+
+    def _process_response(self, conn, request):
+        conn.error = None
+        resp = conn.resp
+        if resp.content_length == 0:
+            return conn
+        node = conn.cnode
+        untar_stream = UntarStream(resp.app_iter)
+        bytes_transferred = 0
+        while True:
+            try:
+                data = next(untar_stream.tar_iter)
+            except StopIteration:
+                break
+            untar_stream.update_buffer(data)
+            info = untar_stream.get_next_tarinfo()
+            while info:
+                if info.offset_data:
+                    chan = node.get_channel(device=info.name)
+                    if not chan:
+                        conn.error = 'Channel name %s not found' % info.name
+                        return conn
+                    if not chan.path:
+                        cache = [untar_stream.block[untar_stream.offset_data:]]
+                        app_iter = iter(CachedBody(untar_stream.tar_iter, cache))
+                        resp.appp_iter = app_iter
+                        resp.content_length = info.size
+                        return conn
+                    dest_header = unquote(chan.path)
+                    acct = request.path_info.split('/', 2)[1]
+                    dest_header = '/' + acct + dest_header
+                    dest_container_name, dest_obj_name =\
+                        dest_header.split('/', 3)[2:]
+                    dest_req = Request.blank(dest_header,
+                        environ=request.environ, headers=request.headers)
+                    dest_req.method = 'PUT'
+                    dest_req.headers['Content-Length'] = info.size
+                    untar_stream.to_write = info.size
+                    untar_stream.offset_data = info.offset_data
+                    dest_req.environ['wsgi.input'] =\
+                        self._untar_file_iter(untar_stream)
+                    dest_resp = \
+                        ObjectController(self.app, acct,
+                        dest_container_name, dest_obj_name).PUT(dest_req)
+                    if dest_resp.status_int >= 300:
+                        conn.error = 'Status %s when putting %s' \
+                                     % (dest_resp.status, dest_header)
+                        return conn
+                info = untar_stream.get_next_tarinfo()
+            bytes_transferred += len(data)
+        untar_stream = None
+        return conn
+
+    def _connect_exec_node(self, obj_nodes, part, request,
+                          logger_thread_locals, cnode, nexe_headers):
+        self.app.logger.thread_locals = logger_thread_locals
+        for node in obj_nodes:
+            try:
+                with ConnectionTimeout(self.app.conn_timeout):
+                    conn = http_connect(node['ip'], node['port'],
+                        node['device'], part, request.method,
+                        request.path_info, request.headers)
+                with Timeout(self.app.node_timeout):
+                    resp = conn.getexpect()
+                if resp.status == HTTP_CONTINUE:
+                    conn.resp = None
+                    conn.node = node
+                    conn.cnode = cnode
+                    conn.nexe_headers = nexe_headers
+                    return conn
+                elif is_success(resp.status):
+                    conn.resp = resp
+                    conn.node = node
+                    conn.cnode = cnode
+                    conn.nexe_headers = nexe_headers
+                    return conn
+                elif resp.status == HTTP_INSUFFICIENT_STORAGE:
+                    self.error_limit(node)
+            except:
+                self.exception_occurred(node, _('Object'),
+                    _('Expect: 100-continue on %s') % request.path_info)
+
+    def _send_file(self, conn, path):
+        while True:
+            chunk = conn.queue.get()
+            if not conn.failed:
+                try:
+                    with ChunkWriteTimeout(self.app.node_timeout):
+                        conn.send(chunk)
+                except (Exception, ChunkWriteTimeout):
+                    conn.failed = True
+                    self.exception_occurred(conn.node, _('Object'),
+                        _('Trying to write to %s') % path)
+            conn.queue.task_done()
 
 def filter_factory(global_conf, **local_conf):
     """
