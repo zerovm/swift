@@ -1723,7 +1723,9 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
                 'exec':{'path':'boot/lua','args':'my_script.lua'},
                 'file_list':[
                     {'device':'image', 'path':'/images/lua.img'}
-                ]
+                ],
+                'connect':['script'],
+                'count':5
             }
         ]
         conf = json.dumps(conf)

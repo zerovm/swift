@@ -955,6 +955,10 @@ class TarStream(object):
         buf = tarinfo.tobuf(self.format, self.encoding, self.errors)
         return buf
 
+    def get_archive_size(self, file_size):
+        size = file_size + BLOCKSIZE - 1
+        return (size % BLOCKSIZE) * BLOCKSIZE
+
     def __iter__(self):
         if self.append:
             if self.tar_iter:
@@ -1030,6 +1034,7 @@ class ExtractedFile(object):
                 self.data = buf[self.to_write:]
                 self.to_write += self.chunk_size
                 return result
+
 
 class UntarStream(object):
 
@@ -1162,6 +1167,17 @@ class UntarStream(object):
         elif info.magic == POSIX_MAGIC:
             self.format = USTAR_FORMAT
         return info
+
+    def untar_file_iter(self):
+        while self.to_write:
+            yield self.get_file_chunk()
+            if self.to_write:
+                self.block = None
+                try:
+                    data = next(self.tar_iter)
+                except StopIteration:
+                    break
+                self.update_buffer(data)
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:

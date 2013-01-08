@@ -33,10 +33,11 @@ from swift.common.swob import Request, Response, HTTPNotFound, HTTPPreconditionF
     HTTPUnprocessableEntity, HTTPServiceUnavailable, HTTPClientDisconnect
 
 ACCESS_READABLE = 0x1
-ACCESS_WRITABLE = 0x2
-ACCESS_RANDOM = 0x4
-ACCESS_NETWORK = 0x8
-ACCESS_CDR = 0x10
+ACCESS_WRITABLE = 0x1 << 1
+ACCESS_RANDOM = 0x1 << 2
+ACCESS_NETWORK = 0x1 << 3
+ACCESS_CDR = 0x1 << 4
+
 
 device_map = {
     'stdin': ACCESS_READABLE, 'stdout': ACCESS_WRITABLE, 'stderr': ACCESS_WRITABLE,
@@ -65,8 +66,10 @@ def merge_headers(current, new):
 
 class CachedBody(object):
 
-    def __init__(self, read_iter, cache=None, cache_size=CONFIG_BYTE_SIZE):
+    def __init__(self, read_iter, cache=None, cache_size=CONFIG_BYTE_SIZE,
+                 total_size=None):
         self.read_iter = read_iter
+        self.total_size = total_size
         if cache:
             self.cache = cache
         else:
@@ -81,8 +84,17 @@ class CachedBody(object):
     def __iter__(self):
         for chunk in self.cache:
             yield chunk
-        for chunk in self.read_iter:
-            yield chunk
+        if self.total_size:
+            for chunk in self.read_iter:
+                self.total_size -= len(chunk)
+                if self.total_size < 0:
+                    yield chunk[:self.total_size]
+                    break
+                else:
+                    yield  chunk
+        else:
+            for chunk in self.read_iter:
+                yield chunk
 
 class FinalBody(object):
 
@@ -781,13 +793,26 @@ class ClusterController(Controller):
                                     path=new_path)
                             node_count = len(list)
                         elif path:
-                            new_node = self.nodes.get(node_name)
-                            if not new_node:
-                                new_node = ZvmNode(nid, node_name, nexe_path,
-                                    nexe_args, nexe_env)
-                                nid += 1
-                                self.nodes[node_name] = new_node
-                            new_node.add_channel(device, access, path=path)
+                            if node_count > 1:
+                                for i in range(1, node_count + 1):
+                                    new_name = self.create_name(node_name, i)
+                                    new_path = path
+                                    new_node = self.nodes.get(new_name)
+                                    if not new_node:
+                                        new_node = ZvmNode(nid, new_name,
+                                            nexe_path, nexe_args, nexe_env)
+                                        nid += 1
+                                        self.nodes[new_name] = new_node
+                                    new_node.add_channel(device, access,
+                                        path=new_path)
+                            else:
+                                new_node = self.nodes.get(node_name)
+                                if not new_node:
+                                    new_node = ZvmNode(nid, node_name, nexe_path,
+                                        nexe_args, nexe_env)
+                                    nid += 1
+                                    self.nodes[node_name] = new_node
+                                new_node.add_channel(device, access, path=path)
                         else:
                             return HTTPBadRequest(request=req,
                                 body='Readable file must have a path')
@@ -904,8 +929,7 @@ class ClusterController(Controller):
                                 nid += 1
                                 self.nodes[node_name] = new_node
                             new_node.add_channel(device, access, path=path)
-            #for n in self.nodes.itervalues():
-            #    print n.__dict__
+
         except Exception:
             print traceback.format_exc()
             return HTTPUnprocessableEntity(request=req)
@@ -928,10 +952,10 @@ class ClusterController(Controller):
                 while connect_node:
                     try:
                         connect_node.add_connections(self.nodes, connect)
-                    except Exception:
+                    except Exception, e:
                         return HTTPBadRequest(request=req,
-                            body='Invalid connect string for node %s'
-                                % connect_node.name)
+                            body='Invalid connect string for node %s: %s'
+                                % (connect_node.name, e))
                     j += 1
                     connect_node = self.nodes.get(
                         self.create_name(node_name, j))
@@ -939,6 +963,35 @@ class ClusterController(Controller):
                 return HTTPBadRequest(request=req,
                     body='Non existing node in connect string for node %s'
                         % node_name)
+
+        #for n in self.nodes.itervalues():
+        #    print n.__dict__
+
+        for node in self.nodes.itervalues():
+            tmp = []
+            for dst in node.bind:
+                dst_id = self.nodes.get(dst).id
+                tmp.append(
+                ','.join(['tcp:%d:0' % dst_id,
+                          '/dev/in/' + dst,
+                          '0',
+                          str(self.app.zerovm_maxiops),
+                          str(self.app.zerovm_maxinput),
+                          '0,0'])
+                )
+            node.bind = tmp
+            tmp = []
+            for dst in node.connect:
+                dst_id = self.nodes.get(dst).id
+                tmp.append(
+                ','.join(['tcp:%d:' % dst_id,
+                          '/dev/out/' + dst,
+                          '0,0,0',
+                          str(self.app.zerovm_maxiops),
+                          str(self.app.zerovm_maxoutput)])
+                )
+            node.connect = tmp
+
         return None
 
     def zerovm_query(self, req):
@@ -1030,7 +1083,9 @@ class ClusterController(Controller):
                 'x-nexe-system': node.name,
                 'x-nexe-status': 'ZeroVM did not run',
                 'x-nexe-retcode' : 0,
-                'x-nexe-etag': ''
+                'x-nexe-etag': '',
+                'x-nexe-validation': 0,
+                'x-nexe-cdr-line': '0 0 0 0 0 0 0 0 0 0 0 0'
             }
             path_info = req.path_info
             top_channel = node.channels[0]
@@ -1046,8 +1101,7 @@ class ClusterController(Controller):
                 environ=req.environ, headers=req.headers)
             #exec_request.content_length = None
             #exec_request.etag = None
-            #exec_request.headers['Content-Type'] =\
-            #    req.headers['Content-Type']
+            exec_request.headers['Content-Type'] = TAR_MIMES[0]
 
             channels = []
             if node.exe[0] == '/':
@@ -1281,17 +1335,6 @@ class ClusterController(Controller):
     def create_name(self, node_name, i):
         return node_name + '-' + str(i)
 
-    def _untar_file_iter(self, untar_stream):
-        while untar_stream.to_write:
-            yield untar_stream.get_file_chunk()
-            if untar_stream.to_write:
-                untar_stream.block = None
-                try:
-                    data = next(untar_stream.tar_iter)
-                except StopIteration:
-                    break
-                untar_stream.update_buffer(data)
-
     def _process_response(self, conn, request):
         conn.error = None
         resp = conn.resp
@@ -1308,37 +1351,37 @@ class ClusterController(Controller):
             untar_stream.update_buffer(data)
             info = untar_stream.get_next_tarinfo()
             while info:
-                if info.offset_data:
-                    chan = node.get_channel(device=info.name)
-                    if not chan:
-                        conn.error = 'Channel name %s not found' % info.name
-                        return conn
-                    if not chan.path:
-                        cache = [untar_stream.block[untar_stream.offset_data:]]
-                        app_iter = iter(CachedBody(untar_stream.tar_iter, cache))
-                        resp.appp_iter = app_iter
-                        resp.content_length = info.size
-                        return conn
-                    dest_header = unquote(chan.path)
-                    acct = request.path_info.split('/', 2)[1]
-                    dest_header = '/' + acct + dest_header
-                    dest_container_name, dest_obj_name =\
-                        dest_header.split('/', 3)[2:]
-                    dest_req = Request.blank(dest_header,
-                        environ=request.environ, headers=request.headers)
-                    dest_req.method = 'PUT'
-                    dest_req.headers['Content-Length'] = info.size
-                    untar_stream.to_write = info.size
-                    untar_stream.offset_data = info.offset_data
-                    dest_req.environ['wsgi.input'] =\
-                        self._untar_file_iter(untar_stream)
-                    dest_resp = \
-                        ObjectController(self.app, acct,
-                        dest_container_name, dest_obj_name).PUT(dest_req)
-                    if dest_resp.status_int >= 300:
-                        conn.error = 'Status %s when putting %s' \
-                                     % (dest_resp.status, dest_header)
-                        return conn
+                chan = node.get_channel(device=info.name)
+                if not chan:
+                    conn.error = 'Channel name %s not found' % info.name
+                    return conn
+                if not chan.path:
+                    cache = [untar_stream.block[info.offset_data:]]
+                    app_iter = iter(CachedBody(untar_stream.tar_iter,
+                        cache, total_size=info.size))
+                    resp.appp_iter = app_iter
+                    resp.content_length = info.size
+                    return conn
+                dest_header = unquote(chan.path)
+                acct = request.path_info.split('/', 2)[1]
+                dest_header = '/' + acct + dest_header
+                dest_container_name, dest_obj_name =\
+                    dest_header.split('/', 3)[2:]
+                dest_req = Request.blank(dest_header,
+                    environ=request.environ, headers=request.headers)
+                dest_req.method = 'PUT'
+                dest_req.headers['Content-Length'] = info.size
+                untar_stream.to_write = info.size
+                untar_stream.offset_data = info.offset_data
+                dest_req.environ['wsgi.input'] =\
+                    untar_stream.untar_file_iter()
+                dest_resp = \
+                    ObjectController(self.app, acct,
+                    dest_container_name, dest_obj_name).PUT(dest_req)
+                if dest_resp.status_int >= 300:
+                    conn.error = 'Status %s when putting %s' \
+                                 % (dest_resp.status, dest_header)
+                    return conn
                 info = untar_stream.get_next_tarinfo()
             bytes_transferred += len(data)
         untar_stream = None

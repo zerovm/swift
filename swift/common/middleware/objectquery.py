@@ -1,27 +1,25 @@
-# needed for etag validation using md5
+try:
+    import simplejson as json
+except ImportError:
+    import json
 from contextlib import contextmanager
 import re
-# for capturing zerovm stdout and stderr
 import os
+import shutil
 import time
 import traceback
-
-# needed to limit the number of simultaneously running zerovms
+import tarfile
 from eventlet import GreenPool, sleep
 from eventlet.green import select, subprocess
 from eventlet.timeout import Timeout
-
-# needed for parsing manifest files returned from zerovm
 from urllib import unquote
 from hashlib import md5
-from webob import Request, Response
-from tempfile import mkstemp
-
-# needed for error handling
-from webob.exc import HTTPBadRequest, HTTPNotFound,\
-    HTTPPreconditionFailed, HTTPRequestTimeout, HTTPUnprocessableEntity,\
-    HTTPServiceUnavailable, HTTPLengthRequired, HTTPRequestEntityTooLarge,\
-    HTTPInternalServerError
+from tempfile import mkstemp, mkdtemp
+from swift.common.swob import Request, Response, HTTPNotFound, HTTPPreconditionFailed,\
+    HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest,\
+    HTTPUnprocessableEntity, HTTPServiceUnavailable, HTTPClientDisconnect, HTTPInternalServerError
+from swift.common.middleware.proxyquery import TAR_MIMES, ACCESS_CDR, ACCESS_READABLE, ACCESS_WRITABLE, device_map
+from swift.common.tarstream import UntarStream, TarStream, REGTYPE, BLOCKSIZE, NUL
 
 from swift.common.utils import normalize_timestamp,\
     fallocate, split_path, drop_buffer_cache,\
@@ -29,6 +27,12 @@ from swift.common.utils import normalize_timestamp,\
 from swift.obj.server import DiskFile, write_metadata, read_metadata
 from swift.common.constraints import check_mount, check_utf8
 from swift.common.exceptions import DiskFileError, DiskFileNotExist
+
+channel_type_map = {
+    'stdin': 0, 'stdout': 0, 'stderr': 0,
+    'input': 3, 'output': 3,
+    'debug': 0, 'image': 1, 'sysimage': 3
+}
 
 class TmpDir(object):
     def __init__(self, path, device, disk_chunk_size=65536, os_interface=os):
@@ -53,6 +57,17 @@ class TmpDir(object):
                 self.os_interface.unlink(tmppath)
             except OSError:
                 pass
+
+    @contextmanager
+    def mkdtemp(self):
+        if not self.os_interface.path.exists(self.tmpdir):
+            mkdirs(self.tmpdir)
+        tmpdir = mkdtemp(dir=self.tmpdir)
+        try:
+            yield tmpdir
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class ObjectQueryMiddleware(object):
 
@@ -86,7 +101,7 @@ class ObjectQueryMiddleware(object):
         #self.zerovm_maxmnfstlines = int(conf.get('zerovm_maxmnfstlines', 128))
 
         # maximum input data file size
-        self.zerovm_maxinput = int(conf.get('zerovm_maxinput', 256 * 1048576))
+        self.zerovm_maxinput = int(conf.get('zerovm_maxinput', 1024 * 1048576))
 
         self.zerovm_maxiops = int(conf.get('zerovm_maxiops', 1024 * 1048576))
 
@@ -179,17 +194,18 @@ class ObjectQueryMiddleware(object):
             'x-nexe-status': 'Zerovm did not run',
             'x-nexe-etag': '',
             'x-nexe-validation': 0,
-            'x-nexe-cdr-line': '0 0 0 0 0 0 0 0 0 0 0 0'
+            'x-nexe-cdr-line': '0 0 0 0 0 0 0 0 0 0 0 0',
+            'x-nexe-system': ''
         }
-        if 'x-validator-exec' in req.headers:
-            validator = str(req.headers.get('x-validator-exec', ''))
-            if 'skip' in validator:
-                self.zerovm_exename.append('-s')
-            #if 'fuzzy' in validator:
-            #    self.zerovm_exename.append('-z')
-        if 'x-node-name' in req.headers:
-            nexe_name = re.split('\s*,\s*', req.headers['x-node-name'])
-            nexe_headers['x-nexe-name'] = nexe_name[0]
+#        if 'x-validator-exec' in req.headers:
+#            validator = str(req.headers.get('x-validator-exec', ''))
+#            if 'skip' in validator:
+#                self.zerovm_exename.append('-s')
+#            #if 'fuzzy' in validator:
+#            #    self.zerovm_exename.append('-z')
+#        if 'x-node-name' in req.headers:
+#            nexe_name = re.split('\s*,\s*', req.headers['x-node-name'])
+#            nexe_headers['x-nexe-name'] = nexe_name[0]
         zerovm_execute_only = False
         try:
             (device, partition, account) = \
@@ -213,49 +229,49 @@ class ObjectQueryMiddleware(object):
                 request=req, content_type='text/plain', headers=nexe_headers)
         if self.app.mount_check and not check_mount(self.app.devices, device):
             return Response(status='507 %s is not mounted' % device, headers=nexe_headers)
-        if 'content-length' not in req.headers\
-        and req.headers.get('transfer-encoding') != 'chunked':
-            return HTTPLengthRequired(request=req, headers=nexe_headers)
+#        if 'content-length' not in req.headers\
+#        and req.headers.get('transfer-encoding') != 'chunked':
+#            return HTTPLengthRequired(request=req, headers=nexe_headers)
         if 'content-length' in req.headers\
-        and int(req.headers['content-length']) > self.zerovm_maxnexe:
-            return HTTPRequestEntityTooLarge(body='Your request is too large.'
+        and int(req.headers['content-length']) > self.zerovm_maxinput:
+            return HTTPRequestEntityTooLarge(body='Your request is too large'
                 , request=req, content_type='text/plain', headers=nexe_headers)
         if 'Content-Type' not in req.headers:
             return HTTPBadRequest(request=req, content_type='text/plain'
                 , body='No content type', headers=nexe_headers)
-        if req.headers['Content-Type'] != 'application/octet-stream':
+        if not req.headers['Content-Type'] in TAR_MIMES:
             return HTTPBadRequest(request=req,
                 body='Invalid Content-Type',
                 content_type='text/plain', headers=nexe_headers)
 
-        channels = []
-        if 'x-nexe-channels' in req.headers:
-            for c in xrange(0,int(req.headers['x-nexe-channels'])):
-                channel = 'x-nexe-channel-'+str(c)
-                if not channel in req.headers:
-                    return HTTPBadRequest(request=req,
-                        body='Missing header %s' % channel,
-                        content_type='text/plain',
-                        headers=nexe_headers)
-                channels.append(req.headers[channel])
-        channel_list = ''
-        for channel in channels:
-            channel_list += 'Channel=%s\n' % channel
+#        channels = []
+#        if 'x-nexe-channels' in req.headers:
+#            for c in xrange(0,int(req.headers['x-nexe-channels'])):
+#                channel = 'x-nexe-channel-'+str(c)
+#                if not channel in req.headers:
+#                    return HTTPBadRequest(request=req,
+#                        body='Missing header %s' % channel,
+#                        content_type='text/plain',
+#                        headers=nexe_headers)
+#                channels.append(req.headers[channel])
+#        channel_list = ''
+#        for channel in channels:
+#            channel_list += 'Channel=%s\n' % channel
+#
+#        nexe_std_list = []
+#        if 'x-nexe-stdlist' in req.headers:
+#            nexe_std_list = re.split('\s*,\s*', req.headers['x-nexe-stdlist'])
+#        if not nexe_std_list:
+#            nexe_std_list = ['stdout']
 
-        nexe_std_list = []
-        if 'x-nexe-stdlist' in req.headers:
-            nexe_std_list = re.split('\s*,\s*', req.headers['x-nexe-stdlist'])
-        if not nexe_std_list:
-            nexe_std_list = ['stdout']
-
-        if zerovm_execute_only:
-            file = TmpDir(
-                self.app.devices,
-                device,
-                disk_chunk_size=self.app.disk_chunk_size,
-                os_interface=self.os_interface
-            )
-        else:
+        tmpdir = TmpDir(
+            self.app.devices,
+            device,
+            disk_chunk_size=self.app.disk_chunk_size,
+            os_interface=self.os_interface
+        )
+        file = None
+        if not zerovm_execute_only:
             file = DiskFile(
                 self.app.devices,
                 device,
@@ -274,101 +290,170 @@ class ObjectQueryMiddleware(object):
                 return HTTPRequestEntityTooLarge(body='Data Object is too large'
                     , request=req, content_type='text/plain', headers=nexe_headers)
 
-        with file.mkstemp() as (zerovm_nexe_fd, zerovm_nexe_fn):
-            if 'content-length' in req.headers:
-                fallocate(zerovm_nexe_fd,
-                    int(req.headers['content-length']))
+        channels = {}
+        with tmpdir.mkdtemp() as zerovm_tmp:
+            #if 'content-length' in req.headers:
+            #    fallocate(zerovm_image_fd,
+            #        int(req.headers['content-length']))
             reader = req.environ['wsgi.input'].read
+            read_iter = iter(lambda: reader(self.app.network_chunk_size),'')
             upload_size = 0
             etag = md5()
             upload_expiration = time.time() + self.app.max_upload_time
-            for chunk in iter(lambda: reader(self.app.network_chunk_size),
-                ''):
+            untar_stream = UntarStream(read_iter)
+            for chunk in read_iter:
                 upload_size += len(chunk)
                 if time.time() > upload_expiration:
                     return HTTPRequestTimeout(request=req, headers=nexe_headers)
                 etag.update(chunk)
-                while chunk:
-                    written = self.os_interface.write(zerovm_nexe_fd, chunk)
-                    chunk = chunk[written:]
-                    sleep()
+                untar_stream.update_buffer(chunk)
+                info = untar_stream.get_next_tarinfo()
+                while info:
+                    if info.offset_data:
+                        channels[info.name] = os.path.join(zerovm_tmp, info.name)
+                        fp = open(channels[info.name], 'ab')
+                        untar_stream.to_write = info.size
+                        untar_stream.offset_data = info.offset_data
+                        for data in untar_stream.untar_file_iter():
+                            fp.write(data)
+                        fp.close()
+                    info = untar_stream.get_next_tarinfo()
             if 'content-length' in req.headers\
             and int(req.headers['content-length']) != upload_size:
-                return Response(status='499 Client Disconnect', headers=nexe_headers)
+                return HTTPClientDisconnect(request=req, headers=nexe_headers)
             etag = etag.hexdigest()
             if 'etag' in req.headers and req.headers['etag'].lower()\
             != etag:
                 return HTTPUnprocessableEntity(request=req, headers=nexe_headers)
 
-            def file_iter(fd_list, fn_list):
-                """Returns an iterator over the data file."""
+            config = None
+            if 'sysmap' in channels:
+                config_file = channels.pop('sysmap')
+                fp = open(config_file, 'rb')
+                try:
+                    config = json.load(fp)
+                except Exception:
+                    fp.close()
+                    return HTTPBadRequest(request=req,
+                        body='Cannot parse system map')
+                fp.close()
+            else:
+                return HTTPBadRequest(request=req,
+                    body='No system map found in request')
 
-                try:
-                    chunk_size = file.disk_chunk_size
-                    for fd in fd_list:
-                        read = 0
-                        dropped_cache = 0
-                        self.os_interface.lseek(fd, 0, self.os_interface.SEEK_SET)
-                        while True:
-                            chunk = self.os_interface.read(fd, chunk_size)
-                            if chunk:
-                                read += len(chunk)
-                                if read - dropped_cache > self.zerovm_maxchunksize:
-                                    drop_buffer_cache(fd, dropped_cache,
-                                        read - dropped_cache)
-                                    dropped_cache = read
-                                yield chunk
-                                sleep()
-                            else:
-                                drop_buffer_cache(fd, dropped_cache, read
-                                - dropped_cache)
-                                break
-                finally:
-                    try:
-                        for fd in fd_list:
-                            self.os_interface.close(fd)
-                    except OSError:
-                        pass
-                    try:
-                        for fn in fn_list:
-                            self.os_interface.unlink(fn)
-                    except OSError:
-                        pass
+            zerovm_nexe = None
+            if config['exe'][0] != '/' and 'image' in channels:
+                tar = tarfile.open(name=channels['image'])
+                nexe = tar.extractfile(config['exe'])
+                if nexe:
+                    channels['boot'] = os.path.join(zerovm_tmp, 'boot')
+                    fp = open(channels['boot'], 'wb')
+                    reader = iter(lambda: nexe.read(self.app.disk_chunk_size),'')
+                    for chunk in reader:
+                        fp.write(chunk)
+                    fp.close()
+                tar.close()
+            if 'boot' in channels:
+                zerovm_nexe = channels.pop('boot')
+            else:
+                return HTTPBadRequest(request=req,
+                    body='No executable found in request')
 
-            nexe_output_fd = nexe_output_fn = None
-            nexe_error_fd = nexe_error_fn = None
-            try:
-                fd_list = []
-                fn_list = []
-                for stream in nexe_std_list:
-                    if 'stdout' in stream:
-                        (nexe_output_fd, nexe_output_fn) = mkstemp(dir=file.tmpdir)
-                        fallocate(nexe_output_fd, self.zerovm_maxoutput)
-                        fd_list.append(nexe_output_fd)
-                        fn_list.append(nexe_output_fn)
-                    elif 'stderr' in stream:
-                        (nexe_error_fd, nexe_error_fn) = mkstemp(dir=file.tmpdir)
-                        fallocate(nexe_error_fd, self.zerovm_maxoutput)
-                        fd_list.append(nexe_error_fd)
-                        fn_list.append(nexe_error_fn)
-                # outputiter is responsible to delete temp file
-                outputiter = file_iter(fd_list,fn_list)
-            except:
-                try:
-                    if nexe_output_fd:
-                        self.os_interface.close(nexe_output_fd)
-                    if nexe_error_fd:
-                        self.os_interface.close(nexe_error_fd)
-                except OSError:
-                    pass
-                try:
-                    if nexe_output_fn:
-                        self.os_interface.unlink(nexe_output_fn)
-                    if nexe_error_fn:
-                        self.os_interface.unlink(nexe_error_fn)
-                except OSError:
-                    pass
-                raise
+            response_channels = []
+            local_object = None
+            if not zerovm_execute_only:
+                local_object = '/'.join('', container, obj)
+            for ch in config['channels']:
+                if ch['device'] in channels:
+                    ch['lpath'] = channels[ch['device']]
+                if ch['access'] & (ACCESS_READABLE | ACCESS_CDR):
+                    if not ch['path'] or ch['path'][0] != '/':
+                        return HTTPBadRequest(request=req,
+                            body='Could not resolve channel path %s'
+                                 % ch['path'])
+                    if local_object:
+                        if ch['path'] in local_object:
+                            ch['lpath'] = file.data_file
+                            #channels[ch['device']] = file.data_file
+                elif ch['access'] & ACCESS_WRITABLE:
+                    (output_fd, output_fn) = mkstemp(dir=zerovm_tmp)
+                    fallocate(output_fd, self.zerovm_maxoutput)
+                    self.os_interface.close(output_fd)
+                    ch['lpath'] = output_fn
+                    #channels[ch['device']] = output_fn
+                    if not ch['path']:
+                        response_channels.append(ch)
+                    else:
+                        response_channels.insert(0, ch)
+
+#            def file_iter(fd_list, fn_list):
+#                """Returns an iterator over the data file."""
+#                try:
+#                    chunk_size = file.disk_chunk_size
+#                    for fd in fd_list:
+#                        read = 0
+#                        dropped_cache = 0
+#                        self.os_interface.lseek(fd, 0, self.os_interface.SEEK_SET)
+#                        while True:
+#                            chunk = self.os_interface.read(fd, chunk_size)
+#                            if chunk:
+#                                read += len(chunk)
+#                                if read - dropped_cache > self.zerovm_maxchunksize:
+#                                    drop_buffer_cache(fd, dropped_cache,
+#                                        read - dropped_cache)
+#                                    dropped_cache = read
+#                                yield chunk
+#                                sleep()
+#                            else:
+#                                drop_buffer_cache(fd, dropped_cache, read
+#                                - dropped_cache)
+#                                break
+#                finally:
+#                    try:
+#                        for fd in fd_list:
+#                            self.os_interface.close(fd)
+#                    except OSError:
+#                        pass
+#                    try:
+#                        for fn in fn_list:
+#                            self.os_interface.unlink(fn)
+#                    except OSError:
+#                        pass
+
+#            nexe_output_fd = nexe_output_fn = None
+#            nexe_error_fd = nexe_error_fn = None
+#            try:
+#                fd_list = []
+#                fn_list = []
+#                for stream in nexe_std_list:
+#                    if 'stdout' in stream:
+#                        (nexe_output_fd, nexe_output_fn) = mkstemp(dir=file.tmpdir)
+#                        fallocate(nexe_output_fd, self.zerovm_maxoutput)
+#                        fd_list.append(nexe_output_fd)
+#                        fn_list.append(nexe_output_fn)
+#                    elif 'stderr' in stream:
+#                        (nexe_error_fd, nexe_error_fn) = mkstemp(dir=file.tmpdir)
+#                        fallocate(nexe_error_fd, self.zerovm_maxoutput)
+#                        fd_list.append(nexe_error_fd)
+#                        fn_list.append(nexe_error_fn)
+#                # outputiter is responsible to delete temp file
+#                outputiter = file_iter(fd_list,fn_list)
+#            except:
+#                try:
+#                    if nexe_output_fd:
+#                        self.os_interface.close(nexe_output_fd)
+#                    if nexe_error_fd:
+#                        self.os_interface.close(nexe_error_fd)
+#                except OSError:
+#                    pass
+#                try:
+#                    if nexe_output_fn:
+#                        self.os_interface.unlink(nexe_output_fn)
+#                    if nexe_error_fn:
+#                        self.os_interface.unlink(nexe_error_fn)
+#                except OSError:
+#                    pass
+#                raise
 
             with file.mkstemp() as (zerovm_inputmnfst_fd,
                                     zerovm_inputmnfst_fn):
@@ -376,52 +461,102 @@ class ObjectQueryMiddleware(object):
                     'Version=%s\n'
                     'Nexe=%s\n'
                     'NexeMax=%s\n'
-                    'SyscallsMax=%s\n'
                     'NexeEtag=%s\n'
                     'Timeout=%s\n'
                     'MemMax=%s\n'
                     % (
                         self.zerovm_manifest_ver,
-                        zerovm_nexe_fn,
+                        zerovm_nexe,
                         self.zerovm_maxnexe,
-                        self.zerovm_maxsyscalls,
                         etag,
                         self.zerovm_timeout,
                         self.zerovm_maxnexemem
                         ))
 
-                zerovm_inputmnfst += 'Channel=%s,/dev/stdin,0,%s,%s,0,0\n'\
-                % ('/dev/null' if zerovm_execute_only else file.data_file,
-                   self.zerovm_maxiops, self.zerovm_maxinput)
 
-                zerovm_inputmnfst += 'Channel=%s,/dev/stdout,0,0,0,%s,%s\n'\
-                % (nexe_output_fn if 'stdout' in nexe_std_list else '/dev/null',
-                   self.zerovm_maxiops, self.zerovm_maxoutput)
+                for ch in config['channels']:
+                    type = channel_type_map.get(ch['device'])
+                    if not type:
+                        return HTTPBadRequest(request=req,
+                            body='Could not resolve channel type for: %s'
+                                 % ch['device'])
+                    access = ch['access']
+                    if access & ACCESS_READABLE:
+                        zerovm_inputmnfst += \
+                            'Channel=%s,/dev/%s,%s,%s,%s,0,0\n' % \
+                            (ch['lpath'], ch['device'], type,
+                             self.zerovm_maxiops, self.zerovm_maxinput)
+                    elif access & ACCESS_CDR:
+                        zerovm_inputmnfst +=\
+                        'Channel=%s,/dev/%s,%s,%s,%s,%s,%s\n' %\
+                        (ch['lpath'], ch['device'], type,
+                         self.zerovm_maxiops, self.zerovm_maxinput,
+                         self.zerovm_maxiops, self.zerovm_maxoutput)
+                    elif access & ACCESS_WRITABLE:
+                        zerovm_inputmnfst +=\
+                        'Channel=%s,/dev/%s,%s,0,0,%s,%s\n' %\
+                        (ch['lpath'], ch['device'], type,
+                         self.zerovm_maxiops, self.zerovm_maxoutput)
 
-                zerovm_inputmnfst += 'Channel=%s,/dev/stderr,0,0,0,%s,%s\n'\
-                % (nexe_error_fn if 'stderr' in nexe_std_list else '/dev/null',
-                   self.zerovm_maxiops, self.zerovm_maxoutput)
+#                zerovm_inputmnfst += 'Channel=%s,/dev/stdin,0,%s,%s,0,0\n'\
+#                % ('/dev/null' if zerovm_execute_only else file.data_file,
+#                   self.zerovm_maxiops, self.zerovm_maxinput)
+#
+#                zerovm_inputmnfst += 'Channel=%s,/dev/stdout,0,0,0,%s,%s\n'\
+#                % (nexe_output_fn if 'stdout' in nexe_std_list else '/dev/null',
+#                   self.zerovm_maxiops, self.zerovm_maxoutput)
+#
+#                zerovm_inputmnfst += 'Channel=%s,/dev/stderr,0,0,0,%s,%s\n'\
+#                % (nexe_error_fn if 'stderr' in nexe_std_list else '/dev/null',
+#                   self.zerovm_maxiops, self.zerovm_maxoutput)
 
-                for channel in channels:
-                    zerovm_inputmnfst += 'Channel=%s\n' % channel
+                for conn in config['connect'] + config['bind']:
+                    zerovm_inputmnfst += 'Channel=%s\n' % conn
 
-                if 'x-nexe-env' in req.headers:
-                    zerovm_inputmnfst += 'Environment=%s\n' \
-                    % req.headers['x-nexe-env']
+                for dev in ['stdin', 'stdout', 'stderr']:
+                    if not dev in channels:
+                        if 'stdin' in dev:
+                            zerovm_inputmnfst +=\
+                            'Channel=/dev/null,/dev/stdin,0,%s,%s,0,0\n' %\
+                            (self.zerovm_maxiops, self.zerovm_maxinput)
+                        else:
+                            zerovm_inputmnfst +=\
+                            'Channel=/dev/null,/dev/%s,0,0,0,%s,%s\n' %\
+                            (dev, self.zerovm_maxiops, self.zerovm_maxoutput)
 
-                if 'x-nexe-args' in req.headers:
-                    zerovm_inputmnfst += 'CommandLine=%s\n' \
-                    % req.headers['x-nexe-args']
+#                for channel in channels:
+#                    zerovm_inputmnfst += 'Channel=%s\n' % channel
 
-                nexe_name = None
-                if 'x-node-name' in req.headers:
-                    zerovm_inputmnfst += 'NodeName=%s\n'\
-                    % req.headers['x-node-name']
-                    nexe_name = re.split('\s*,\s*', req.headers['x-node-name'])
+                if config['env']:
+                    zerovm_inputmnfst += 'Environment=%s\n' % ','.join(
+                        reduce(lambda x, y: x + y, config['env'].items()))
 
-                if 'x-name-service' in req.headers:
-                    zerovm_inputmnfst += 'NameServer=%s\n'\
-                    % req.headers['x-name-service']
+#                if 'x-nexe-env' in req.headers:
+#                    zerovm_inputmnfst += 'Environment=%s\n' \
+#                    % req.headers['x-nexe-env']
+
+                if config['args']:
+                    zerovm_inputmnfst += 'CommandLine=%s\n'\
+                                         % config['args']
+
+#                if 'x-nexe-args' in req.headers:
+#                    zerovm_inputmnfst += 'CommandLine=%s\n' \
+#                    % req.headers['x-nexe-args']
+
+                nexe_name = config['name']
+                zerovm_inputmnfst += 'NodeName=%s,%d\n' \
+                                     % (nexe_name, config['id'])
+                zerovm_inputmnfst += 'NameServer=%s\n'\
+                                     % config['name_service']
+
+#                if 'x-node-name' in req.headers:
+#                    zerovm_inputmnfst += 'NodeName=%s\n'\
+#                    % req.headers['x-node-name']
+#                    nexe_name = re.split('\s*,\s*', req.headers['x-node-name'])
+
+#                if 'x-name-service' in req.headers:
+#                    zerovm_inputmnfst += 'NameServer=%s\n'\
+#                    % req.headers['x-name-service']
 
                 while zerovm_inputmnfst:
                     written = self.os_interface.write(zerovm_inputmnfst_fd,
@@ -457,7 +592,37 @@ class ObjectQueryMiddleware(object):
                     nexe_status = '\n'.join(report[4:])
 
                 self.logger.info('Zerovm CDR: %s' % nexe_cdr_line)
-                response = Response(app_iter=outputiter,
+
+                tar_stream = TarStream()
+                resp_size = 0
+                for ch in response_channels:
+                    file_size = self.os_interface.path.getsize(ch['lpath'])
+                    info = tar_stream.create_tarinfo(REGTYPE, ch['device'],
+                        file_size)
+                    resp_size += len(info) + \
+                                 tar_stream.get_archive_size(file_size)
+                    ch['info'] = info
+                    ch['size'] = file_size
+
+                def resp_iter(channels, chunk_size):
+                    tar_stream = TarStream(chunk_size=chunk_size)
+                    for ch in channels:
+                        fp = open(ch['lpath'], 'rb')
+                        reader = iter(lambda: fp.read(chunk_size), '')
+                        for chunk in tar_stream._serve_chunk(ch['info']):
+                            yield chunk
+                        for data in reader:
+                            for chunk in tar_stream._serve_chunk(data):
+                                yield chunk
+                        fp.close()
+                        blocks, remainder = divmod(ch['size'], BLOCKSIZE)
+                        if remainder > 0:
+                            nulls = NUL * (BLOCKSIZE - remainder)
+                            for chunk in tar_stream._serve_chunk(nulls):
+                                yield chunk
+
+                response = Response(app_iter=resp_iter(response_channels,
+                    self.app.network_chunk_size),
                     request=req, conditional_response=True)
                 response.headers['x-nexe-retcode'] = nexe_retcode
                 response.headers['x-nexe-status'] = nexe_status
@@ -465,15 +630,18 @@ class ObjectQueryMiddleware(object):
                 response.headers['x-nexe-validation'] = nexe_validation
                 response.headers['X-Timestamp'] =\
                     normalize_timestamp(time.time())
-                content_length = 0
-                for fn in fn_list:
-                    content_length += self.os_interface.path.getsize(fn)
-                response.content_length = content_length
-                response.headers['x-nexe-stdsize'] = ' '.join([str(self.os_interface.path.getsize(fn)) for fn in fn_list])
-                if 'x-nexe-content-type' in req.headers:
-                    response.headers['Content-Type'] = req.headers['x-nexe-content-type']
+#                content_length = 0
+#                for fn in fn_list:
+#                    content_length += self.os_interface.path.getsize(fn)
+#                response.content_length = content_length
+#                response.headers['x-nexe-stdsize'] = ' '.join([
+#                str(self.os_interface.path.getsize(fn))
+#                for fn in fn_list])
+#                if 'x-nexe-content-type' in req.headers:
+#                    response.headers['Content-Type'] = req.headers['x-nexe-content-type']
                 if nexe_name:
-                    response.headers['x-node-name'] = nexe_name[0]
+                    response.headers['x-node-name'] = nexe_name
+                response.content_length = resp_size
                 return req.get_response(response)
 
     def __call__(self, env, start_response):
