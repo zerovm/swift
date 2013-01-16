@@ -362,7 +362,7 @@ class ObjectQueryMiddleware(object):
             response_channels = []
             local_object = None
             if not zerovm_execute_only:
-                local_object = '/'.join('', container, obj)
+                local_object = '/'.join(['', container, obj])
             for ch in config['channels']:
                 if ch['device'] in channels:
                     ch['lpath'] = channels[ch['device']]
@@ -374,13 +374,13 @@ class ObjectQueryMiddleware(object):
                     if local_object:
                         if ch['path'] in local_object:
                             ch['lpath'] = file.data_file
-                            #channels[ch['device']] = file.data_file
+                            channels[ch['device']] = file.data_file
                 elif ch['access'] & ACCESS_WRITABLE:
-                    (output_fd, output_fn) = mkstemp(dir=zerovm_tmp)
+                    (output_fd, output_fn) = mkstemp()
                     fallocate(output_fd, self.zerovm_maxoutput)
-                    self.os_interface.close(output_fd)
+                    #self.os_interface.close(output_fd)
                     ch['lpath'] = output_fn
-                    #channels[ch['device']] = output_fn
+                    channels[ch['device']] = output_fn
                     if not ch['path']:
                         response_channels.append(ch)
                     else:
@@ -455,20 +455,18 @@ class ObjectQueryMiddleware(object):
 #                    pass
 #                raise
 
-            with file.mkstemp() as (zerovm_inputmnfst_fd,
+            with tmpdir.mkstemp() as (zerovm_inputmnfst_fd,
                                     zerovm_inputmnfst_fn):
                 zerovm_inputmnfst = (
                     'Version=%s\n'
                     'Nexe=%s\n'
                     'NexeMax=%s\n'
-                    'NexeEtag=%s\n'
                     'Timeout=%s\n'
                     'MemMax=%s\n'
                     % (
                         self.zerovm_manifest_ver,
                         zerovm_nexe,
                         self.zerovm_maxnexe,
-                        etag,
                         self.zerovm_timeout,
                         self.zerovm_maxnexemem
                         ))
@@ -476,7 +474,7 @@ class ObjectQueryMiddleware(object):
 
                 for ch in config['channels']:
                     type = channel_type_map.get(ch['device'])
-                    if not type:
+                    if type is None:
                         return HTTPBadRequest(request=req,
                             body='Could not resolve channel type for: %s'
                                  % ch['device'])
@@ -546,8 +544,9 @@ class ObjectQueryMiddleware(object):
                 nexe_name = config['name']
                 zerovm_inputmnfst += 'NodeName=%s,%d\n' \
                                      % (nexe_name, config['id'])
-                zerovm_inputmnfst += 'NameServer=%s\n'\
-                                     % config['name_service']
+                if 'name_service' in config:
+                    zerovm_inputmnfst += 'NameServer=%s\n'\
+                                         % config['name_service']
 
 #                if 'x-node-name' in req.headers:
 #                    zerovm_inputmnfst += 'NodeName=%s\n'\
@@ -557,7 +556,7 @@ class ObjectQueryMiddleware(object):
 #                if 'x-name-service' in req.headers:
 #                    zerovm_inputmnfst += 'NameServer=%s\n'\
 #                    % req.headers['x-name-service']
-
+                #print zerovm_inputmnfst
                 while zerovm_inputmnfst:
                     written = self.os_interface.write(zerovm_inputmnfst_fd,
                         zerovm_inputmnfst)
@@ -615,11 +614,14 @@ class ObjectQueryMiddleware(object):
                             for chunk in tar_stream._serve_chunk(data):
                                 yield chunk
                         fp.close()
+                        os.unlink(ch['lpath'])
                         blocks, remainder = divmod(ch['size'], BLOCKSIZE)
                         if remainder > 0:
                             nulls = NUL * (BLOCKSIZE - remainder)
                             for chunk in tar_stream._serve_chunk(nulls):
                                 yield chunk
+                    if tar_stream.data:
+                        yield tar_stream.data
 
                 response = Response(app_iter=resp_iter(response_channels,
                     self.app.network_chunk_size),
@@ -640,7 +642,8 @@ class ObjectQueryMiddleware(object):
 #                if 'x-nexe-content-type' in req.headers:
 #                    response.headers['Content-Type'] = req.headers['x-nexe-content-type']
                 if nexe_name:
-                    response.headers['x-node-name'] = nexe_name
+                    response.headers['x-nexe-system'] = nexe_name
+                response.content_type = 'application/x-gtar'
                 response.content_length = resp_size
                 return req.get_response(response)
 

@@ -11,7 +11,7 @@ import greenlet
 from swift.common.http import HTTP_CONTINUE, is_success, HTTP_INSUFFICIENT_STORAGE
 from swiftclient.client import quote
 from swift.proxy.controllers.base import update_headers
-from swift.common.tarstream import StringBuffer, UntarStream, RECORDSIZE, TarStream, REGTYPE, BLOCKSIZE, NUL
+from swift.common.tarstream import StringBuffer, UntarStream, RECORDSIZE, TarStream, REGTYPE, BLOCKSIZE, NUL, ExtractedFile
 
 try:
     import simplejson as json
@@ -337,6 +337,8 @@ class NodeEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, ZvmNode) or isinstance(o, ZvmChannel):
             return o.__dict__
+        elif isinstance(o, Response):
+            return str(o.__dict__)
         return json.JSONEncoder.default(self, o)
 
 
@@ -1060,7 +1062,7 @@ class ClusterController(Controller):
         ns_server = NameService()
         if self.app.zerovm_ns_thrdpool.free() <= 0:
             return HTTPServiceUnavailable(body='Cluster slot not available',
-                request=req, content_type='text/plain')
+                request=req)
         ns_port = ns_server.start(self.app.zerovm_ns_thrdpool, len(self.nodes))
 
         image_resp = None
@@ -1071,8 +1073,22 @@ class ClusterController(Controller):
 
         data_sources = []
         pile = GreenPile(len(node_list))
+        partition, obj_nodes = self.get_random_nodes()
+        if self.app.zerovm_ns_hostname:
+            addr = self.app.zerovm_ns_hostname
+        else:
+            for n in obj_nodes:
+                addr = self.get_local_address(n)
+                if addr:
+                    break
+        if not addr:
+            return HTTPServiceUnavailable(
+                body='Cannot find own address, check zerovm_ns_hostname')
+            #exec_request.headers['x-name-service'] = 'udp:%s:%d' % (addr, ns_port)
         for node in node_list:
-            sysmap = json.dumps(node)
+            node.name_service = 'udp:%s:%d' % (addr, ns_port)
+            sysmap = json.dumps(node, cls=NodeEncoder)
+            #print sysmap
             sysmap_iter = iter([sysmap])
             sysmap_resp = Response(app_iter=sysmap_iter,
             headers={'Content-Length':str(len(sysmap))})
@@ -1099,9 +1115,11 @@ class ClusterController(Controller):
                 partition, obj_nodes = self.get_random_nodes()
             exec_request = Request.blank(path_info,
                 environ=req.environ, headers=req.headers)
-            #exec_request.content_length = None
-            #exec_request.etag = None
-            exec_request.headers['Content-Type'] = TAR_MIMES[0]
+            exec_request.path_info = path_info
+            exec_request.content_length = None
+            exec_request.etag = None
+            exec_request.headers['content-type'] = TAR_MIMES[0]
+            exec_request.headers['transfer-encoding'] = 'chunked'
 
             channels = []
             if node.exe[0] == '/':
@@ -1116,7 +1134,7 @@ class ClusterController(Controller):
                 source_resp = None
                 load_from = req.path_info + ch.path
                 for resp in data_sources:
-                    if load_from == resp.request.path_info:
+                    if resp.request and load_from == resp.request.path_info:
                         source_resp = resp
                         break
                 if not source_resp:
@@ -1180,18 +1198,18 @@ class ClusterController(Controller):
 #
 #            exec_request.headers['x-node-name'] = '%s,%d' % (node.name, node.id)
 
-            if self.app.zerovm_ns_hostname:
-                addr = self.app.zerovm_ns_hostname
-            else:
-                for n in obj_nodes:
-                    addr = self.get_local_address(n)
-                    if addr:
-                        break
-            if not addr:
-                return HTTPServiceUnavailable(
-                    body='Cannot find own address, check zerovm_ns_hostname')
+#            if self.app.zerovm_ns_hostname:
+#                addr = self.app.zerovm_ns_hostname
+#            else:
+#                for n in obj_nodes:
+#                    addr = self.get_local_address(n)
+#                    if addr:
+#                        break
+#            if not addr:
+#                return HTTPServiceUnavailable(
+#                    body='Cannot find own address, check zerovm_ns_hostname')
             #exec_request.headers['x-name-service'] = 'udp:%s:%d' % (addr, ns_port)
-            node.name_service = 'udp:%s:%d' % (addr, ns_port)
+#            node.name_service = 'udp:%s:%d' % (addr, ns_port)
 #            if node.args:
 #                exec_request.headers['x-nexe-args'] = node.args
 #            if node.env:
@@ -1219,59 +1237,72 @@ class ClusterController(Controller):
                         conn.last_data = node['node'].last_data
                         data_src.conns.append({'conn':conn, 'dev':node['dev']})
 
-        chunked = req.headers.get('transfer-encoding')
+        #chunked = req.headers.get('transfer-encoding')
+        chunked = True
         try:
             with ContextPool(len(node_list)) as pool:
                 for conn in conns:
                     conn.failed = False
                     conn.queue = Queue(self.app.put_queue_depth)
+                    conn.tar_stream = TarStream()
                     pool.spawn(self._send_file, conn, req.path)
 
                 for data_src in data_sources:
                     data_src.bytes_transferred = 0
-                    tar_stream = TarStream()
                     for conn in data_src.conns:
-                        info = tar_stream.create_tarinfo(
+                        info = conn['conn'].tar_stream.create_tarinfo(
                             REGTYPE, conn['dev'],
                             data_src.content_length)
-                        if not conn['conn'].failed:
-                            conn['conn'].queue.put('%x\r\n%s\r\n' %
-                                                   (len(info), info)
-                            if chunked else info)
+                        for chunk in conn['conn'].tar_stream._serve_chunk(info):
+                            if not conn['conn'].failed:
+                                conn['conn'].queue.put('%x\r\n%s\r\n' %
+                                                       (len(chunk), chunk)
+                                if chunked else chunk)
                     while True:
                         with ChunkReadTimeout(self.app.client_timeout):
                             try:
-                                chunk = next(data_src.app_iter)
+                                data = next(data_src.app_iter)
                             except StopIteration:
-                                if chunked:
+                                blocks, remainder = divmod(data_src.bytes_transferred,
+                                    BLOCKSIZE)
+                                if remainder > 0:
+                                    nulls = NUL * (BLOCKSIZE - remainder)
                                     for conn in data_src.conns:
-                                        if conn['conn'].last_data is data_src:
+                                        for chunk in conn['conn'].tar_stream._serve_chunk(nulls):
+                                            if not conn['conn'].failed:
+                                                conn['conn'].queue.put('%x\r\n%s\r\n' % (len(chunk), chunk)
+                                                if chunked else chunk)
+                                            else:
+                                                return HTTPServiceUnavailable(request=req)
+                                for conn in data_src.conns:
+                                    if conn['conn'].last_data is data_src:
+                                        if conn['conn'].tar_stream.data:
+                                            data = conn['conn'].tar_stream.data
+                                            if not conn['conn'].failed:
+                                                conn['conn'].queue.put('%x\r\n%s\r\n'
+                                                                       % (len(data),data)
+                                                if chunked else data)
+                                            else:
+                                                return HTTPServiceUnavailable(request=req)
+                                        if chunked:
                                             conn['conn'].queue.put('0\r\n\r\n')
                                 break
-                        data_src.bytes_transferred += len(chunk)
+                        data_src.bytes_transferred += len(data)
                         if data_src.bytes_transferred > MAX_FILE_SIZE:
                             return HTTPRequestEntityTooLarge(request=req)
                         for conn in data_src.conns:
-                            if not conn['conn'].failed:
-                                conn['conn'].queue.put('%x\r\n%s\r\n' % (len(chunk), chunk)
-                                if chunked else chunk)
-                            else:
-                                return HTTPServiceUnavailable(request=req)
+                            for chunk in conn['conn'].tar_stream._serve_chunk(data):
+                                if not conn['conn'].failed:
+                                    conn['conn'].queue.put('%x\r\n%s\r\n' % (len(chunk), chunk)
+                                    if chunked else chunk)
+                                else:
+                                    return HTTPServiceUnavailable(request=req)
                     if data_src.bytes_transferred < data_src.content_length:
                         return HTTPClientDisconnect(request=req)
-                    blocks, remainder = divmod(data_src.bytes_transferred,
-                        BLOCKSIZE)
-                    if remainder > 0:
-                        nulls = NUL * (BLOCKSIZE - remainder)
-                        for conn in data_src.conns:
-                            if not conn['conn'].failed:
-                                conn['conn'].queue.put('%x\r\n%s\r\n' % (len(nulls), nulls)
-                                if chunked else nulls)
-                            else:
-                                return HTTPServiceUnavailable(request=req)
                 for conn in conns:
                     if conn.queue.unfinished_tasks:
                         conn.queue.join()
+                    conn.tar_stream = None
         except ChunkReadTimeout, err:
             self.app.logger.warn(
                 _('ERROR Client read timeout (%ss)'), err.seconds)
@@ -1369,12 +1400,13 @@ class ClusterController(Controller):
                     dest_header.split('/', 3)[2:]
                 dest_req = Request.blank(dest_header,
                     environ=request.environ, headers=request.headers)
+                dest_req.path_info = dest_header
                 dest_req.method = 'PUT'
                 dest_req.headers['Content-Length'] = info.size
                 untar_stream.to_write = info.size
                 untar_stream.offset_data = info.offset_data
                 dest_req.environ['wsgi.input'] =\
-                    untar_stream.untar_file_iter()
+                    ExtractedFile(untar_stream)
                 dest_resp = \
                     ObjectController(self.app, acct,
                     dest_container_name, dest_obj_name).PUT(dest_req)
@@ -1385,6 +1417,7 @@ class ClusterController(Controller):
                 info = untar_stream.get_next_tarinfo()
             bytes_transferred += len(data)
         untar_stream = None
+        resp.content_length = 0
         return conn
 
     def _connect_exec_node(self, obj_nodes, part, request,
@@ -1393,6 +1426,9 @@ class ClusterController(Controller):
         for node in obj_nodes:
             try:
                 with ConnectionTimeout(self.app.conn_timeout):
+                    if (request.content_length > 0) or 'transfer-encoding' in request.headers:
+                        request.headers['Expect'] = '100-continue'
+                    #request.headers['Connection'] = 'close'
                     conn = http_connect(node['ip'], node['port'],
                         node['device'], part, request.method,
                         request.path_info, request.headers)

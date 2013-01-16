@@ -1,11 +1,13 @@
 from __future__ import with_statement
+from StringIO import StringIO
 import re
 import struct
 from eventlet.green import socket
+import tarfile
 from swiftclient.client import quote
 import random
 import swift
-from swift.common.middleware.proxyquery import ZvmNode, ZvmChannel, NodeEncoder
+from swift.common.middleware.proxyquery import ZvmNode, ZvmChannel, NodeEncoder, CLUSTER_CONFIG_FILENAME
 
 try:
     import simplejson as json
@@ -390,7 +392,7 @@ if args.validate:
     errdump(0, valid, retcode, '', accounting, status)
     exit(0)
 retrieve_mnfst_field('NexeMax', isint=True)
-retrieve_mnfst_field('SyscallsMax', min=1, isint=True)
+retrieve_mnfst_field('SyscallsMax', min=1, isint=True, optional=True)
 retrieve_mnfst_field('NexeEtag', optional=True)
 retrieve_mnfst_field('Timeout', min=1, isint=True)
 retrieve_mnfst_field('MemMax', min=32*1048576, max=4096*1048576, isint=True)
@@ -399,6 +401,8 @@ retrieve_mnfst_field('CommandLine', optional=True)
 retrieve_mnfst_field('Channel')
 retrieve_mnfst_field('NodeName', optional=True)
 retrieve_mnfst_field('NameServer', optional=True)
+if not getattr(mnfst, 'NexeEtag', None):
+    mnfst.NexeEtag = 'DISABLED'
 
 channel_list = re.split('\s*,\s*',mnfst.Channel)
 if len(channel_list) % 7 != 0:
@@ -538,11 +542,39 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
                      'x-zerovm-execute': '1.0'})
         return req
 
+    def zerovm_tar_request(self):
+        req = Request.blank('/v1/a',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'Content-Type': 'application/x-gtar',
+                     'x-zerovm-execute': '1.0'})
+        return req
+
     def object_request(self, path):
         req = Request.blank(path,
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Content-Type': 'application/octet-stream'})
         return req
+
+    @contextmanager
+    def create_tar(self, dict):
+        tarfd, tarname = mkstemp()
+        os.close(tarfd)
+        tar = tarfile.open(name=tarname, mode='w')
+        for name, file in dict.iteritems():
+            info = tarfile.TarInfo(name)
+            file.seek(0, 2)
+            size = file.tell()
+            info.size = size
+            file.seek(0, 0)
+            tar.addfile(info, file)
+        tar.close()
+        try:
+            yield tarname
+        finally:
+            try:
+                os.unlink(tarname)
+            except OSError:
+                pass
 
     def test_QUERY_name_service(self):
         ns_server = proxyquery.NameService()
@@ -614,27 +646,17 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         ]
         conf = json.dumps(conf)
         prosrv = _test_servers[0]
-        req = self.zerovm_request()
-        req.body = conf
-        res = req.get_response(prosrv)
-        self.assertEqual(res.status_int, 200)
-        resp = [
-                {
-                'status': '201 Created',
-                'body': '',
-                #'body': '201 Created\n\n\n\n   ',
-                'name': 'sort',
-                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
-                'nexe_status': 'ok.',
-                'nexe_retcode': 0
-            }
-        ]
-        self.assertEqual(res.body, json.dumps(resp))
-
-        req = self.object_request('/v1/a/c/o2')
-        res = req.get_response(prosrv)
-        self.assertEqual(res.status_int, 200)
-        self.assertEqual(res.body, self.get_sorted_numbers())
+        req = self.zerovm_tar_request()
+        sysmap = StringIO(conf)
+        with self.create_tar({CLUSTER_CONFIG_FILENAME: sysmap}) as tar:
+            req.body_file = open(tar, 'rb')
+            req.content_length = os.path.getsize(tar)
+            res = req.get_response(prosrv)
+            self.assertEqual(res.status_int, 200)
+            req = self.object_request('/v1/a/c/o2')
+            res = req.get_response(prosrv)
+            self.assertEqual(res.status_int, 200)
+            self.assertEqual(res.body, self.get_sorted_numbers())
 
     def test_QUERY_sort_store_stdout_stderr(self):
         self.setup_QUERY()
@@ -655,18 +677,15 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         req.body = conf
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
-        resp = [
-                {
-                'status': '201 Created',
-                'body': '',
-                'name': 'sort',
-                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
-                'nexe_status': 'ok.',
-                'nexe_retcode': 0
-            }
-        ]
-        self.assertEqual(res.body, json.dumps(resp))
-
+        self.assertEqual(res.headers,{
+            'x-nexe-retcode': '0',
+            'content-length': '0',
+            'x-nexe-cdr-line': '0 0 0 0 0 0 0 0 0 0 0 0',
+            'x-nexe-validation': '1',
+            'x-nexe-system': 'sort',
+            'x-nexe-etag': 'DISABLED',
+            'x-nexe-status': 'ok.'
+        })
         req = self.object_request('/v1/a/c/o2')
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
@@ -682,8 +701,8 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         self.setup_QUERY()
         (_prosrv, _acc1srv, _acc2srv, _con1srv,
          _con2srv, _obj1srv, _obj2srv) = _test_servers
-        _obj1srv.zerovm_exename = ['./zerovm']
-        _obj2srv.zerovm_exename = ['./zerovm']
+        _obj1srv.zerovm_exename = ['zerovm']
+        _obj2srv.zerovm_exename = ['zerovm']
         prosrv = _test_servers[0]
         prolis = _test_sockets[0]
         fd = open('sort.nexe')

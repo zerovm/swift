@@ -73,7 +73,7 @@ if args.validate:
     errdump(0, valid, retcode, '', accounting, status)
     exit(0)
 retrieve_mnfst_field('NexeMax', isint=True)
-retrieve_mnfst_field('SyscallsMax', min=1, isint=True)
+retrieve_mnfst_field('SyscallsMax', min=1, isint=True, optional=True)
 retrieve_mnfst_field('NexeEtag', optional=True)
 retrieve_mnfst_field('Timeout', min=1, isint=True)
 retrieve_mnfst_field('MemMax', min=32*1048576, max=4096*1048576, isint=True)
@@ -82,6 +82,8 @@ retrieve_mnfst_field('CommandLine', optional=True)
 retrieve_mnfst_field('Channel')
 retrieve_mnfst_field('NodeName', optional=True)
 retrieve_mnfst_field('NameServer', optional=True)
+if not getattr(mnfst, 'NexeEtag', None):
+    mnfst.NexeEtag = 'DISABLED'
 
 channel_list = re.split('\s*,\s*',mnfst.Channel)
 if len(channel_list) % 7 != 0:
