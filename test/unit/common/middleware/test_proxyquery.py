@@ -697,7 +697,6 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         self.assertEqual(res.body, '\nfinished\n')
 
     def test_QUERY_sort_store_stdout_stderr_realzvm(self):
-        raise SkipTest
         self.setup_QUERY()
         (_prosrv, _acc1srv, _acc2srv, _con1srv,
          _con2srv, _obj1srv, _obj2srv) = _test_servers
@@ -705,7 +704,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         _obj2srv.zerovm_exename = ['zerovm']
         prosrv = _test_servers[0]
         prolis = _test_sockets[0]
-        fd = open('sort.nexe')
+        fd = open('sort_uint_proper_with_args.nexe')
         exe = fd.read()
         fd.close()
         self.create_object(prolis, '/v1/a/c/sort.exe', exe)
@@ -714,13 +713,15 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         conf = [
                 {
                 'name':'sort',
-                'exec':{'path':'/c/sort.exe'},
+                'exec':{
+                    'path':'/c/sort.exe',
+                    'args':'%d' % (1024 * 1024)
+                    },
                 'file_list':[
                         {'device':'stdin','path':'/c/binary.data'},
                         {'device':'stdout','path':'/c/binary.out'},
                         {'device':'stderr','path':'/c/sort.log'}
-                ],
-                'args':'%d' % (1024 * 1024)
+                ]
             }
         ]
         conf = json.dumps(conf)
@@ -728,17 +729,15 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         req.body = conf
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
-        resp = [
-                {
-                'status': '201 Created',
-                'body': '201 Created\n\n\n\n   ',
-                'name': 'sort',
-                'nexe_etag': 'disabled',
-                'nexe_status': 'ok',
-                'nexe_retcode': 0
-            }
-        ]
-        self.assertEqual(res.body, json.dumps(resp))
+        self.assertEqual(res.headers, {
+            'x-nexe-retcode': '0',
+            'content-length': '0',
+            'x-nexe-cdr-line': '0 0 0 0 0 0 0 0 0 0 0 0',
+            'x-nexe-validation': '1',
+            'x-nexe-system': 'sort',
+            'x-nexe-etag': 'disabled',
+            'x-nexe-status': 'ok'
+        })
 
         req = self.object_request('/v1/a/c/binary.out')
         res = req.get_response(prosrv)

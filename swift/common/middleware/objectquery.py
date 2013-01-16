@@ -556,6 +556,7 @@ class ObjectQueryMiddleware(object):
 #                if 'x-name-service' in req.headers:
 #                    zerovm_inputmnfst += 'NameServer=%s\n'\
 #                    % req.headers['x-name-service']
+                #print config
                 #print zerovm_inputmnfst
                 while zerovm_inputmnfst:
                     written = self.os_interface.write(zerovm_inputmnfst_fd,
