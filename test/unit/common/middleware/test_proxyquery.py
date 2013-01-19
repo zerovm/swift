@@ -1539,6 +1539,26 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 422)
 
+    def test_QUERY_invalid_nexe_name(self):
+        conf = [
+            {
+                'name':'sort',
+                'exec':{'path':'/c/error'},
+                'file_list':[
+                    {'device':'stdin','path':'/c/o'},
+                    {'device':'stdout', 'path':'/c/out'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        prosrv = _test_servers[0]
+        req = self.zerovm_request()
+        req.body = conf
+        #req.headers['etag'] = '1111'
+        res = req.get_response(prosrv)
+        print res.body
+        #self.assertEqual(res.status_int, 422)
+
     def test_QUERY_missing_required_fields(self):
         conf = [
                 {

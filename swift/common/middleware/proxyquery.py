@@ -1126,7 +1126,7 @@ class ClusterController(Controller):
                 channels.append(ZvmChannel('boot', None, node.exe))
             if len(node.channels) > 1:
                 for ch in node.channels[1:]:
-                    if ch.path[0] == '/' and \
+                    if ch.path and ch.path[0] == '/' and \
                        (ch.access & (ACCESS_READABLE | ACCESS_CDR)):
                         channels.append(ch)
 
@@ -1148,7 +1148,7 @@ class ClusterController(Controller):
                             src_container_name, src_obj_name)\
                         .GET(source_req)
                     if source_resp.status_int >= 300:
-                        update_headers(source_resp.headers, nexe_headers)
+                        update_headers(source_resp, nexe_headers)
                         return source_resp
                     source_resp.nodes = []
                     data_sources.append(source_resp)
