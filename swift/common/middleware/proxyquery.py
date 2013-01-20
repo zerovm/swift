@@ -1162,8 +1162,6 @@ class ClusterController(Controller):
             if image_resp:
                 node.last_data = image_resp
                 image_resp.nodes.append({'node':node, 'dev':'image'})
-        if image_resp:
-            data_sources.append(image_resp)
 #            stdlist = []
 #            for ch in node.channels:
 #                if 'stdout' in ch.device or 'stderr' in ch.device:
@@ -1222,6 +1220,9 @@ class ClusterController(Controller):
             pile.spawn(self._connect_exec_node, node_iter, partition,
                 exec_request, self.app.logger.thread_locals, node,
                 nexe_headers)
+
+        if image_resp:
+            data_sources.append(image_resp)
 
         conns = [conn for conn in pile if conn]
         if len(conns) < len(node_list):
