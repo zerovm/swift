@@ -422,259 +422,6 @@ class ClusterController(Controller):
             return ret
         return result
 
-    def make_request(self, node, request, ns_port):
-        nexe_headers = {
-            'x-node-name': node.name,
-            'x-nexe-status': 'ZeroVM did not run',
-            'x-nexe-retcode' : 0,
-            'x-nexe-etag': ''
-        }
-        path_info = request.path_info
-        top_path = node.channels[0].path
-        if top_path and top_path[0] == '/' and \
-           ((node.channels[0].access & ACCESS_READABLE)
-           or (node.channels[0].access & ACCESS_CDR)):
-            path_info += top_path
-            account, container, obj = split_path(path_info, 1, 3, True)
-            partition, obj_nodes = self.app.object_ring.get_nodes(
-                account, container, obj)
-        else:
-            partition, obj_nodes = self.get_random_nodes()
-
-        code_source = None
-        req = Request.blank(path_info,
-            environ=request.environ, headers=request.headers)
-        req.content_length = None
-        req.etag = None
-        req.headers['Content-Type'] =\
-            request.headers['Content-Type']
-        if node.exe[0] == '/':
-            load_from = request.path_info + node.exe
-            source_req = request.copy_get()
-            source_req.path_info = load_from
-            #source_req.headers['X-Newest'] = 'true'
-            acct, src_container_name, src_obj_name = \
-                split_path(load_from, 1, 3, True)
-            source_resp = \
-                ObjectController(self.app, acct,
-                    src_container_name, src_obj_name).GET(source_req)
-            if source_resp.status_int >= 300:
-                source_resp.headers = nexe_headers
-                return source_resp
-            code_source = source_resp.app_iter
-            req.content_length = source_resp.content_length
-            req.etag = source_resp.etag
-            req.headers['Content-Type'] = source_resp.headers['Content-Type']
-        else:
-            pass
-        shuffle(obj_nodes)
-        obj_nodes_iter = self.iter_nodes(partition, obj_nodes,
-            self.app.object_ring)
-        stdlist = []
-        for ch in node.channels:
-            if 'stdout' in ch.device or 'stderr' in ch.device:
-                if ch.path:
-                    stdlist.insert(0, ch)
-                else:
-                    stdlist.append(ch)
-        if stdlist:
-            req.headers['x-nexe-stdlist'] = ','.join(
-                [s.device for s in stdlist])
-        i = 0
-        for dst in node.bind:
-            dst_id = self.nodes.get(dst).id
-            req.headers['x-nexe-channel-' + str(i)] = \
-                ','.join(['tcp:%d:0' % dst_id,
-                          '/dev/in/' + dst,
-                          '0',
-                          str(self.app.zerovm_maxiops),
-                          str(self.app.zerovm_maxinput),
-                          '0,0'])
-            i += 1
-        for dst in node.connect:
-            dst_id = self.nodes.get(dst).id
-            req.headers['x-nexe-channel-' + str(i)] = \
-            ','.join(['tcp:%d:' % dst_id,
-                      '/dev/out/' + dst,
-                      '0,0,0',
-                      str(self.app.zerovm_maxiops),
-                      str(self.app.zerovm_maxoutput)]
-            )
-            i += 1
-        req.headers['x-nexe-channels'] = str(i)
-
-        req.headers['x-node-name'] = '%s,%d' % (node.name, node.id)
-
-        if self.app.zerovm_ns_hostname:
-            addr = self.app.zerovm_ns_hostname
-        else:
-            for n in obj_nodes:
-                addr = self.get_local_address(n)
-                if addr:
-                    break
-        req.headers['x-name-service'] = 'udp:%s:%d' % (addr, ns_port)
-        if node.args:
-            req.headers['x-nexe-args'] = node.args
-        if node.env:
-            req.headers['x-nexe-env'] = ','.join(
-                reduce(lambda x, y: x + y, node.env.items()))
-        req.path_info = path_info
-
-        def connect():
-            for node in obj_nodes_iter:
-                req.headers['Expect'] = '100-continue'
-                try:
-                    with ConnectionTimeout(self.app.conn_timeout):
-                        conn = http_connect(node['ip'], node['port'],
-                            node['device'], partition, req.method,
-                            path_info, headers=req.headers,
-                            query_string=req.query_string)
-                    with Timeout(self.app.node_timeout):
-                        resp = conn.getexpect()
-                    if resp.status == 100:
-                        conn.node = node
-                        return conn
-                except:
-                    self.exception_occurred(node, _('Object'),
-                        _('Expect: 100-continue on %s') % request.path_info)
-                    continue
-        conn = connect()
-        if not conn:
-            self.app.logger.exception(
-                _('ERROR Cannot find suitable node to execute code on'))
-            return HTTPServiceUnavailable(
-                body='Cannot find suitable node to execute code on',
-                headers=nexe_headers)
-
-        chunked = req.headers.get('transfer-encoding')
-        try:
-            req.bytes_transferred = 0
-            while True:
-                with ChunkReadTimeout(self.app.node_timeout):
-                    try:
-                        chunk = next(code_source)
-                    except StopIteration:
-                        if chunked:
-                            conn.send('0\r\n\r\n')
-                        break
-                    req.bytes_transferred += len(chunk)
-                    if req.bytes_transferred > self.app.zerovm_maxnexe:
-                        return HTTPRequestEntityTooLarge(request=req,
-                            headers=nexe_headers)
-                    try:
-                        with ChunkWriteTimeout(self.app.node_timeout):
-                            conn.send('%x\r\n%s\r\n' % (len(chunk), chunk)
-                            if chunked else chunk)
-                            sleep()
-                    except (Exception, ChunkWriteTimeout):
-                        raise Exception(conn.node, _('Object'),
-                            _('Trying to write to %s') % req.path_info)
-
-        except ChunkReadTimeout, err:
-            self.app.logger.warn(
-                _('ERROR Client read timeout (%ss)'), err.seconds)
-            return HTTPRequestTimeout(request=req, headers=nexe_headers)
-        except Exception:
-            req.client_disconnect = True
-            self.app.logger.exception(
-                _('ERROR Exception causing client disconnect'))
-            return Response(status='499 Client Disconnect',
-                headers=nexe_headers)
-        if req.content_length and req.bytes_transferred < req.content_length:
-            req.client_disconnect = True
-            self.app.logger.warn(
-                _('Client disconnected without sending enough data'))
-            return Response(status='499 Client Disconnect',
-                headers=nexe_headers)
-        try:
-            with Timeout(self.app.node_timeout):
-                server_response = conn.getresponse()
-        except (Exception, Timeout):
-            self.exception_occurred(conn.node, _('Object'),
-                _('Trying to get final status of POST to %s')
-                % req.path_info)
-            return Response(status='499 Client Disconnect',
-                headers=nexe_headers)
-        if server_response.status != 200:
-            resp = Response(status='%d %s' %
-                                   (server_response.status,
-                                    server_response.reason),
-                body=server_response.read())
-            update_headers(resp, nexe_headers)
-            return resp
-
-        std_size = server_response.getheader('x-nexe-stdsize')
-        if not std_size:
-            std_size = [server_response.getheader('content-length')]
-        else:
-            std_size = [int(s) for s in std_size.split(' ')]
-        req.bytes_transferred = 0
-
-        client_response = ''
-        dest_resp = ''
-        seq_resp = SequentialResponseBody(server_response, std_size)
-        def file_iter():
-            try:
-                while True:
-                    with ChunkReadTimeout(self.app.node_timeout):
-                        chunk = seq_resp.read(self.app.object_chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
-                    sleep()
-                    #client_response.bytes_transferred += len(chunk)
-            except GeneratorExit:
-                client_response.client_disconnect = True
-                self.app.logger.warn(_('Client disconnected on read'))
-            except (Exception, Timeout):
-                self.exception_occurred(conn.node, _('Object'),
-                    _('Trying to read during QUERY of %s') % req.path_info)
-                raise
-
-        for std in stdlist:
-            if std.path:
-                dest_header = unquote(std.path)
-                acct = req.path_info.split('/', 2)[1]
-                dest_header = '/' + acct + dest_header
-                dest_container_name, dest_obj_name = \
-                    dest_header.split('/', 3)[2:]
-                dest_req = Request.blank(dest_header)
-                dest_req.method = 'PUT'
-                dest_req.environ['wsgi.input'] = seq_resp
-                #dest_req.app_iter = self._make_app_iter(node, seq_resp, dest_req)
-                dest_req.headers['Content-Length'] = \
-                    seq_resp.get_content_length()
-                dest_resp = \
-                    ObjectController(self.app, acct,
-                        dest_container_name, dest_obj_name).PUT(dest_req)
-                if dest_resp.status_int >= 300:
-                    update_headers(dest_resp, nexe_headers)
-                    return dest_resp
-                update_headers(dest_resp, server_response.getheaders())
-            else:
-                if client_response:
-                    client_response = Response(request=req,
-                        conditional_response=True, body=server_response.read())
-                else:
-                    client_response = Response(request=req,
-                        conditional_response=True, app_iter=file_iter())
-                    client_response.content_length = \
-                        seq_resp.get_content_length()
-                update_headers(client_response, server_response.getheaders())
-                update_headers(client_response, {'accept-ranges': 'bytes'})
-                client_response.status = server_response.status
-                if server_response.getheader('Content-Type'):
-                    client_response.charset = None
-                    client_response.content_type =\
-                    server_response.getheader('Content-Type')
-            seq_resp.next_response()
-        if not client_response:
-            if not dest_resp:
-                raise Exception('Invalid response from obj server: %s %s'
-                    % (server_response.status, server_response.read()))
-            return dest_resp
-        return client_response
-
     def parse_cluster_config(self, req, cluster_config):
         try:
             cluster_config = json.loads(cluster_config)
@@ -713,10 +460,6 @@ class ClusterController(Controller):
                                 body='Unknown device %s in %s'
                                 % (device, node_name))
                         if access & ACCESS_READABLE:
-                            #if len(read_list) > 0:
-                            #    return HTTPBadRequest(request=req,
-                            #        body='More than one readable file in %s'
-                            #        % node_name)
                             read_list.insert(0, f)
                         elif access & ACCESS_CDR:
                             read_list.append(f)
@@ -884,15 +627,6 @@ class ClusterController(Controller):
                                 return HTTPBadRequest(request=req,
                                     body='Immediate response is not available '
                                          'for multiple nodes')
-#                                for i in range(1, node_count + 1):
-#                                    new_name = self.create_name(node_name, i)
-#                                    new_node = self.nodes.get(new_name)
-#                                    if not new_node:
-#                                        new_node = ZvmNode(nid, new_name,
-#                                            nexe_path, nexe_args, nexe_env)
-#                                        nid += 1
-#                                        self.nodes[new_name] = new_node
-#                                    new_node.add_channel(device, access)
                             else:
                                 new_node = self.nodes.get(node_name)
                                 if not new_node:
@@ -1084,7 +818,6 @@ class ClusterController(Controller):
         if not addr:
             return HTTPServiceUnavailable(
                 body='Cannot find own address, check zerovm_ns_hostname')
-            #exec_request.headers['x-name-service'] = 'udp:%s:%d' % (addr, ns_port)
         for node in node_list:
             node.name_service = 'udp:%s:%d' % (addr, ns_port)
             sysmap = json.dumps(node, cls=NodeEncoder)
@@ -1152,75 +885,15 @@ class ClusterController(Controller):
                         return source_resp
                     source_resp.nodes = []
                     data_sources.append(source_resp)
-                    #exec_request.content_length = \
-                    #    source_resp.content_length
-                    #exec_request.etag = source_resp.etag
-                    #exec_request.headers['Content-Type'] = \
-                    #    source_resp.headers['Content-Type']
                 node.last_data = source_resp
                 source_resp.nodes.append({'node':node, 'dev':ch.device})
             if image_resp:
                 node.last_data = image_resp
                 image_resp.nodes.append({'node':node, 'dev':'image'})
-#            stdlist = []
-#            for ch in node.channels:
-#                if 'stdout' in ch.device or 'stderr' in ch.device:
-#                    if ch.path:
-#                        stdlist.insert(0, ch)
-#                    else:
-#                        stdlist.append(ch)
-#            if stdlist:
-#                exec_request.headers['x-nexe-stdlist'] = ','.join(
-#                    [s.device for s in stdlist])
-#            i = 0
-#            for dst in node.bind:
-#                dst_id = self.nodes.get(dst).id
-#                exec_request.headers['x-nexe-channel-' + str(i)] =\
-#                ','.join(['tcp:%d:0' % dst_id,
-#                          '/dev/in/' + dst,
-#                          '0',
-#                          str(self.app.zerovm_maxiops),
-#                          str(self.app.zerovm_maxinput),
-#                          '0,0'])
-#                i += 1
-#            for dst in node.connect:
-#                dst_id = self.nodes.get(dst).id
-#                exec_request.headers['x-nexe-channel-' + str(i)] =\
-#                ','.join(['tcp:%d:' % dst_id,
-#                          '/dev/out/' + dst,
-#                          '0,0,0',
-#                          str(self.app.zerovm_maxiops),
-#                          str(self.app.zerovm_maxoutput)]
-#                )
-#                i += 1
-#            exec_request.headers['x-nexe-channels'] = str(i)
-#
-#            exec_request.headers['x-node-name'] = '%s,%d' % (node.name, node.id)
-
-#            if self.app.zerovm_ns_hostname:
-#                addr = self.app.zerovm_ns_hostname
-#            else:
-#                for n in obj_nodes:
-#                    addr = self.get_local_address(n)
-#                    if addr:
-#                        break
-#            if not addr:
-#                return HTTPServiceUnavailable(
-#                    body='Cannot find own address, check zerovm_ns_hostname')
-            #exec_request.headers['x-name-service'] = 'udp:%s:%d' % (addr, ns_port)
-#            node.name_service = 'udp:%s:%d' % (addr, ns_port)
-#            if node.args:
-#                exec_request.headers['x-nexe-args'] = node.args
-#            if node.env:
-#                exec_request.headers['x-nexe-env'] = ','.join(
-#                    reduce(lambda x, y: x + y, node.env.items()))
-
-            #exec_request.path_info = path_info
             node_iter = self.iter_nodes(partition, obj_nodes, self.app.object_ring)
             pile.spawn(self._connect_exec_node, node_iter, partition,
                 exec_request, self.app.logger.thread_locals, node,
                 nexe_headers)
-
         if image_resp:
             data_sources.append(image_resp)
 
@@ -1316,32 +989,6 @@ class ClusterController(Controller):
             return HTTPClientDisconnect(request=req, body='exception')
 
         for conn in conns:
-#            try:
-#                with Timeout(self.app.node_timeout):
-#                    if conn.resp:
-#                        server_response = conn.resp
-#                    else:
-#                        server_response = conn.getresponse()
-#            except (Exception, Timeout):
-#                self.exception_occurred(conn.node, _('Object'),
-#                    _('Trying to get final status of POST to %s')
-#                    % req.path_info)
-#                return HTTPClientDisconnect(body=conn.path,
-#                    headers=conn.nexe_headers)
-#            if server_response.status != 200:
-#                resp = Response(status='%d %s' %
-#                                       (server_response.status,
-#                                        server_response.reason),
-#                    body=server_response.read(),
-#                    headers = conn.nexe_headers)
-#                return resp
-#            print [conn, server_response]
-#            conn.resp = Response(status='%d %s' %
-#                                   (server_response.status,
-#                                    server_response.reason),
-#                    app_iter=iter(lambda:
-#                    server_response.read(self.app.network_chunk_size),''),
-#                    headers = dict(server_response.getheaders()))
             pile.spawn(self._process_response, conn, req)
 
         conns = [conn for conn in pile if conn]
@@ -1389,7 +1036,6 @@ class ClusterController(Controller):
                           server_response.reason,
                           server_response.read())
             return conn
-        print [conn, server_response]
         resp = Response(status='%d %s' %
                             (server_response.status,
                              server_response.reason),
