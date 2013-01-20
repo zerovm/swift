@@ -1298,7 +1298,7 @@ class ClusterController(Controller):
                                 else:
                                     return HTTPServiceUnavailable(request=req)
                     if data_src.bytes_transferred < data_src.content_length:
-                        return HTTPClientDisconnect(request=req, body='data source %s dead' % data_src.request.path)
+                        return HTTPClientDisconnect(request=req, body='data source %s dead' % data_src.__dict__)
                 for conn in conns:
                     if conn.queue.unfinished_tasks:
                         conn.queue.join()
