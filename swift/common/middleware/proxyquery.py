@@ -1487,7 +1487,9 @@ class ClusterController(Controller):
                         conn.send(chunk)
                 except (Exception, ChunkWriteTimeout):
                     conn.failed = True
-                    print conn.__dict__
+                    cc = str(conn.__dict__)
+                    for start in range(0, len(cc), 1024):
+                        print cc[start:start + 1024]
                     self.exception_occurred(conn.node, _('Object'),
                         _('Trying to write to %s') % path)
             conn.queue.task_done()
