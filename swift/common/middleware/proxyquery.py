@@ -1463,6 +1463,8 @@ class ClusterController(Controller):
                     conn.failed = True
                     self.exception_occurred(conn.node, _('Object'),
                         _('Trying to write to %s') % path)
+                    self.exception_occurred(conn.node, _('Object'),
+                        traceback.format_exc())
             conn.queue.task_done()
 
 def filter_factory(global_conf, **local_conf):

@@ -1331,33 +1331,15 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         req.body = jconf
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
-        resp = [
-                {
-                'status': '201 Created',
-                'body': '',
-                'name': 'sort-1',
-                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
-                'nexe_status': 'ok.',
-                'nexe_retcode': 0
-            },
-                {
-                'status': '201 Created',
-                'body': '',
-                'name': 'sort-2',
-                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
-                'nexe_status': 'ok.',
-                'nexe_retcode': 0
-            }
-        ]
-        self.assertEqual(json.dumps(resp), res.body)
+
         req = self.object_request('/v1/a/c_out1/output1')
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
-        self.assertEqual(res.body, self.get_sorted_numbers(0, 10))
+        self.assertEqual(str(res.body), self.get_sorted_numbers(0, 10))
         req = self.object_request('/v1/a/c_out1/output2')
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
-        self.assertEqual(res.body, self.get_sorted_numbers(10, 20))
+        self.assertEqual(str(res.body), self.get_sorted_numbers(10, 20))
 
     def test_QUERY_write_wildcard(self):
         self.setup_QUERY()
