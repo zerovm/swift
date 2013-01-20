@@ -1162,7 +1162,8 @@ class ClusterController(Controller):
             if image_resp:
                 node.last_data = image_resp
                 image_resp.nodes.append({'node':node, 'dev':'image'})
-                data_sources.append(image_resp)
+        if image_resp:
+            data_sources.append(image_resp)
 #            stdlist = []
 #            for ch in node.channels:
 #                if 'stdout' in ch.device or 'stderr' in ch.device:
