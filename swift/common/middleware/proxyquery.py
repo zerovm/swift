@@ -1314,31 +1314,32 @@ class ClusterController(Controller):
             return HTTPClientDisconnect(request=req)
 
         for conn in conns:
-            try:
-                with Timeout(self.app.node_timeout):
-                    if conn.resp:
-                        server_response = conn.resp
-                    else:
-                        server_response = conn.getresponse()
-            except (Exception, Timeout):
-                self.exception_occurred(conn.node, _('Object'),
-                    _('Trying to get final status of POST to %s')
-                    % req.path_info)
-                return HTTPClientDisconnect(body=conn.path,
-                    headers=conn.nexe_headers)
-            if server_response.status != 200:
-                resp = Response(status='%d %s' %
-                                       (server_response.status,
-                                        server_response.reason),
-                    body=server_response.read(),
-                    headers = conn.nexe_headers)
-                return resp
-            conn.resp = Response(status='%d %s' %
-                                   (server_response.status,
-                                    server_response.reason),
-                    app_iter=iter(lambda:
-                    server_response.read(self.app.network_chunk_size),''),
-                    headers = dict(server_response.getheaders()))
+#            try:
+#                with Timeout(self.app.node_timeout):
+#                    if conn.resp:
+#                        server_response = conn.resp
+#                    else:
+#                        server_response = conn.getresponse()
+#            except (Exception, Timeout):
+#                self.exception_occurred(conn.node, _('Object'),
+#                    _('Trying to get final status of POST to %s')
+#                    % req.path_info)
+#                return HTTPClientDisconnect(body=conn.path,
+#                    headers=conn.nexe_headers)
+#            if server_response.status != 200:
+#                resp = Response(status='%d %s' %
+#                                       (server_response.status,
+#                                        server_response.reason),
+#                    body=server_response.read(),
+#                    headers = conn.nexe_headers)
+#                return resp
+#            print [conn, server_response]
+#            conn.resp = Response(status='%d %s' %
+#                                   (server_response.status,
+#                                    server_response.reason),
+#                    app_iter=iter(lambda:
+#                    server_response.read(self.app.network_chunk_size),''),
+#                    headers = dict(server_response.getheaders()))
             pile.spawn(self._process_response, conn, req)
 
         conns = [conn for conn in pile if conn]
@@ -1368,7 +1369,32 @@ class ClusterController(Controller):
 
     def _process_response(self, conn, request):
         conn.error = None
-        resp = conn.resp
+        try:
+            with Timeout(self.app.node_timeout):
+                if conn.resp:
+                    server_response = conn.resp
+                else:
+                    server_response = conn.getresponse()
+        except (Exception, Timeout):
+            self.exception_occurred(conn.node, _('Object'),
+                _('Trying to get final status of POST to %s')
+                % request.path_info)
+            return HTTPClientDisconnect(body=conn.path,
+                headers=conn.nexe_headers)
+        if server_response.status != 200:
+            conn.error = '%d %s %s' % \
+                         (server_response.status,
+                          server_response.reason,
+                          server_response.read())
+            return conn
+        print [conn, server_response]
+        resp = Response(status='%d %s' %
+                            (server_response.status,
+                             server_response.reason),
+            app_iter=iter(lambda:
+                server_response.read(self.app.network_chunk_size),''),
+            headers = dict(server_response.getheaders()))
+        conn.resp = resp
         if resp.content_length == 0:
             return conn
         node = conn.cnode

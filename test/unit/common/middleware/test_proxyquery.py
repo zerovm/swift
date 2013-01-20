@@ -749,6 +749,80 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         self.assertEqual(res.status_int, 200)
         self.assert_('done\n' in res.body)
 
+    def test_QUERY_sort_transform_realzvm(self):
+        self.setup_QUERY()
+        (_prosrv, _acc1srv, _acc2srv, _con1srv,
+         _con2srv, _obj1srv, _obj2srv) = _test_servers
+        _obj1srv.zerovm_exename = ['zerovm']
+        _obj2srv.zerovm_exename = ['zerovm']
+        prosrv = _test_servers[0]
+        prolis = _test_sockets[0]
+        fd = open('sort_uint_proper_with_args.nexe')
+        exe = fd.read()
+        fd.close()
+        self.create_object(prolis, '/v1/a/c/sort.exe', exe)
+        size = 1024 * 1024 / 4
+        randomnum = self.get_random_numbers(0, size, proto='binary')
+        self.create_object(prolis, '/v1/a/c/binary.data', randomnum)
+        randomnum = self.get_random_numbers(size, size * 2, proto='binary')
+        self.create_object(prolis, '/v1/a/c/binary1.data', randomnum)
+        randomnum = self.get_random_numbers(size * 2, size * 3, proto='binary')
+        self.create_object(prolis, '/v1/a/c/binary2.data', randomnum)
+        conf = [
+            {
+                'name':'sort',
+                'exec':{
+                    'path':'/c/sort.exe',
+                    'args':'%d' % (1024 * 1024)
+                },
+                'file_list':[
+                    {'device':'stdin','path':'/c/binary*.data'},
+                    {'device':'stdout','path':'/c/binary*.out'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.headers,{
+            'x-nexe-retcode': '0,'
+                              '0,'
+                              '0',
+            'content-length': '0',
+            'x-nexe-cdr-line': '0 0 0 0 0 0 0 0 0 0 0 0,'
+                               '0 0 0 0 0 0 0 0 0 0 0 0,'
+                               '0 0 0 0 0 0 0 0 0 0 0 0',
+            'x-nexe-validation': '1,'
+                                 '1,'
+                                 '1',
+            'x-nexe-system': 'sort-1,'
+                             'sort-2,'
+                             'sort-3',
+            'x-nexe-etag': 'disabled,'
+                           'disabled,'
+                           'disabled',
+            'x-nexe-status': 'ok,'
+                             'ok,'
+                             'ok'
+        })
+
+        req = self.object_request('/v1/a/c/binary.out')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(0, size, proto='binary'))
+
+        req = self.object_request('/v1/a/c/binary1.out')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(size, size * 2, proto='binary'))
+
+        req = self.object_request('/v1/a/c/binary2.out')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.body, self.get_sorted_numbers(size * 2, size * 3, proto='binary'))
+
     def test_QUERY_generator_zerovm(self):
         raise SkipTest
         self.setup_QUERY()
