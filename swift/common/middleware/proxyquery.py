@@ -1301,6 +1301,7 @@ class ClusterController(Controller):
                         return HTTPClientDisconnect(request=req)
                 for conn in conns:
                     if conn.queue.unfinished_tasks:
+                        print 'joining'
                         conn.queue.join()
                     conn.tar_stream = None
         except ChunkReadTimeout, err:
@@ -1313,7 +1314,6 @@ class ClusterController(Controller):
                 _('ERROR Exception causing client disconnect'))
             return HTTPClientDisconnect(request=req)
 
-        print 'process requests'
         for conn in conns:
 #            try:
 #                with Timeout(self.app.node_timeout):
