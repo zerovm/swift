@@ -1040,7 +1040,7 @@ class ClusterController(Controller):
                 cluster_config += chunk
             if 'content-length' in req.headers and \
                int(req.headers['content-length']) != req.bytes_transferred:
-                return HTTPClientDisconnect(request=req)
+                return HTTPClientDisconnect(request=req, body='application/json post unfinished')
             etag = etag.hexdigest()
             if 'etag' in req.headers and\
                req.headers['etag'].lower() != etag:
@@ -1298,7 +1298,7 @@ class ClusterController(Controller):
                                 else:
                                     return HTTPServiceUnavailable(request=req)
                     if data_src.bytes_transferred < data_src.content_length:
-                        return HTTPClientDisconnect(request=req)
+                        return HTTPClientDisconnect(request=req, body='data source %s dead' % data_src.request.path)
                 for conn in conns:
                     if conn.queue.unfinished_tasks:
                         conn.queue.join()
@@ -1311,7 +1311,7 @@ class ClusterController(Controller):
         except (Exception, Timeout):
             self.app.logger.exception(
                 _('ERROR Exception causing client disconnect'))
-            return HTTPClientDisconnect(request=req)
+            return HTTPClientDisconnect(request=req, body='exception')
 
         for conn in conns:
 #            try:
@@ -1481,14 +1481,12 @@ class ClusterController(Controller):
     def _send_file(self, conn, path):
         while True:
             chunk = conn.queue.get()
-            print conn.queue.qsize()
             if not conn.failed:
                 try:
                     with ChunkWriteTimeout(self.app.node_timeout):
                         conn.send(chunk)
                 except (Exception, ChunkWriteTimeout):
                     conn.failed = True
-                    print 'final %d' % conn.queue.qsize()
                     self.exception_occurred(conn.node, _('Object'),
                         _('Trying to write to %s') % path)
             conn.queue.task_done()
