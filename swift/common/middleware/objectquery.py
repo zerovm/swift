@@ -303,7 +303,6 @@ class ObjectQueryMiddleware(object):
             untar_stream = UntarStream(read_iter)
             for chunk in read_iter:
                 upload_size += len(chunk)
-                print 'got %d bytes' % len(chunk)
                 if time.time() > upload_expiration:
                     return HTTPRequestTimeout(request=req, headers=nexe_headers)
                 etag.update(chunk)
@@ -313,11 +312,14 @@ class ObjectQueryMiddleware(object):
                     if info.offset_data:
                         channels[info.name] = os.path.join(zerovm_tmp, info.name)
                         fp = open(channels[info.name], 'ab')
+                        print 'open file %s' % info.name
                         untar_stream.to_write = info.size
                         untar_stream.offset_data = info.offset_data
                         for data in untar_stream.untar_file_iter():
+                            print 'write %d bytes' % len(data)
                             fp.write(data)
                         fp.close()
+                        print 'close file'
                     info = untar_stream.get_next_tarinfo()
             if 'content-length' in req.headers\
             and int(req.headers['content-length']) != upload_size:
