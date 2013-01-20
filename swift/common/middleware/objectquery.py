@@ -303,7 +303,7 @@ class ObjectQueryMiddleware(object):
             untar_stream = UntarStream(read_iter)
             for chunk in read_iter:
                 upload_size += len(chunk)
-                print 'got %d bytes' % chunk
+                print 'got %d bytes' % len(chunk)
                 if time.time() > upload_expiration:
                     return HTTPRequestTimeout(request=req, headers=nexe_headers)
                 etag.update(chunk)
