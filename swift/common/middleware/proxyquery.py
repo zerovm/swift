@@ -1301,7 +1301,6 @@ class ClusterController(Controller):
                         return HTTPClientDisconnect(request=req)
                 for conn in conns:
                     if conn.queue.unfinished_tasks:
-                        print 'joining'
                         conn.queue.join()
                     conn.tar_stream = None
         except ChunkReadTimeout, err:
@@ -1488,6 +1487,7 @@ class ClusterController(Controller):
                         conn.send(chunk)
                 except (Exception, ChunkWriteTimeout):
                     conn.failed = True
+                    print conn.__dict__
                     self.exception_occurred(conn.node, _('Object'),
                         _('Trying to write to %s') % path)
             conn.queue.task_done()

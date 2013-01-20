@@ -629,7 +629,7 @@ class ObjectQueryMiddleware(object):
 
                 response = Response(app_iter=resp_iter(response_channels,
                     self.app.network_chunk_size),
-                    request=req, conditional_response=True)
+                    request=req)
                 response.headers['x-nexe-retcode'] = nexe_retcode
                 response.headers['x-nexe-status'] = nexe_status
                 response.headers['x-nexe-etag'] = nexe_etag
