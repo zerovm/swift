@@ -312,14 +312,14 @@ class ObjectQueryMiddleware(object):
                     if info.offset_data:
                         channels[info.name] = os.path.join(zerovm_tmp, info.name)
                         fp = open(channels[info.name], 'ab')
-                        print 'open file %s' % info.name
+                        print 'open file %s' % channels[info.name]
                         untar_stream.to_write = info.size
                         untar_stream.offset_data = info.offset_data
                         for data in untar_stream.untar_file_iter():
-                            print 'write %d bytes' % len(data)
+                            print 'write %d to file %s' % (len(data), channels[info.name])
                             fp.write(data)
                         fp.close()
-                        print 'close file'
+                        print 'close file %s' % channels[info.name]
                     info = untar_stream.get_next_tarinfo()
             if 'content-length' in req.headers\
             and int(req.headers['content-length']) != upload_size:
