@@ -484,7 +484,7 @@ class TempAuth(object):
                             'x-auth-token': token,
                             'x-storage-token': token,
                             'x-storage-url': self.users[account_user]['url'],
-                            'set-cookie': cookie['session'].output()})
+                            'set-cookie': cookie['session'].output(header='').strip()})
 
     def posthooklogger(self, env, req):
         if not req.path.startswith(self.auth_prefix):
