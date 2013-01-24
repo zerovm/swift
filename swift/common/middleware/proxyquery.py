@@ -1,4 +1,5 @@
 from __future__ import with_statement
+from Cookie import SimpleCookie
 import ctypes
 import re
 import struct
@@ -8,6 +9,7 @@ import time
 from hashlib import md5
 from eventlet import GreenPile, GreenPool, sleep, Queue
 import greenlet
+import datetime
 from swift.common.http import HTTP_CONTINUE, is_success, HTTP_INSUFFICIENT_STORAGE
 from swiftclient.client import quote
 from swift.proxy.controllers.base import update_headers
@@ -211,6 +213,20 @@ class ProxyQueryMiddleware(object):
         self.app.network_chunk_size = int(conf.get('network_chunk_size', 65536))
 
     def __call__(self, env, start_response):
+
+        def cookie_response(status, headers, exc_info=None):
+            for h, v in list(headers):
+                if 'x-auth-token' in h.lower():
+                    cookie = SimpleCookie()
+                    cookie['session'] = v
+                    cookie['session']['path'] = '/'
+                    cookie['session']['domain'] = 'z.litestack.com'
+                    expiration = datetime.datetime.now() + datetime.timedelta(days=30)
+                    cookie['session']['expires'] = expiration.strftime('%a, %d %b %Y %H:%M:%S')
+                    headers.append(('Set-Cookie',cookie['session'].output()))
+                    break
+            return start_response(status, headers, exc_info)
+
         req = Request(env)
         if req.method == 'POST' and 'x-zerovm-execute' in req.headers:
             if req.content_length and req.content_length < 0:
@@ -260,7 +276,7 @@ class ProxyQueryMiddleware(object):
                         return resp(env, start_response)
             res = handler(req)
         else:
-            return self.app(env, start_response)
+            return self.app(env, cookie_response)
         return res(env, start_response)
 
     def get_controller(self, account):
