@@ -140,6 +140,10 @@ class TempAuth(object):
         will be routed through the internal auth request handler (self.handle).
         This is to handle granting tokens, etc.
         """
+        auth_token = SimpleCookie(env.get('HTTP_COOKIE',''))['session'].value
+        if auth_token:
+            env['HTTP_X_AUTH_TOKEN'] = auth_token
+            env['HTTP_X_STORAGE_TOKEN'] = auth_token
         if self.allow_overrides and env.get('swift.authorize_override', False):
             return self.app(env, start_response)
         if env.get('PATH_INFO', '').startswith(self.auth_prefix):
