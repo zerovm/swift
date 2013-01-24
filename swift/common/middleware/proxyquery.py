@@ -66,6 +66,21 @@ def merge_headers(current, new):
             else:
                 current[key.lower()] += ',' + value
 
+def has_control_chars(line):
+    if line:
+        RE_ILLEGAL = u'([\u0000-\u0008\u000b-\u000c\u000e-\u001f\ufffe-\uffff])' +\
+                         u'|' +\
+                         u'([%s-%s][^%s-%s])|([^%s-%s][%s-%s])|([%s-%s]$)|(^[%s-%s])' %\
+                         (unichr(0xd800),unichr(0xdbff),unichr(0xdc00),unichr(0xdfff),
+                          unichr(0xd800),unichr(0xdbff),unichr(0xdc00),unichr(0xdfff),
+                          unichr(0xd800),unichr(0xdbff),unichr(0xdc00),unichr(0xdfff),
+                             )
+        if re.search(RE_ILLEGAL, line):
+            return True
+        if re.search(r"[\x01-\x1F\x7F]", line):
+            return True
+    return False
+
 class CachedBody(object):
 
     def __init__(self, read_iter, cache=None, cache_size=CONFIG_BYTE_SIZE,
@@ -434,6 +449,9 @@ class ClusterController(Controller):
                 if not node_name:
                     return HTTPBadRequest(request=req,
                         body='Must specify node name')
+                if has_control_chars(node_name):
+                    return HTTPBadRequest(request=req,
+                        body='Invalid node name')
                 nexe = node.get('exec')
                 if not nexe:
                     return HTTPBadRequest(request=req,
@@ -444,7 +462,13 @@ class ClusterController(Controller):
                         body='Must specify executable path for %s' % node_name)
                 nexe_args = nexe.get('args')
                 nexe_env = nexe.get('env')
+                if has_control_chars('%s %s %s' % (nexe_path, nexe_args, nexe_env)):
+                    return HTTPBadRequest(request=req,
+                        body='Invalid nexe property')
                 node_count = node.get('count', 1)
+                if not isinstance(node_count, int):
+                    return HTTPBadRequest(request=req,
+                        body='Invalid node count')
                 file_list = node.get('file_list')
                 read_list = []
                 write_list = []
@@ -453,6 +477,13 @@ class ClusterController(Controller):
                 if file_list:
                     for f in file_list:
                         device = f.get('device')
+                        if has_control_chars(device):
+                            return HTTPBadRequest(request=req,
+                                body='Bad device name')
+                        path = f.get('path')
+                        if has_control_chars(path):
+                            return HTTPBadRequest(request=req,
+                                body='Bad device path')
                         if not device:
                             return HTTPBadRequest(request=req,
                                 body='Must specify device for file in %s'
