@@ -12,6 +12,7 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from Cookie import SimpleCookie
 
 from time import gmtime, strftime, time
 from traceback import format_exc
@@ -22,6 +23,7 @@ import hmac
 import base64
 
 from eventlet import Timeout
+import datetime
 from swift.common.swob import Response, Request
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, HTTPNotFound, \
     HTTPUnauthorized
@@ -471,11 +473,18 @@ class TempAuth(object):
                 '%s/user/%s' % (self.reseller_prefix, account_user)
             memcache_client.set(memcache_user_key, token,
                                 timeout=float(expires - time()))
+        cookie = SimpleCookie()
+        cookie['session'] = token
+        cookie['session']['path'] = '/'
+        cookie['session']['domain'] = 'z.litestack.com'
+        expiration = datetime.datetime.now() + datetime.timedelta(days=30)
+        cookie['session']['expires'] = expiration.strftime('%a, %d %b %Y %H:%M:%S')
         return Response(request=req,
                         headers={
                             'x-auth-token': token,
                             'x-storage-token': token,
-                            'x-storage-url': self.users[account_user]['url']})
+                            'x-storage-url': self.users[account_user]['url'],
+                            'set-cookie': cookie['session'].output()})
 
     def posthooklogger(self, env, req):
         if not req.path.startswith(self.auth_prefix):

@@ -214,19 +214,6 @@ class ProxyQueryMiddleware(object):
 
     def __call__(self, env, start_response):
 
-        def cookie_response(status, headers, exc_info=None):
-            for h, v in list(headers):
-                if 'x-auth-token' in h.lower():
-                    cookie = SimpleCookie()
-                    cookie['session'] = v
-                    cookie['session']['path'] = '/'
-                    cookie['session']['domain'] = 'z.litestack.com'
-                    expiration = datetime.datetime.now() + datetime.timedelta(days=30)
-                    cookie['session']['expires'] = expiration.strftime('%a, %d %b %Y %H:%M:%S')
-                    headers.append(('Set-Cookie',cookie['session'].output()))
-                    break
-            return start_response(status, headers, exc_info)
-
         req = Request(env)
         if req.method == 'POST' and 'x-zerovm-execute' in req.headers:
             if req.content_length and req.content_length < 0:
@@ -276,7 +263,7 @@ class ProxyQueryMiddleware(object):
                         return resp(env, start_response)
             res = handler(req)
         else:
-            return self.app(env, cookie_response)
+            return self.app(env, start_response)
         return res(env, start_response)
 
     def get_controller(self, account):
