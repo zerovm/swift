@@ -142,7 +142,7 @@ class TempAuth(object):
         """
         auth_token = None
         try:
-            auth_token = SimpleCookie(env.get('HTTP_COOKIE','')).get('session', '').value
+            auth_token = SimpleCookie(env.get('HTTP_COOKIE',''))['session'].value
         except KeyError:
             pass
         if auth_token:
