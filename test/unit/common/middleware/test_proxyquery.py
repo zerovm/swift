@@ -7,7 +7,7 @@ import tarfile
 from swiftclient.client import quote
 import random
 import swift
-from swift.common.middleware.proxyquery import ZvmNode, ZvmChannel, NodeEncoder, CLUSTER_CONFIG_FILENAME
+from swift.common.middleware.proxyquery import ZvmNode, ZvmChannel, NodeEncoder, CLUSTER_CONFIG_FILENAME, NODE_CONFIG_FILENAME
 
 try:
     import simplejson as json
@@ -560,6 +560,19 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         tarfd, tarname = mkstemp()
         os.close(tarfd)
         tar = tarfile.open(name=tarname, mode='w')
+        sysmap = None
+        for name, file in dict.iteritems():
+            if name in [CLUSTER_CONFIG_FILENAME, NODE_CONFIG_FILENAME]:
+                info = tarfile.TarInfo(name)
+                file.seek(0, 2)
+                size = file.tell()
+                info.size = size
+                file.seek(0, 0)
+                tar.addfile(info, file)
+                sysmap = name
+                break
+        if sysmap:
+            del dict[sysmap]
         for name, file in dict.iteritems():
             info = tarfile.TarInfo(name)
             file.seek(0, 2)
@@ -822,6 +835,81 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
         self.assertEqual(res.body, self.get_sorted_numbers(size * 2, size * 3, proto='binary'))
+
+    def test_QUERY_mapred_realzvm(self):
+
+        def upload_file(listener, name, url):
+            fd = open(name)
+            content = fd.read()
+            fd.close()
+            self.create_object(listener, url, content)
+
+        self.setup_QUERY()
+        (_prosrv, _acc1srv, _acc2srv, _con1srv,
+         _con2srv, _obj1srv, _obj2srv) = _test_servers
+        _obj1srv.zerovm_exename = ['zerovm']
+        _obj2srv.zerovm_exename = ['zerovm']
+        _obj1srv.zerovm_timeout = 60
+        _obj2srv.zerovm_timeout = 60
+        _obj1srv.zerovm_maxnexemem = 128 * 1048576
+        _obj2srv.zerovm_maxnexemem = 128 * 1048576
+        _prosrv.app.node_timeout = 60
+        prosrv = _test_servers[0]
+        prolis = _test_sockets[0]
+        fd = open('mapred/map.nexe')
+        map_nexe = fd.read()
+        fd.close()
+        fd = open('mapred/reduce.nexe')
+        red_nexe = fd.read()
+        fd.close()
+        #upload_file(prolis, 'mapred/map.nexe', '/v1/a/c/map.nexe')
+        #upload_file(prolis, 'mapred/reduce.nexe', '/v1/a/c/reduce.nexe')
+        upload_file(prolis, 'mapred/1input.txt', '/v1/a/c/1input.txt')
+        upload_file(prolis, 'mapred/2input.txt', '/v1/a/c/2input.txt')
+        upload_file(prolis, 'mapred/3input.txt', '/v1/a/c/3input.txt')
+        upload_file(prolis, 'mapred/4input.txt', '/v1/a/c/4input.txt')
+        conf = [
+            {
+                'name':'map',
+                'exec':{
+                    'path':'boot/map.nexe',
+                    'env':{ 'MAP_NAME':'map', 'REDUCE_NAME':'red'}
+                },
+                'file_list':[
+                    {'device':'stdin','path':'/c/*input.txt'}
+                ],
+                'connect': [ 'map', 'red' ]
+            },
+            {
+                'name':'red',
+                'exec':{
+                    'path':'boot/reduce.nexe',
+                    'env':{ 'MAP_NAME':'map', 'REDUCE_NAME':'red'}
+                },
+                'file_list':[
+                    {'device':'stdout','path':'/c/*output.txt'}
+                ],
+                'connect': [ 'map' ],
+                'count': 5
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_tar_request()
+        sysmap = StringIO(conf)
+        map_nexe = StringIO(map_nexe)
+        red_nexe = StringIO(red_nexe)
+        with self.create_tar({CLUSTER_CONFIG_FILENAME: sysmap,
+                              'boot/map.nexe': map_nexe,
+                              'boot/reduce.nexe': red_nexe}) \
+        as tar:
+            req.body_file = open(tar, 'rb')
+            req.content_length = os.path.getsize(tar)
+            res = req.get_response(prosrv)
+#        req = self.zerovm_request()
+#        req.body = conf
+#        res = req.get_response(prosrv)
+            print res.headers
+            print res.body
 
     def test_QUERY_generator_zerovm(self):
         raise SkipTest

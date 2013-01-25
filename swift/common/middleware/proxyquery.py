@@ -56,15 +56,15 @@ def merge_headers(current, new):
     if hasattr(new, 'keys'):
         for key in new.keys():
             if not current[key.lower()]:
-                current[key.lower()] = new[key]
+                current[key.lower()] = str(new[key])
             else:
-                current[key.lower()] += ',' + new[key]
+                current[key.lower()] += ',' + str(new[key])
     else:
         for key, value in new:
             if not current[key.lower()]:
-                current[key.lower()] = value
+                current[key.lower()] = str(value)
             else:
-                current[key.lower()] += ',' + value
+                current[key.lower()] += ',' + str(value)
 
 def has_control_chars(line):
     if line:
@@ -734,9 +734,6 @@ class ClusterController(Controller):
                     body='Non existing node in connect string for node %s'
                         % node_name)
 
-        #for n in self.nodes.itervalues():
-        #    print n.__dict__
-
         for node in self.nodes.itervalues():
             tmp = []
             for dst in node.bind:
@@ -761,6 +758,9 @@ class ClusterController(Controller):
                           str(self.app.zerovm_maxoutput)])
                 )
             node.connect = tmp
+
+        #for n in self.nodes.itervalues():
+        #    print n.__dict__
 
         return None
 
@@ -1030,13 +1030,16 @@ class ClusterController(Controller):
         final_response = Response(request=req)
         for conn in conns:
             resp = conn.resp
-            for key in conn.nexe_headers.keys():
-                if resp.headers.get(key):
-                    conn.nexe_headers[key] = resp.headers.get(key)
+            if resp:
+                for key in conn.nexe_headers.keys():
+                    if resp.headers.get(key):
+                        conn.nexe_headers[key] = resp.headers.get(key)
             if conn.error:
                 conn.nexe_headers['x-nexe-error'] = conn.error
+
+            #print [final_response.headers, conn.nexe_headers]
             merge_headers(final_response.headers, conn.nexe_headers)
-            if resp.content_length > 0:
+            if resp and resp.content_length > 0:
                 if final_body:
                     final_body.append(resp.app_iter)
                     final_response.content_length += resp.content_length
@@ -1062,8 +1065,10 @@ class ClusterController(Controller):
             self.exception_occurred(conn.node, _('Object'),
                 _('Trying to get final status of POST to %s')
                 % request.path_info)
-            return HTTPClientDisconnect(body=conn.path,
-                headers=conn.nexe_headers)
+            conn.error = 'Timeout: trying to get final status of POST to %s' % request.path_info
+            #conn.resp = HTTPClientDisconnect(body=conn.path,
+            #    headers=conn.nexe_headers)
+            return conn
         if server_response.status != 200:
             conn.error = '%d %s %s' % \
                          (server_response.status,
