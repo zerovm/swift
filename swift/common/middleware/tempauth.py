@@ -140,7 +140,9 @@ class TempAuth(object):
         will be routed through the internal auth request handler (self.handle).
         This is to handle granting tokens, etc.
         """
-        auth_token = SimpleCookie(env.get('HTTP_COOKIE',''))['session'].value
+        auth_token = SimpleCookie(env.get('HTTP_COOKIE','')).get('session', '')
+        if auth_token:
+            auth_token = auth_token.value
         if auth_token:
             env['HTTP_X_AUTH_TOKEN'] = auth_token
             env['HTTP_X_STORAGE_TOKEN'] = auth_token
