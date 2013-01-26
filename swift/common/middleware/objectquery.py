@@ -428,6 +428,8 @@ class ObjectQueryMiddleware(object):
 
                 thrd = self.zerovm_thrdpool.spawn(self.execute_zerovm, zerovm_inputmnfst_fn)
                 (zerovm_retcode, zerovm_stdout, zerovm_stderr) = thrd.wait()
+                if zerovm_stderr:
+                    self.logger.warning('zerovm stderr: '+zerovm_stderr)
                 if zerovm_retcode:
                     err = 'ERROR OBJ.QUERY retcode=%s, '\
                           ' zerovm_stdout=%s'\
@@ -438,8 +440,6 @@ class ObjectQueryMiddleware(object):
                     nexe_headers['x-nexe-status'] = 'ZeroVM runtime error'
                     resp.headers = nexe_headers
                     return resp
-                if zerovm_stderr:
-                    self.logger.warning('zerovm stderr: '+zerovm_stderr)
                 report = zerovm_stdout.splitlines()
                 if len(report) < 5:
                     nexe_validation = 0
