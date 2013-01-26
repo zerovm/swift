@@ -79,7 +79,7 @@ class ObjectQueryMiddleware(object):
             self.logger = get_logger(conf, log_route='obj-query')
 
         self.zerovm_manifest_ver = conf.get('zerovm_manifest_ver','09082012')
-        self.zerovm_exename = set(i.strip() for i in conf.get('zerovm_exename', 'zerovm').split() if i.strip())
+        self.zerovm_exename = [i.strip() for i in conf.get('zerovm_exename', 'zerovm').split() if i.strip()]
         #self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '').split() if i.strip())
 
         # maximum number of simultaneous running zerovms, others are queued
@@ -134,7 +134,6 @@ class ObjectQueryMiddleware(object):
         cmdline = []
         cmdline += self.zerovm_exename
         cmdline += ['-M%s' % zerovm_inputmnfst_fn]
-        print cmdline
         proc = subprocess.Popen(cmdline, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
 
