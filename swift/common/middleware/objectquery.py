@@ -134,6 +134,7 @@ class ObjectQueryMiddleware(object):
         cmdline = []
         cmdline += self.zerovm_exename
         cmdline += ['-M%s' % zerovm_inputmnfst_fn]
+        print cmdline
         proc = subprocess.Popen(cmdline, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE)
 
@@ -420,7 +421,7 @@ class ObjectQueryMiddleware(object):
                     zerovm_inputmnfst += 'NameServer=%s\n'\
                                          % config['name_service']
                 #print config
-                print zerovm_inputmnfst
+                #print zerovm_inputmnfst
                 while zerovm_inputmnfst:
                     written = self.os_interface.write(zerovm_inputmnfst_fd,
                         zerovm_inputmnfst)

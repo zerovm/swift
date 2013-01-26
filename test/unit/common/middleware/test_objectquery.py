@@ -186,7 +186,8 @@ retrieve_mnfst_field('CommandLine', optional=True)
 retrieve_mnfst_field('Channel')
 retrieve_mnfst_field('NodeName', optional=True)
 retrieve_mnfst_field('NameServer', optional=True)
-
+if not getattr(mnfst, 'NexeEtag', None):
+    mnfst.NexeEtag = 'DISABLED'
 channel_list = re.split('\s*,\s*',mnfst.Channel)
 if len(channel_list) % 7 != 0:
     errdump(1,valid,0,mnfst.Nexe,accounting,'wrong channel config: %s' % mnfst.Channel)
