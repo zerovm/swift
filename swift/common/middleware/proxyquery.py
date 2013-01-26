@@ -170,33 +170,33 @@ class NameService(object):
         peer_map = {}
         while 1:
             try:
-                message, address = self.sock.recvfrom(65535)
+                message,peer_address = self.sock.recvfrom(65535)
                 offset = 0
-                alias = struct.unpack_from('!I', message, offset)[0]
+                peer_id = struct.unpack_from('!I', message, offset)[0]
                 offset += 4
                 count = struct.unpack_from('!I', message, offset)[0]
                 offset += 4
                 for i in range(count):
-                    h, _junk, port = struct.unpack_from('!IIH', message, offset)[0:3]
-                    bind_map.setdefault(alias, {})[h] = port
+                    connecting_host, _junk, port = struct.unpack_from('!IIH', message, offset)[0:3]
+                    bind_map.setdefault(peer_id, {})[connecting_host] = port
                     offset += 10
-                conn_map[alias] = ctypes.create_string_buffer(message[offset:])
-                peer_map.setdefault(alias, {})[0] = address[0]
-                peer_map.setdefault(alias, {})[1] = address[1]
+                conn_map[peer_id] = ctypes.create_string_buffer(message[offset:])
+                peer_map.setdefault(peer_id, {})[0] = peer_address[0]
+                peer_map.setdefault(peer_id, {})[1] = peer_address[1]
 
                 if len(peer_map) == self.peers:
-                    for src in peer_map.iterkeys():
-                        reply = conn_map[src]
+                    for peer_id in peer_map.iterkeys():
+                        reply = conn_map[peer_id]
                         offset = 0
                         count = struct.unpack_from('!I', reply, offset)[0]
                         offset += 4
                         for i in range(count):
-                            h = struct.unpack_from('!I', reply, offset)[0]
-                            port = bind_map[h][src]
+                            connecting_host = struct.unpack_from('!I', reply, offset)[0]
+                            port = bind_map[connecting_host][peer_id]
                             struct.pack_into('!4sH', reply, offset + 4,
-                                socket.inet_pton(socket.AF_INET, peer_map[src][0]), port)
+                                socket.inet_pton(socket.AF_INET, peer_map[connecting_host][0]), port)
                             offset += 10
-                        self.sock.sendto(reply, (peer_map[src][0], peer_map[src][1]))
+                        self.sock.sendto(reply, (peer_map[peer_id][0], peer_map[peer_id][1]))
             except greenlet.GreenletExit:
                 return
             except Exception:
