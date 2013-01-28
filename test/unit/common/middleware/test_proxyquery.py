@@ -58,7 +58,8 @@ def setup():
         swift.proxy.controllers.obj.CONTAINER_LISTING_LIMIT
     conf = {'devices': _testdir, 'swift_dir': _testdir,
             'mount_check': 'false', 'allowed_headers':
-            'content-encoding, x-object-manifest, content-disposition, foo'}
+            'content-encoding, x-object-manifest, content-disposition, foo',
+            'disable_fallocate': 'true'}
     prolis = listen(('localhost', 0))
     acc1lis = listen(('localhost', 0))
     acc2lis = listen(('localhost', 0))
@@ -910,6 +911,127 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
 #        res = req.get_response(prosrv)
             print res.headers
             print res.body
+
+    def test_QUERY_dist_sort_realzvm(self):
+
+        def upload_file(listener, name, url):
+            fd = open(name)
+            content = fd.read()
+            fd.close()
+            self.create_object(listener, url, content)
+
+        def load_file(name):
+            fd = open(name)
+            content = fd.read()
+            fd.close()
+            return StringIO(content)
+
+        self.setup_QUERY()
+        (_prosrv, _acc1srv, _acc2srv, _con1srv,
+         _con2srv, _obj1srv, _obj2srv) = _test_servers
+        _obj1srv.zerovm_exename = ['zerovm']
+        _obj2srv.zerovm_exename = ['zerovm']
+        _obj1srv.zerovm_timeout = 60
+        _obj2srv.zerovm_timeout = 60
+        _obj1srv.zerovm_maxnexemem = 128 * 1048576
+        _obj2srv.zerovm_maxnexemem = 128 * 1048576
+        _prosrv.app.node_timeout = 60
+        prosrv = _test_servers[0]
+        prolis = _test_sockets[0]
+        fd = open('generator.uint32_t.nexe')
+        gen_nexe = fd.read()
+        fd.close()
+        self.create_container(prolis, '/v1/a/disort')
+        #upload_file(prolis, 'mapred/map.nexe', '/v1/a/c/map.nexe')
+        #upload_file(prolis, 'mapred/reduce.nexe', '/v1/a/c/reduce.nexe')
+        conf = [
+            {
+                "name":"gen",
+                "exec":{
+                    "path":"generator.uint32_t.nexe",
+                    "args":"5000000"
+                },
+                "file_list":[
+                    { "device":"stdout", "path":"/disort/unsorted*.data" }
+                ],
+                "count": 5
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_tar_request()
+        sysmap = StringIO(conf)
+        gen_nexe = StringIO(gen_nexe)
+        with self.create_tar({CLUSTER_CONFIG_FILENAME: sysmap,
+                              'generator.uint32_t.nexe': gen_nexe}) \
+        as tar:
+            req.body_file = open(tar, 'rb')
+            req.content_length = os.path.getsize(tar)
+            res = req.get_response(prosrv)
+            #        req = self.zerovm_request()
+            #        req.body = conf
+            #        res = req.get_response(prosrv)
+            print res.headers
+            print res.body
+
+        req = self.object_request('/v1/a/disort/unsortedgen-1.data')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(len(res.body), res.content_length)
+        conf = [
+            {
+                "name": "man",
+                "exec": {
+                    "path": "nodeman.nexe",
+                    "args":"5000000",
+                    "env": {"SOURCE_NAME": "src", "DEST_NAME": "dst", "MAN_NAME": "man"}
+                },
+                "file_list": [
+                    {"device": "stderr"}
+                ],
+                "connect": ["src"]
+            },
+            {
+                "name": "src",
+                "exec": {
+                    "path": "nodesrc.nexe",
+                    "args":"5000000",
+                    "env": {"SOURCE_NAME": "src", "DEST_NAME": "dst", "MAN_NAME": "man"}
+                },
+                "file_list": [
+                    {"device": "stdin", "path": "/disort/unsorted*.data"}
+                ],
+                "connect": ["man", "dst"]
+            },
+            {
+                "name": "dst",
+                "exec": {
+                    "path": "nodedst.nexe",
+                    "args":"5000000",
+                    "env": {"SOURCE_NAME": "src", "DEST_NAME": "dst", "MAN_NAME": "man"}
+                },
+                "file_list": [
+                    {"device": "stdout", "path": "/disort/sorted*.data"}
+                ],
+                "connect": ["man"],
+                "count": 5
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_tar_request()
+        sysmap = StringIO(conf)
+        man_nexe = load_file('nodeman.nexe')
+        src_nexe = load_file('nodesrc.nexe')
+        dst_nexe = load_file('nodedst.nexe')
+        with self.create_tar({CLUSTER_CONFIG_FILENAME: sysmap,
+                              'nodeman.nexe': man_nexe,
+                              'nodesrc.nexe': src_nexe,
+                              'nodedst.nexe': dst_nexe})\
+        as tar:
+            req.body_file = open(tar, 'rb')
+            req.content_length = os.path.getsize(tar)
+            res = req.get_response(prosrv)
+            self.assertEqual(res.status_int, 200)
+            self.assertIn('crc OK', res.body)
 
     def test_QUERY_generator_zerovm(self):
         raise SkipTest

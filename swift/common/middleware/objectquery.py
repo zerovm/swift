@@ -23,7 +23,7 @@ from swift.common.tarstream import UntarStream, TarStream, REGTYPE, BLOCKSIZE, N
 
 from swift.common.utils import normalize_timestamp,\
     fallocate, split_path, drop_buffer_cache,\
-    get_logger, mkdirs
+    get_logger, mkdirs, disable_fallocate, TRUE_VALUES
 from swift.obj.server import DiskFile, write_metadata, read_metadata
 from swift.common.constraints import check_mount, check_utf8
 from swift.common.exceptions import DiskFileError, DiskFileNotExist
@@ -109,7 +109,7 @@ class ObjectQueryMiddleware(object):
         self.zerovm_maxnexe = int(conf.get('zerovm_maxnexe', 256 * 1048576))
 
         # maximum output data file size
-        self.zerovm_maxoutput = int(conf.get('zerovm_maxoutput', 64 * 1048576))
+        self.zerovm_maxoutput = int(conf.get('zerovm_maxoutput', 1024 * 1048576))
 
         self.zerovm_maxchunksize = int(conf.get('zerovm_maxchunksize', 1024 * 1024))
 
@@ -129,6 +129,9 @@ class ObjectQueryMiddleware(object):
 
         # green thread for zerovm execution
         self.zerovm_thrdpool = GreenPool(self.zerovm_maxpool)
+
+        if conf.get('disable_fallocate', 'no').lower() in TRUE_VALUES:
+            disable_fallocate()
 
     def execute_zerovm(self, zerovm_inputmnfst_fn):
         cmdline = []

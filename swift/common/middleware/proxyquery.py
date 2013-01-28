@@ -99,17 +99,27 @@ class CachedBody(object):
                     break
 
     def __iter__(self):
-        for chunk in self.cache:
-            yield chunk
         if self.total_size:
-            for chunk in self.read_iter:
+            for chunk in self.cache:
                 self.total_size -= len(chunk)
                 if self.total_size < 0:
                     yield chunk[:self.total_size]
                     break
                 else:
                     yield  chunk
+            if self.total_size > 0:
+                for chunk in self.read_iter:
+                    self.total_size -= len(chunk)
+                    if self.total_size < 0:
+                        yield chunk[:self.total_size]
+                        break
+                    else:
+                        yield  chunk
+            for chunk in self.read_iter:
+                pass
         else:
+            for chunk in self.cache:
+                yield chunk
             for chunk in self.read_iter:
                 yield chunk
 
@@ -1100,10 +1110,11 @@ class ClusterController(Controller):
                     conn.error = 'Channel name %s not found' % info.name
                     return conn
                 if not chan.path:
-                    cache = [untar_stream.block[info.offset_data:]]
-                    app_iter = iter(CachedBody(untar_stream.tar_iter,
-                        cache, total_size=info.size))
-                    resp.appp_iter = app_iter
+                    app_iter = iter(CachedBody(
+                        untar_stream.tar_iter,
+                        cache=[untar_stream.block[info.offset_data:]],
+                        total_size=info.size))
+                    resp.app_iter = app_iter
                     resp.content_length = info.size
                     return conn
                 dest_header = unquote(chan.path)
