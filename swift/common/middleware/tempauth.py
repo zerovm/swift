@@ -485,7 +485,7 @@ class TempAuth(object):
         cookie['session'] = token
         cookie['session']['path'] = '/'
         cookie['session']['domain'] = 'z.litestack.com'
-        expiration = datetime.datetime.now() + datetime.timedelta(days=30)
+        expiration = datetime.datetime.utcnow() + datetime.timedelta(days=30)
         cookie['session']['expires'] = expiration.strftime('%a, %d %b %Y %H:%M:%S')
         return Response(request=req,
                         headers={

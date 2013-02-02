@@ -99,6 +99,7 @@ setup(
                 'filter_factory',
             'proxy_query=swift.common.middleware.proxyquery:filter_factory',
             'object_query=swift.common.middleware.objectquery:filter_factory',
+            'liteauth=swift.common.middleware.liteauth:filter_factory',
         ],
     },
 )
