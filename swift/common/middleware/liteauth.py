@@ -120,7 +120,7 @@ class LiteAuth(object):
                 'x-storage-url': '%s/%s/%s' % (self.service_endpoint, self.version, user_data),
                 'set-cookie': cookie['session'].output(header='').strip(),
                 'location': '%s/%s/%s' % (self.service_endpoint, self.version, user_data)})
-        print resp.headers
+        #print resp.headers
         return resp
 
     def get_cached_user_data(self, env, token):
