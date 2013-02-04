@@ -32,21 +32,23 @@ class LiteAuth(object):
 
     def __call__(self, env, start_response):
         if env.get('PATH_INFO', '').startswith(self.google_auth):
+            state = [None]
             qs = env.get('QUERY_STRING')
             if qs:
                 code = parse_qs(qs).get('code', None)
+                state = parse_qs(qs).get('state', [None])
                 if code:
                     if not 'eventlet.posthooks' in env:
                         req = Request(env)
                         req.bytes_transferred = '-'
                         req.client_disconnect = False
                         req.start_time = time()
-                        response = self.do_google_login(env, code[0])(env, start_response)
+                        response = self.do_google_login(env, code[0], state[0])(env, start_response)
                         self.posthooklogger(env, req)
                         return response
                     else:
-                        return self.do_google_login(env, code[0])(env, start_response)
-            return self.do_google_oauth(env, start_response)
+                        return self.do_google_login(env, code[0], state[0])(env, start_response)
+            return self.do_google_oauth(state[0])(env, start_response)
         auth_token = None
         try:
             auth_token = SimpleCookie(env.get('HTTP_COOKIE',''))['session'].value
@@ -70,14 +72,14 @@ class LiteAuth(object):
             env['swift.clean_acl'] = clean_acl
         return self.app(env, start_response)
 
-    def do_google_oauth(self, env, start_response):
+    def do_google_oauth(self, state=None):
         c = Client(auth_endpoint='https://accounts.google.com/o/oauth2/auth',
             client_id=self.google_client_id,
             redirect_uri='%s%s' % (self.service_endpoint, self.google_auth))
-        loc = c.auth_uri(scope=self.google_scope.split(','), access_type='offline')
-        return HTTPFound(location=loc)(env, start_response)
+        loc = c.auth_uri(scope=self.google_scope.split(','), access_type='offline', state=state)
+        return HTTPFound(location=loc)
 
-    def do_google_login(self, env, code):
+    def do_google_login(self, env, code, state=None):
         if 'eventlet.posthooks' in env:
             req = Request(env)
             req.bytes_transferred = '-'
@@ -85,6 +87,20 @@ class LiteAuth(object):
             req.start_time = time()
             env['eventlet.posthooks'].append(
                 (self.posthooklogger, (req,), {}))
+        if 'logout' in code:
+            cookie = SimpleCookie()
+            cookie['session'] = ''
+            cookie['session']['path'] = '/'
+            if not self.service_domain.startswith('localhost'):
+                cookie['session']['domain'] = self.service_domain
+            expiration = datetime.datetime.utcnow()
+            cookie['session']['expires'] = expiration.strftime('%a, %d %b %Y %H:%M:%S GMT')
+            resp = Response(request=req, status=302,
+                headers={
+                    'set-cookie': cookie['session'].output(header='').strip(),
+                    'location': '%s%s?account=logout' % (self.service_endpoint, state)})
+            #print resp.headers
+            return resp
         c = Client(token_endpoint='https://accounts.google.com/o/oauth2/token',
             resource_endpoint='https://www.googleapis.com/oauth2/v1',
             redirect_uri='%s%s' % (self.service_endpoint, self.google_auth),
@@ -119,7 +135,7 @@ class LiteAuth(object):
                 'x-storage-token': token,
                 'x-storage-url': '%s/%s/%s' % (self.service_endpoint, self.version, user_data),
                 'set-cookie': cookie['session'].output(header='').strip(),
-                'location': '%s/%s/%s' % (self.service_endpoint, self.version, user_data)})
+                'location': '%s%s?account=%s' % (self.service_endpoint, state, user_data)})
         #print resp.headers
         return resp
 

@@ -2,7 +2,7 @@ try:
     import simplejson as json
 except ImportError:
     import json
-from urllib import urlencode, urlopen
+from urllib import urlencode
 from eventlet.green.urllib2 import urlopen, HTTPError
 from eventlet.green.httplib import HTTPMessage
 
