@@ -12,7 +12,7 @@ import greenlet
 import datetime
 from swift.common.http import HTTP_CONTINUE, is_success, HTTP_INSUFFICIENT_STORAGE
 from swiftclient.client import quote
-from swift.proxy.controllers.base import update_headers
+from swift.proxy.controllers.base import update_headers, delay_denial
 from swift.common.tarstream import StringBuffer, UntarStream, RECORDSIZE, TarStream, REGTYPE, BLOCKSIZE, NUL, ExtractedFile
 
 try:
@@ -236,6 +236,9 @@ class ProxyQueryMiddleware(object):
 
         self.app.max_upload_time = int(conf.get('max_upload_time', 86400))
         self.app.network_chunk_size = int(conf.get('network_chunk_size', 65536))
+        self.app.cdr_account = conf.get('user_stats_account', 'userstats')
+        self.app.version = 'v1'
+        self.app.zerovm_uses_newest = conf.get('zerovm_uses_newest', 'f').lower() in TRUE_VALUES
 
     def __call__(self, env, start_response):
 
@@ -271,21 +274,13 @@ class ProxyQueryMiddleware(object):
             if path_parts['version']:
                 req.path_info_pop()
             handler = controller.zerovm_query
-            if 'swift.authorize' in req.environ:
-                # We call authorize before the handler, always. If authorized,
-                # we remove the swift.authorize hook so isn't ever called
-                # again. If not authorized, we return the denial unless the
-                # controller's method indicates it'd like to gather more
-                # information and try again later.
-                resp = req.environ['swift.authorize'](req)
-                if not resp:
-                    # No resp means authorized, no delayed recheck required.
-                    del req.environ['swift.authorize']
-                else:
-                    # Response indicates denial, but we might delay the denial
-                    # and recheck later. If not delayed, return the error now.
-                    if not getattr(handler, 'delay_denial', None):
-                        return resp(env, start_response)
+#            if 'swift.authorize' in req.environ:
+#                resp = req.environ['swift.authorize'](req)
+#                if not resp:
+#                    del req.environ['swift.authorize']
+#                else:
+#                    if not getattr(handler, 'delay_denial', None):
+#                        return resp(env, start_response)
             res = handler(req)
         else:
             return self.app(env, start_response)
@@ -774,6 +769,7 @@ class ClusterController(Controller):
 
         return None
 
+    @delay_denial
     def zerovm_query(self, req):
         if 'content-type' not in req.headers:
             return HTTPBadRequest(request=req,
@@ -897,6 +893,10 @@ class ClusterController(Controller):
             exec_request.etag = None
             exec_request.headers['content-type'] = TAR_MIMES[0]
             exec_request.headers['transfer-encoding'] = 'chunked'
+            if 'swift.authorize' in exec_request.environ:
+                aresp = exec_request.environ['swift.authorize'](exec_request)
+                if aresp:
+                    return aresp
 
             channels = []
             if node.exe[0] == '/':
@@ -917,9 +917,15 @@ class ClusterController(Controller):
                 if not source_resp:
                     source_req = req.copy_get()
                     source_req.path_info = load_from
-                    #source_req.headers['X-Newest'] = 'true'
+                    if self.app.zerovm_uses_newest:
+                        source_req.headers['X-Newest'] = 'true'
                     acct, src_container_name, src_obj_name =\
                         split_path(load_from, 1, 3, True)
+                    container_info = self.container_info(acct, src_container_name)
+                    if 'boot' in ch.device:
+                        source_req.acl = container_info['exec_acl']
+                    else:
+                        source_req.acl = container_info['read_acl']
                     source_resp =\
                         ObjectController(self.app, acct,
                             src_container_name, src_obj_name)\
@@ -1038,6 +1044,7 @@ class ClusterController(Controller):
         conns = [conn for conn in pile if conn]
         final_body = None
         final_response = Response(request=req)
+        req.cdr_log = []
         for conn in conns:
             resp = conn.resp
             if resp:
@@ -1048,6 +1055,7 @@ class ClusterController(Controller):
                 conn.nexe_headers['x-nexe-error'] = conn.error
 
             #print [final_response.headers, conn.nexe_headers]
+            self._store_accounting_data(req, conn)
             merge_headers(final_response.headers, conn.nexe_headers)
             if resp and resp.content_length > 0:
                 if final_body:
@@ -1058,6 +1066,7 @@ class ClusterController(Controller):
                     final_response.app_iter = final_body
                     final_response.content_length = resp.content_length
         ns_server.stop()
+        self._store_accounting_data(req)
         return final_response
 
     def create_name(self, node_name, i):
@@ -1188,6 +1197,50 @@ class ClusterController(Controller):
                     self.exception_occurred(conn.node, _('Object'),
                         _('Trying to write to %s') % path)
             conn.queue.task_done()
+
+    def _store_accounting_data(self, request, connection=None):
+        txn_id = request.environ['swift.trans_id']
+        acc_object = datetime.datetime.utcnow().strftime('%Y/%m/%d.log')
+        if connection:
+#            cdr = []
+#            for n in connection.nexe_headers['x-nexe-cdr-line'].split():
+#                try:
+#                    cdr.append(int(float(n) * 1000))
+#                except ValueError:
+#                    cdr.append(int(n))
+#            try:
+#                request.cdr_summary = [x + y for (x, y) in zip(request.cdr_summary, cdr)]
+#            except AttributeError:
+#                request.cdr_summary = cdr
+            body = '%s %s %s (%s) [%s]\n' % (datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                                   txn_id, connection.nexe_headers['x-nexe-system'],
+                                   connection.nexe_headers['x-nexe-cdr-line'],
+                                   connection.nexe_headers['x-nexe-status'])
+            request.cdr_log.append(body)
+        else:
+#            try:
+#                summary = ' '.join([str(n) for n in request.cdr_summary])
+#            except AttributeError:
+#                return
+#            body = '%s %s === (%s) [Done]\n' % (datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+#                                   txn_id, summary)
+#            request.cdr_log.append(body)
+            body = ''.join(request.cdr_log)
+            append_req = Request.blank('/%s/%s/%s/%s' % (self.app.version,
+                                                         self.app.cdr_account,
+                                                         self.account_name,
+                                                         acc_object),
+                headers={'X-Append-To': '-1',
+                         'Content-Length': len(body),
+                         'Content-Type': 'text/plain'},
+                body=body
+            )
+            append_req.method = 'POST'
+            resp = append_req.get_response(self.app)
+            if resp.status_int >= 300:
+                self.app.logger.warn(
+                    _('ERROR Cannot write stats for account %s'), self.account_name)
+
 
 def filter_factory(global_conf, **local_conf):
     """

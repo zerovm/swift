@@ -3,13 +3,16 @@ from urllib import quote, unquote
 from time import gmtime, strftime, time
 from urlparse import parse_qs
 import datetime
-from swift.common.internal_client import InternalClient
+try:
+    import simplejson as json
+except ImportError:
+    import json
 
 from swift.common.http import HTTP_CLIENT_CLOSED_REQUEST
 from swift.common.oauth import Client
 from swift.common.swob import HTTPFound, Response, Request, HTTPUnauthorized, HTTPForbidden, HTTPNotFound
 from swift.common.utils import cache_from_env, get_logger, TRUE_VALUES, split_path
-from swift.common.middleware.acl import clean_acl
+from swift.common.middleware.acl import clean_acl, parse_lite_acl
 from swift.common.bufferedhttp import http_connect
 
 class LiteAuth(object):
@@ -24,13 +27,25 @@ class LiteAuth(object):
         self.service_endpoint = conf.get('service_endpoint', 'https://' + self.service_domain)
         self.google_scope = conf.get('google_scope')
         #conf_path = conf.get('__file__')
-        #self.swift = InternalClient(conf_path, 'LiteAuth', 3)
+        #self.swift = InternalClient('/etc/swift/proxy-server.conf', 'LiteAuth', 3)
         self.google_auth = '/login/google/'
         self.google_prefix = 'g_'
         self.logger = get_logger(conf, log_route='lite-auth')
         self.log_headers = conf.get('log_headers', 'f').lower() in TRUE_VALUES
+        self.system_accounts = conf.get('system_accounts', '').split()
+
+    def extract_auth_token(self, env):
+        auth_token = None
+        try:
+            auth_token = SimpleCookie(env.get('HTTP_COOKIE', ''))['session'].value
+        except KeyError:
+            pass
+        return auth_token
 
     def __call__(self, env, start_response):
+        #for acc in self.system_accounts:
+        #    if env.get('PATH_INFO', '').startswith('/%s/%s' % (self.version, acc)):
+        #        return HTTPForbidden()(env, start_response)
         if env.get('PATH_INFO', '').startswith(self.google_auth):
             state = [None]
             qs = env.get('QUERY_STRING')
@@ -49,11 +64,7 @@ class LiteAuth(object):
                     else:
                         return self.do_google_login(env, code[0], state[0])(env, start_response)
             return self.do_google_oauth(state[0])(env, start_response)
-        auth_token = None
-        try:
-            auth_token = SimpleCookie(env.get('HTTP_COOKIE',''))['session'].value
-        except KeyError:
-            pass
+        auth_token = self.extract_auth_token(env)
         if auth_token:
             env['HTTP_X_AUTH_TOKEN'] = auth_token
             env['HTTP_X_STORAGE_TOKEN'] = auth_token
@@ -88,18 +99,14 @@ class LiteAuth(object):
             env['eventlet.posthooks'].append(
                 (self.posthooklogger, (req,), {}))
         if 'logout' in code:
-            cookie = SimpleCookie()
-            cookie['session'] = ''
-            cookie['session']['path'] = '/'
-            if not self.service_domain.startswith('localhost'):
-                cookie['session']['domain'] = self.service_domain
-            expiration = datetime.datetime.utcnow()
-            cookie['session']['expires'] = expiration.strftime('%a, %d %b %Y %H:%M:%S GMT')
+            auth_token = self.extract_auth_token(env)
+            if auth_token:
+                self.delete_user_data(env, auth_token)
+            cookie = self.create_session_cookie()
             resp = Response(request=req, status=302,
                 headers={
-                    'set-cookie': cookie['session'].output(header='').strip(),
+                    'set-cookie': cookie,
                     'location': '%s%s?account=logout' % (self.service_endpoint, state)})
-            #print resp.headers
             return resp
         c = Client(token_endpoint='https://accounts.google.com/o/oauth2/token',
             resource_endpoint='https://www.googleapis.com/oauth2/v1',
@@ -122,22 +129,43 @@ class LiteAuth(object):
         user_data = self.get_new_user_data(env, c)
         if not user_data:
             return HTTPForbidden()
-        cookie = SimpleCookie()
-        cookie['session'] = token
-        cookie['session']['path'] = '/'
-        if not self.service_domain.startswith('localhost'):
-            cookie['session']['domain'] = self.service_domain
-        expiration = datetime.datetime.utcnow() + datetime.timedelta(seconds=c.expires_in)
-        cookie['session']['expires'] = expiration.strftime('%a, %d %b %Y %H:%M:%S GMT')
+        req = Request.blank('/%s/%s' % (self.version, user_data))
+        req.method = 'HEAD'
+        resp = req.get_response(self.app)
+        if resp.status_int >= 300:
+            return HTTPNotFound()
+        if not 'x-account-meta-userdata' in resp.headers:
+            req = Request.blank('/%s/%s' % (self.version, user_data))
+            req.method = 'POST'
+            req.headers['x-account-meta-userdata'] = json.dumps(c.request('/userinfo'))
+            req.get_response(self.app)
+        cookie = self.create_session_cookie(token=token, expires_in=c.expires_in)
         resp = Response(request=req, status=302,
             headers={
                 'x-auth-token': token,
                 'x-storage-token': token,
                 'x-storage-url': '%s/%s/%s' % (self.service_endpoint, self.version, user_data),
-                'set-cookie': cookie['session'].output(header='').strip(),
+                'set-cookie': cookie,
                 'location': '%s%s?account=%s' % (self.service_endpoint, state, user_data)})
         #print resp.headers
         return resp
+
+    def create_session_cookie(self, token='', path='/', expires_in=0):
+        cookie = SimpleCookie()
+        cookie['session'] = token
+        cookie['session']['path'] = path
+        if not self.service_domain.startswith('localhost'):
+            cookie['session']['domain'] = self.service_domain
+        expiration = datetime.datetime.utcnow() + datetime.timedelta(seconds=expires_in)
+        cookie['session']['expires'] = expiration.strftime('%a, %d %b %Y %H:%M:%S GMT')
+        return cookie['session'].output(header='').strip()
+
+    def delete_user_data(self, env, token):
+        memcache_client = cache_from_env(env)
+        if not memcache_client:
+            raise Exception('Memcache required')
+        memcache_token_key = '%s/token/%s' % (self.google_prefix, token)
+        memcache_client.delete(memcache_token_key)
 
     def get_cached_user_data(self, env, token):
         user_data = None
@@ -173,11 +201,14 @@ class LiteAuth(object):
             return self.denied_response(req)
         user_data = (req.remote_user or '')
         if account in user_data and\
-           (req.method not in ('DELETE', 'PUT') or container):
-            # If the user is admin for the account and is not trying to do an
-            # account DELETE or PUT...
+           (req.method not in ('DELETE', 'PUT', 'POST') or container):
             req.environ['swift_owner'] = True
             return None
+        if container:
+            accounts = parse_lite_acl(getattr(req, 'acl', None))
+            if user_data and \
+               ('*' in accounts or user_data in accounts):
+                return None
         return self.denied_response(req)
 
     def denied_response(self, req):
@@ -187,7 +218,6 @@ class LiteAuth(object):
         else:
             self.logger.increment('unauthorized')
             return HTTPUnauthorized(request=req)
-
 
     def posthooklogger(self, env, req):
         if not req.path.startswith(self.google_auth):

@@ -138,6 +138,19 @@ def parse_acl(acl_string):
                 groups.append(value)
     return referrers, groups
 
+def parse_lite_acl(acl_string):
+    """
+    Parses Litestack ACL string into an account list.
+
+    :param acl_string: The standard Swift ACL string to parse.
+    :returns: list of user accounts
+    """
+    accounts = []
+    if acl_string:
+        for value in acl_string.split(','):
+            accounts.append(value)
+    return accounts
+
 
 def referrer_allowed(referrer, referrer_acl):
     """

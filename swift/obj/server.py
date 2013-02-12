@@ -701,20 +701,21 @@ class ObjectController(object):
                 int(file.metadata['X-Delete-At']) <= time.time():
             self.logger.timing_since('POST.timing', start_time)
             return HTTPNotFound(request=request)
-        if file.is_deleted():
-            response_class = HTTPNotFound
-        else:
-            response_class = HTTPAccepted
-        try:
-            file_size = file.get_data_file_size()
-        except (DiskFileError, DiskFileNotExist):
-            file.quarantine()
-            return HTTPNotFound(request=request)
         if 'x-append-to' in request.headers:
             try:
                 rev_num = int(request.headers['x-append-to'])
             except ValueError:
                 return HTTPUnprocessableEntity(request=request)
+            if file.is_deleted():
+                if rev_num < 0:
+                    return self.PUT(request)
+                else:
+                    return HTTPNotFound(request=request)
+            try:
+                file_size = file.get_data_file_size()
+            except (DiskFileError, DiskFileNotExist):
+                file.quarantine()
+                return HTTPNotFound(request=request)
             try:
                 current_rev = int(file.metadata['X-Revision'])
             except KeyError:
@@ -807,6 +808,15 @@ class ObjectController(object):
                     device)
             return HTTPAccepted(request=request, etag=file.metadata['ETag'])
         else:
+            if file.is_deleted():
+                response_class = HTTPNotFound
+            else:
+                response_class = HTTPAccepted
+            try:
+                file_size = file.get_data_file_size()
+            except (DiskFileError, DiskFileNotExist):
+                file.quarantine()
+                return HTTPNotFound(request=request)
             metadata = {'X-Timestamp': request.headers['x-timestamp']}
             metadata.update(val for val in request.headers.iteritems()
                     if val[0].lower().startswith('x-object-meta-'))

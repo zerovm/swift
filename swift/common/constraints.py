@@ -61,6 +61,13 @@ MAX_CONTAINER_NAME_LENGTH = constraints_conf_int('max_container_name_length',
 FORMAT2CONTENT_TYPE = {'plain': 'text/plain', 'json': 'application/json',
                        'xml': 'application/xml'}
 
+def has_attr_change(req, target_type):
+    prefix = 'x-%s-' % target_type.lower()
+    for key, value in req.headers.iteritems():
+        if key.lower().startswith(prefix):
+           return True
+    return False
+
 
 def check_metadata(req, target_type):
     """

@@ -44,7 +44,7 @@ from swift.common.utils import ContextPool, normalize_timestamp, TRUE_VALUES, \
     public
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_metadata, check_object_creation, \
-    CONTAINER_LISTING_LIMIT, MAX_FILE_SIZE
+    CONTAINER_LISTING_LIMIT, MAX_FILE_SIZE, has_attr_change
 from swift.common.exceptions import ChunkReadTimeout, \
     ChunkWriteTimeout, ConnectionTimeout, ListingIterNotFound, \
     ListingIterNotAuthorized, ListingIterError
@@ -289,9 +289,10 @@ class ObjectController(Controller):
 
     def GETorHEAD(self, req):
         """Handle HTTP GET or HEAD requests."""
-        container_info = self.container_info(self.account_name,
-                                             self.container_name)
-        req.acl = container_info['read_acl']
+        if not getattr(req, 'acl', None):
+            container_info = self.container_info(self.account_name,
+                                                 self.container_name)
+            req.acl = container_info['read_acl']
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
             if aresp:
@@ -429,7 +430,10 @@ class ObjectController(Controller):
                 account_autocreate=self.app.account_autocreate)
             container_partition = container_info['partition']
             containers = container_info['nodes']
-            req.acl = container_info['write_acl']
+            if has_attr_change(req, 'object'):
+                req.acl = container_info['chattr_acl']
+            else:
+                req.acl = container_info['write_acl']
             if 'swift.authorize' in req.environ:
                 aresp = req.environ['swift.authorize'](req)
                 if aresp:

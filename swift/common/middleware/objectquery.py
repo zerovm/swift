@@ -497,6 +497,7 @@ class ObjectQueryMiddleware(object):
                 response.headers['x-nexe-status'] = nexe_status
                 response.headers['x-nexe-etag'] = nexe_etag
                 response.headers['x-nexe-validation'] = nexe_validation
+                response.headers['x-nexe-cdr-line'] = nexe_cdr_line
                 response.headers['X-Timestamp'] =\
                     normalize_timestamp(time.time())
                 if nexe_name:

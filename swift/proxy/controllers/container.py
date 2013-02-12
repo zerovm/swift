@@ -43,6 +43,7 @@ class ContainerController(Controller):
 
     # Ensure these are all lowercase
     pass_through_headers = ['x-container-read', 'x-container-write',
+                            'x-container-exec', 'x-container-chattr',
                             'x-container-sync-key', 'x-container-sync-to',
                             'x-versions-location']
 
@@ -53,7 +54,8 @@ class ContainerController(Controller):
 
     def clean_acls(self, req):
         if 'swift.clean_acl' in req.environ:
-            for header in ('x-container-read', 'x-container-write'):
+            for header in ('x-container-read', 'x-container-write',
+                           'x-container-exec', 'x-container-chattr'):
                 if header in req.headers:
                     try:
                         req.headers[header] = \
@@ -81,6 +83,8 @@ class ContainerController(Controller):
               {'status': resp.status_int,
                'read_acl': resp.headers.get('x-container-read'),
                'write_acl': resp.headers.get('x-container-write'),
+               'exec_acl': resp.headers.get('x-container-exec'),
+               'chattr_acl': resp.headers.get('x-container-chattr'),
                'sync_key': resp.headers.get('x-container-sync-key'),
                'count': resp.headers.get('x-container-object-count'),
                'bytes': resp.headers.get('x-container-bytes-used'),
@@ -94,6 +98,7 @@ class ContainerController(Controller):
                 return aresp
         if not req.environ.get('swift_owner', False):
             for key in ('x-container-read', 'x-container-write',
+                        'x-container-exec', 'x-container-chattr',
                         'x-container-sync-key', 'x-container-sync-to'):
                 if key in resp.headers:
                     del resp.headers[key]

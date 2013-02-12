@@ -48,6 +48,7 @@ class ContainerController(object):
 
     # Ensure these are all lowercase
     save_headers = ['x-container-read', 'x-container-write',
+                    'x-container-exec', 'x-container-chattr',
                     'x-container-sync-key', 'x-container-sync-to']
 
     def __init__(self, conf):

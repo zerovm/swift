@@ -112,11 +112,14 @@ class Controller(object):
         x_remove = 'x-remove-%s-meta-' % st
         x_remove_read = 'x-remove-%s-read' % st
         x_remove_write = 'x-remove-%s-write' % st
+        x_remove_exec = 'x-remove-%s-exec' % st
+        x_remove_chattr = 'x-remove-%s-chattr' % st
         x_meta = 'x-%s-meta-' % st
         dst_headers.update((k.lower().replace('-remove', '', 1), '')
                            for k in src_headers
                            if k.lower().startswith(x_remove) or
-                           k.lower() in (x_remove_read, x_remove_write))
+                           k.lower() in (x_remove_read, x_remove_write,
+                                         x_remove_exec, x_remove_chattr))
 
         dst_headers.update((k.lower(), v)
                            for k, v in src_headers.iteritems()
@@ -283,6 +286,8 @@ class Controller(object):
         return {
             'read_acl': headers.get('x-container-read'),
             'write_acl': headers.get('x-container-write'),
+            'exec_acl': headers.get('x-container-exec'),
+            'chattr_acl': headers.get('x-container-chattr'),
             'sync_key': headers.get('x-container-sync-key'),
             'count': headers.get('x-container-object-count'),
             'bytes': headers.get('x-container-bytes-used'),
@@ -315,6 +320,7 @@ class Controller(object):
         path = '/%s/%s' % (account, container)
         container_info = {'status': 0, 'read_acl': None,
                           'write_acl': None, 'sync_key': None,
+                          'exec_acl': None, 'chattr_acl': None,
                           'count': None, 'bytes': None,
                           'versions': None, 'partition': None,
                           'nodes': None}

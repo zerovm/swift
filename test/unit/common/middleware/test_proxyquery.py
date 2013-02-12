@@ -4,6 +4,7 @@ import re
 import struct
 from eventlet.green import socket
 import tarfile
+import datetime
 from swiftclient.client import quote
 import random
 import swift
@@ -117,7 +118,15 @@ def setup():
                 {'X-Timestamp': ts, 'x-trans-id': 'test'})
         resp = conn.getresponse()
         assert(resp.status == 201)
-        # Create container
+    ts = normalize_timestamp(time())
+    partition, nodes = prosrv.app.account_ring.get_nodes('userstats')
+    for node in nodes:
+        conn = swift.proxy.controllers.base.http_connect(node['ip'], node['port'],
+            node['device'], partition, 'PUT', '/userstats',
+            {'X-Timestamp': ts, 'x-trans-id': 'test1'})
+        resp = conn.getresponse()
+        assert(resp.status == 201)
+    # Create container
     sock = connect_tcp(('localhost', prolis.getsockname()[1]))
     fd = sock.makefile()
     fd.write('PUT /v1/a/c HTTP/1.1\r\nHost: localhost\r\n'
@@ -534,6 +543,7 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         self.create_object(prolis, '/v1/a/c_in2/input1', self.get_random_numbers(20,30))
         self.create_object(prolis, '/v1/a/c_in2/input2', self.get_random_numbers(30,40))
         self.create_object(prolis, '/v1/a/c_in2/junk', 'junk')
+        self.create_container(prolis, '/v1/userstats/a')
 
 
     def zerovm_request(self):
@@ -1031,7 +1041,13 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             req.content_length = os.path.getsize(tar)
             res = req.get_response(prosrv)
             self.assertEqual(res.status_int, 200)
-            self.assertIn('crc OK', res.body)
+            print res.headers
+            #self.assertIn('crc OK', res.body)
+
+        req = Request.blank('/v1/userstats/a/%s' % datetime.datetime.utcnow().strftime('%Y/%m/%d.log'),
+            environ={'REQUEST_METHOD': 'GET'})
+        res = req.get_response(prosrv)
+        print res.body
 
     def test_QUERY_generator_zerovm(self):
         raise SkipTest
