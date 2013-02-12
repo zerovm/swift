@@ -3,7 +3,6 @@ try:
 except ImportError:
     import json
 from contextlib import contextmanager
-import re
 import os
 import shutil
 import time
@@ -18,12 +17,11 @@ from tempfile import mkstemp, mkdtemp
 from swift.common.swob import Request, Response, HTTPNotFound, HTTPPreconditionFailed,\
     HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest,\
     HTTPUnprocessableEntity, HTTPServiceUnavailable, HTTPClientDisconnect, HTTPInternalServerError
-from swift.common.middleware.proxyquery import TAR_MIMES, ACCESS_CDR, ACCESS_READABLE, ACCESS_WRITABLE, device_map
+from swift.common.middleware.proxyquery import TAR_MIMES, ACCESS_CDR, ACCESS_READABLE, ACCESS_WRITABLE
 from swift.common.tarstream import UntarStream, TarStream, REGTYPE, BLOCKSIZE, NUL
 
 from swift.common.utils import normalize_timestamp,\
-    fallocate, split_path, drop_buffer_cache,\
-    get_logger, mkdirs, disable_fallocate, TRUE_VALUES
+    fallocate, split_path, get_logger, mkdirs, disable_fallocate, TRUE_VALUES
 from swift.obj.server import DiskFile, write_metadata, read_metadata
 from swift.common.constraints import check_mount, check_utf8
 from swift.common.exceptions import DiskFileError, DiskFileNotExist
