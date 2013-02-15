@@ -59,6 +59,7 @@ class LiteAuth(object):
                         req.client_disconnect = False
                         req.start_time = time()
                         response = self.do_google_login(env, code[0], state[0])(env, start_response)
+                        req.response = response
                         self.posthooklogger(env, req)
                         return response
                     else:
@@ -91,8 +92,8 @@ class LiteAuth(object):
         return HTTPFound(location=loc)
 
     def do_google_login(self, env, code, state=None):
+        req = Request(env)
         if 'eventlet.posthooks' in env:
-            req = Request(env)
             req.bytes_transferred = '-'
             req.client_disconnect = False
             req.start_time = time()
@@ -107,6 +108,7 @@ class LiteAuth(object):
                 headers={
                     'set-cookie': cookie,
                     'location': '%s%s?account=logout' % (self.service_endpoint, state)})
+            req.response = resp
             return resp
         c = Client(token_endpoint='https://accounts.google.com/o/oauth2/token',
             resource_endpoint='https://www.googleapis.com/oauth2/v1',
@@ -125,20 +127,23 @@ class LiteAuth(object):
                 refresh_token=c.refresh_token)
             token = rc.access_token
         if not token:
-            return HTTPUnauthorized()
+            req.response = HTTPUnauthorized()
+            return req.response
         user_data = self.get_new_user_data(env, c)
         if not user_data:
-            return HTTPForbidden()
-        req = Request.blank('/%s/%s' % (self.version, user_data))
-        req.method = 'HEAD'
-        resp = req.get_response(self.app)
+            req.response = HTTPForbidden()
+            return req.response
+        account_req = Request.blank('/%s/%s' % (self.version, user_data))
+        account_req.method = 'HEAD'
+        resp = account_req.get_response(self.app)
         if resp.status_int >= 300:
-            return HTTPNotFound()
+            req.response = HTTPNotFound()
+            return req.response
         if not 'x-account-meta-userdata' in resp.headers:
-            req = Request.blank('/%s/%s' % (self.version, user_data))
-            req.method = 'POST'
-            req.headers['x-account-meta-userdata'] = json.dumps(c.request('/userinfo'))
-            req.get_response(self.app)
+            userdata_req = Request.blank('/%s/%s' % (self.version, user_data))
+            userdata_req.method = 'POST'
+            userdata_req.headers['x-account-meta-userdata'] = json.dumps(c.request('/userinfo'))
+            userdata_req.get_response(self.app)
         cookie = self.create_session_cookie(token=token, expires_in=c.expires_in)
         resp = Response(request=req, status=302,
             headers={
@@ -148,6 +153,7 @@ class LiteAuth(object):
                 'set-cookie': cookie,
                 'location': '%s%s?account=%s' % (self.service_endpoint, state, user_data)})
         #print resp.headers
+        req.response = resp
         return resp
 
     def create_session_cookie(self, token='', path='/', expires_in=0):
@@ -206,8 +212,7 @@ class LiteAuth(object):
             return None
         if container:
             accounts = parse_lite_acl(getattr(req, 'acl', None))
-            if user_data and \
-               ('*' in accounts or user_data in accounts):
+            if '*' in accounts or user_data in accounts:
                 return None
         return self.denied_response(req)
 
