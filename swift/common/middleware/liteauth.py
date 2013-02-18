@@ -206,6 +206,9 @@ class LiteAuth(object):
         if not account or not account.startswith(self.google_prefix):
             return self.denied_response(req)
         user_data = (req.remote_user or '')
+        if req.method in 'POST' and 'x-zerovm-execute' in req.headers \
+            and account in user_data:
+                return None
         if account in user_data and\
            (req.method not in ('DELETE', 'PUT', 'POST') or container):
             req.environ['swift_owner'] = True

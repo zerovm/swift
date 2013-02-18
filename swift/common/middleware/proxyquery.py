@@ -858,6 +858,7 @@ class ClusterController(Controller):
         if not addr:
             return HTTPServiceUnavailable(
                 body='Cannot find own address, check zerovm_ns_hostname')
+        user_account, _junk = split_path(req.path_info, 1, 2, True)
         for node in node_list:
             node.name_service = 'udp:%s:%d' % (addr, ns_port)
             sysmap = json.dumps(node, cls=NodeEncoder)
@@ -893,6 +894,7 @@ class ClusterController(Controller):
             exec_request.etag = None
             exec_request.headers['content-type'] = TAR_MIMES[0]
             exec_request.headers['transfer-encoding'] = 'chunked'
+            exec_request.headers['x-account-name'] = user_account
             if 'swift.authorize' in exec_request.environ:
                 aresp = exec_request.environ['swift.authorize'](exec_request)
                 if aresp:

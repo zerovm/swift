@@ -1,3 +1,6 @@
+from string import split
+from swift.common.bufferedhttp import http_connect, http_connect_raw
+
 try:
     import simplejson as json
 except ImportError:
@@ -76,6 +79,12 @@ class ObjectQueryMiddleware(object):
         else:
             self.logger = get_logger(conf, log_route='obj-query')
 
+        self.proxy_addr, self.proxy_port = conf.get('zerovm_proxy').split(':')[:2]
+        self.direct_put = conf.get('zerovm_direct_put_url', None)
+        if self.direct_put:
+            self.proxy_addr, self.proxy_port = self.direct_put.split(':')[:2]
+            self.proxy_port, self.proxy_version = self.proxy_port.split('/')[:2]
+            self.proxy_addr = self.proxy_addr.split('//')[1:]
         self.zerovm_manifest_ver = conf.get('zerovm_manifest_ver','09082012')
         self.zerovm_exename = [i.strip() for i in conf.get('zerovm_exename', 'zerovm').split() if i.strip()]
         #self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '').split() if i.strip())
@@ -457,16 +466,57 @@ class ObjectQueryMiddleware(object):
 
                 self.logger.info('Zerovm CDR: %s' % nexe_cdr_line)
 
+                response = Response(request=req)
+                response.headers['x-nexe-retcode'] = nexe_retcode
+                response.headers['x-nexe-status'] = nexe_status
+                response.headers['x-nexe-etag'] = nexe_etag
+                response.headers['x-nexe-validation'] = nexe_validation
+                response.headers['x-nexe-cdr-line'] = nexe_cdr_line
+                response.headers['X-Timestamp'] =\
+                normalize_timestamp(time.time())
+                if nexe_name:
+                    response.headers['x-nexe-system'] = nexe_name
+                response.content_type = 'application/x-gtar'
+
                 tar_stream = TarStream()
                 resp_size = 0
+                account = req.headers['x-account-name']
+                immediate_responses = []
                 for ch in response_channels:
                     file_size = self.os_interface.path.getsize(ch['lpath'])
+                    path = ch.get('path', None)
+                    if self.direct_put and path:
+                        dest_header = '/%s/%s%s' % (self.proxy_version, account, unquote(path))
+                        dest_req = Request.blank(dest_header,
+                            environ=req.environ, headers=req.headers)
+                        dest_req.path_info = dest_header
+                        dest_req.method = 'PUT'
+                        dest_req.headers['Content-Length'] = file_size
+                        if 'expect' in dest_req.headers:
+                            del dest_req.headers['expect']
+                        if 'transfer-encoding' in dest_req.headers:
+                            del dest_req.headers['transfer-encoding']
+                        reader = iter(lambda: open(ch['lpath'], 'rb').read(self.app.network_chunk_size), '')
+                        print dest_req.__dict__
+                        conn = http_connect_raw(self.proxy_addr, self.proxy_port, 'PUT', dest_req.path_info, dest_req.headers)
+                        if conn:
+                            for chunk in reader:
+                                conn.send(chunk)
+                            resp = conn.getresponse()
+                            print [resp.status, resp.reason, resp.getheaders()]
+                            if resp.status >= 300:
+                                response.body = resp.read()
+                                response.status = '%d %s' % (resp.status, resp.reason)
+                                return response
+                            resp.read()
+                            continue
                     info = tar_stream.create_tarinfo(REGTYPE, ch['device'],
                         file_size)
                     resp_size += len(info) + \
                                  tar_stream.get_archive_size(file_size)
                     ch['info'] = info
                     ch['size'] = file_size
+                    immediate_responses.append(ch)
 
                 def resp_iter(channels, chunk_size):
                     tar_stream = TarStream(chunk_size=chunk_size)
@@ -488,19 +538,8 @@ class ObjectQueryMiddleware(object):
                     if tar_stream.data:
                         yield tar_stream.data
 
-                response = Response(app_iter=resp_iter(response_channels,
-                    self.app.network_chunk_size),
-                    request=req)
-                response.headers['x-nexe-retcode'] = nexe_retcode
-                response.headers['x-nexe-status'] = nexe_status
-                response.headers['x-nexe-etag'] = nexe_etag
-                response.headers['x-nexe-validation'] = nexe_validation
-                response.headers['x-nexe-cdr-line'] = nexe_cdr_line
-                response.headers['X-Timestamp'] =\
-                    normalize_timestamp(time.time())
-                if nexe_name:
-                    response.headers['x-nexe-system'] = nexe_name
-                response.content_type = 'application/x-gtar'
+                response.app_iter=resp_iter(immediate_responses,
+                    self.app.network_chunk_size)
                 response.content_length = resp_size
                 return req.get_response(response)
 

@@ -57,10 +57,6 @@ def setup():
     mkdirs(os.path.join(_testdir, 'sdb1', 'tmp'))
     _orig_container_listing_limit = \
         swift.proxy.controllers.obj.CONTAINER_LISTING_LIMIT
-    conf = {'devices': _testdir, 'swift_dir': _testdir,
-            'mount_check': 'false', 'allowed_headers':
-            'content-encoding, x-object-manifest, content-disposition, foo',
-            'disable_fallocate': 'true'}
     prolis = listen(('localhost', 0))
     acc1lis = listen(('localhost', 0))
     acc2lis = listen(('localhost', 0))
@@ -68,6 +64,10 @@ def setup():
     con2lis = listen(('localhost', 0))
     obj1lis = listen(('localhost', 0))
     obj2lis = listen(('localhost', 0))
+    conf = {'devices': _testdir, 'swift_dir': _testdir,
+            'mount_check': 'false', 'allowed_headers':
+        'content-encoding, x-object-manifest, content-disposition, foo',
+            'disable_fallocate': 'true', 'zerovm_proxy': '127.0.0.1:%d' % prolis.getsockname()[1]}
     _test_sockets =\
     (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis)
     pickle.dump(ring.RingData([[0, 1, 0, 1], [1, 0, 1, 0]],
