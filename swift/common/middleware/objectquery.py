@@ -79,7 +79,6 @@ class ObjectQueryMiddleware(object):
         else:
             self.logger = get_logger(conf, log_route='obj-query')
 
-        self.proxy_addr, self.proxy_port = conf.get('zerovm_proxy').split(':')[:2]
         self.direct_put = conf.get('zerovm_direct_put_url', None)
         if self.direct_put:
             self.proxy_addr, self.proxy_port = self.direct_put.split(':')[:2]
