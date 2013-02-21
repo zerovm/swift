@@ -752,8 +752,9 @@ exit(0)
             environ={'REQUEST_METHOD': 'POST', 'wsgi.input': ShortBody()},
             headers={'X-Timestamp': normalize_timestamp(time()),
                      'x-zerovm-execute': '1.0',
+                     'x-account-name': 'a',
                      'Content-Length': '4',
-                     'Content-Type': 'application/octet-stream'})
+                     'Content-Type': 'application/x-gtar'})
         resp = req.get_response(self.app)
         self.assertEquals(resp.status_int, 499)
 
@@ -773,8 +774,9 @@ exit(0)
             environ={'REQUEST_METHOD': 'POST', 'wsgi.input': LongBody()},
             headers={'X-Timestamp': normalize_timestamp(time()),
                      'x-zerovm-execute': '1.0',
+                     'x-account-name': 'a',
                      'Content-Length': '2',
-                     'Content-Type': 'application/octet-stream'})
+                     'Content-Type': 'application/x-gtar'})
         resp = req.get_response(self.app)
         self.assertEquals(resp.status_int, 499)
 
@@ -785,9 +787,22 @@ import sys
 sys.stderr.write('some shit happened\n')
 ''')
         req = self.zerovm_request()
-        req.body = 'test'
-        resp = self.app.zerovm_query(req)
-        self.assertEquals(resp.status_int, 200)
+
+        nexefile = StringIO(self._nexescript)
+        conf = ZvmNode(1, 'sort', '/c/exe')
+        conf.add_channel('stdin', ACCESS_READABLE, '/c/o')
+        conf.add_channel('stdout', ACCESS_WRITABLE)
+        conf = json.dumps(conf, cls=NodeEncoder)
+        sysmap = StringIO(conf)
+        with self.create_tar({'boot': nexefile, 'sysmap': sysmap}) as tar:
+            req.body_file = open(tar, 'rb')
+            resp = self.app.zerovm_query(req)
+            self.assertEquals(resp.status_int, 200)
+            self.assertEqual(resp.headers['x-nexe-retcode'], '0')
+            self.assertEqual(resp.headers['x-nexe-status'], 'Zerovm crashed')
+            self.assertEqual(resp.headers['x-nexe-validation'], '0')
+            self.assertEqual(resp.headers['x-nexe-system'], 'sort')
+
         self.setup_zerovm_query(
 r'''
 import sys
@@ -797,10 +812,17 @@ for i in range(20):
     time.sleep(0.1)
     sys.stderr.write(''.zfill(4096))
 ''')
-        req = self.zerovm_request()
-        req.body = 'test'
-        resp = self.app.zerovm_query(req)
-        self.assertIn('ERROR OBJ.QUERY retcode=Output too long', resp.body)
+        nexefile = StringIO(self._nexescript)
+        conf = ZvmNode(1, 'sort', '/c/exe')
+        conf.add_channel('stdin', ACCESS_READABLE, '/c/o')
+        conf.add_channel('stdout', ACCESS_WRITABLE)
+        conf = json.dumps(conf, cls=NodeEncoder)
+        sysmap = StringIO(conf)
+        with self.create_tar({'boot': nexefile, 'sysmap': sysmap}) as tar:
+            req.body_file = open(tar, 'rb')
+            resp = self.app.zerovm_query(req)
+            self.assertEqual(resp.status_int, 503)
+            self.assertIn('ERROR OBJ.QUERY retcode=Output too long', resp.body)
 
     def test_QUERY_zerovm_term_timeouts(self):
         self.setup_zerovm_query(
@@ -809,18 +831,24 @@ from time import sleep
 sleep(10)
 ''')
         req = self.zerovm_request()
-        req.body = 'test'
-        orig_timeout = None
-        # call QUERY method
-        try:
-            orig_timeout = None if not \
-            hasattr(self.app, 'zerovm_timeout') else \
+        nexefile = StringIO(self._nexescript)
+        conf = ZvmNode(1, 'sort', '/c/exe')
+        conf.add_channel('stdin', ACCESS_READABLE, '/c/o')
+        conf.add_channel('stdout', ACCESS_WRITABLE)
+        conf = json.dumps(conf, cls=NodeEncoder)
+        sysmap = StringIO(conf)
+        with self.create_tar({'boot': nexefile, 'sysmap': sysmap}) as tar:
+            req.body_file = open(tar, 'rb')
+            orig_timeout = None if not\
+            hasattr(self.app, 'zerovm_timeout') else\
             self.app.zerovm_timeout
-            self.app.zerovm_timeout = 1
-            resp = self.app.zerovm_query(req)
-            self.assertIn('ERROR OBJ.QUERY retcode=Timed out', resp.body)
-        finally:
-            self.app.zerovm_timeout = orig_timeout
+            try:
+                self.app.zerovm_timeout = 1
+                resp = self.app.zerovm_query(req)
+                self.assertEquals(resp.status_int, 503)
+                self.assertIn('ERROR OBJ.QUERY retcode=Timed out', resp.body)
+            finally:
+                self.app.zerovm_timeout = orig_timeout
 
     def test_QUERY_zerovm_kill_timeouts(self):
         self.setup_zerovm_query(
@@ -830,23 +858,29 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 time.sleep(10)
 ''')
         req = self.zerovm_request()
-        req.body = 'test'
-        orig_timeout = None
-        # call QUERY method
-        try:
+        nexefile = StringIO(self._nexescript)
+        conf = ZvmNode(1, 'sort', '/c/exe')
+        conf.add_channel('stdin', ACCESS_READABLE, '/c/o')
+        conf.add_channel('stdout', ACCESS_WRITABLE)
+        conf = json.dumps(conf, cls=NodeEncoder)
+        sysmap = StringIO(conf)
+        with self.create_tar({'boot': nexefile, 'sysmap': sysmap}) as tar:
+            req.body_file = open(tar, 'rb')
             orig_timeout = None if not\
             hasattr(self.app, 'zerovm_timeout') else\
             self.app.zerovm_timeout
-            self.app.zerovm_timeout = 1
             orig_kill_timeout = None if not\
             hasattr(self.app, 'zerovm_kill_timeout') else\
             self.app.zerovm_kill_timeout
-            self.app.zerovm_kill_timeout = 1
-            resp = self.app.zerovm_query(req)
-            self.assertIn('ERROR OBJ.QUERY retcode=Killed', resp.body)
-        finally:
-            self.app.zerovm_timeout = orig_timeout
-            self.app.zerovm_kill_timeout = orig_kill_timeout
+            try:
+                self.app.zerovm_timeout = 1
+                self.app.zerovm_kill_timeout = 1
+                resp = self.app.zerovm_query(req)
+                self.assertEquals(resp.status_int, 503)
+                self.assertIn('ERROR OBJ.QUERY retcode=Killed', resp.body)
+            finally:
+                self.app.zerovm_timeout = orig_timeout
+                self.app.zerovm_kill_timeout = orig_kill_timeout
 
     def test_QUERY_simulteneous_running_zerovm_limits(self):
         raise SkipTest
@@ -934,22 +968,40 @@ time.sleep(10)
         orig_maxnexe = getattr(self.app, 'zerovm_maxnexe')
         setattr(self.app, 'zerovm_maxnexe', 0)
         req = self.zerovm_request()
-        req.headers['etag'] = self._nexescript_etag
-        req.body = self._nexescript
-        resp = req.get_response(self.app)
-        self.assertEquals(resp.status_int, 413)
+        nexefile = StringIO(self._nexescript)
+        conf = ZvmNode(1, 'sort', '/c/exe')
+        conf.add_channel('stdin', ACCESS_READABLE, '/c/o')
+        conf.add_channel('stdout', ACCESS_WRITABLE)
+        conf = json.dumps(conf, cls=NodeEncoder)
+        sysmap = StringIO(conf)
+        with self.create_tar({'boot': nexefile, 'sysmap': sysmap}) as tar:
+            req.body_file = open(tar, 'rb')
+            resp = self.app.zerovm_query(req)
+            self.assertEquals(resp.status_int, 200)
+            self.assertEqual(resp.headers['x-nexe-retcode'], '0')
+            self.assertEqual(resp.headers['x-nexe-status'], 'ok.')
+            self.assertEqual(resp.headers['x-nexe-validation'], '1')
+            self.assertEqual(resp.headers['x-nexe-system'], 'sort')
         setattr(self.app, 'zerovm_maxnexe', orig_maxnexe)
 
     def test_QUERY_max_chunk_size(self):
         self.setup_zerovm_query()
         self.app.zerovm_maxchunksize = 10
         req = self.zerovm_request()
-        req.headers['etag'] = self._nexescript_etag
-        req.body = self._nexescript
-        resp = req.get_response(self.app)
-
-        self.assertEquals(resp.status_int, 200)
-        self.assertEquals(resp.body, self._sortednumbers)
+        nexefile = StringIO(self._nexescript)
+        conf = ZvmNode(1, 'sort', '/c/exe')
+        conf.add_channel('stdin', ACCESS_READABLE, '/c/o')
+        conf.add_channel('stdout', ACCESS_WRITABLE)
+        conf = json.dumps(conf, cls=NodeEncoder)
+        sysmap = StringIO(conf)
+        with self.create_tar({'boot': nexefile, 'sysmap': sysmap}) as tar:
+            req.body_file = open(tar, 'rb')
+            resp = self.app.zerovm_query(req)
+            self.assertEquals(resp.status_int, 200)
+            self.assertEqual(resp.headers['x-nexe-retcode'], '0')
+            self.assertEqual(resp.headers['x-nexe-status'], 'ok.')
+            self.assertEqual(resp.headers['x-nexe-validation'], '1')
+            self.assertEqual(resp.headers['x-nexe-system'], 'sort')
 
     def test_QUERY_mount_check(self):
         self.setup_zerovm_query()
