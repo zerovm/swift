@@ -94,6 +94,7 @@ class TestObjectQuery(unittest.TestCase):
         self.conf = {'devices': self.testdir, 'mount_check': 'false'}
         self.obj_controller = FakeApp(self.conf)
         self.app = objectquery.ObjectQueryMiddleware(self.obj_controller, self.conf, logger=FakeLogger())
+        self.app.zerovm_maxoutput = 1024 * 1024 * 10
 
     def tearDown(self):
         """ Tear down for testing swift.object_server.ObjectController """
@@ -292,7 +293,8 @@ exit(0)
         req = Request.blank('/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'POST'},
             headers={'Content-Type': 'application/x-gtar',
-                     'x-zerovm-execute': '1.0'})
+                     'x-zerovm-execute': '1.0',
+                     'x-account-name': 'a'})
         return req
 
     @contextmanager
@@ -441,7 +443,7 @@ exit(0)
         req = Request.blank('/sda1/p/a',
             environ={'REQUEST_METHOD': 'POST'},
             headers={'Content-Type': 'application/x-gtar',
-                     'x-zerovm-execute': '1.0'})
+                     'x-zerovm-execute': '1.0', 'x-account-name': 'a' })
         nexefile = StringIO(self._nexescript)
         conf = ZvmNode(1, 'sort', '/c/exe')
         conf.add_channel('stdout', ACCESS_WRITABLE)
@@ -483,7 +485,7 @@ exit(0)
         req = Request.blank('/sda1/p/a',
             environ={'REQUEST_METHOD': 'POST'},
             headers={'Content-Type': 'application/x-gtar',
-                     'x-zerovm-execute': '1.0'})
+                     'x-zerovm-execute': '1.0', 'x-account-name': 'a' })
         nexefile = StringIO(self._nexescript)
         conf = ZvmNode(1, 'sort', '/c/exe')
         conf.add_channel('stdout', ACCESS_WRITABLE)
@@ -512,7 +514,7 @@ exit(0)
         req = Request.blank('/sda1/p/a',
             environ={'REQUEST_METHOD': 'POST'},
             headers={'Content-Type': 'application/x-gtar',
-                     'x-zerovm-execute': '1.0'})
+                     'x-zerovm-execute': '1.0', 'x-account-name': 'a' })
         nexefile = StringIO(self._nexescript)
         conf = ZvmNode(1, 'sort', '/c/exe')
         conf.add_channel('stdout', ACCESS_WRITABLE)
@@ -531,7 +533,7 @@ exit(0)
         req = Request.blank('/sda1/p/a',
             environ={'REQUEST_METHOD': 'POST'},
             headers={'Content-Type': 'application/x-gtar',
-                     'x-zerovm-execute': '1.0'})
+                     'x-zerovm-execute': '1.0', 'x-account-name': 'a' })
         nexefile = StringIO(self._nexescript)
         conf = ZvmNode(1, 'sort', '/c/exe')
         conf.add_channel('stderr', ACCESS_WRITABLE)
@@ -626,7 +628,7 @@ exit(0)
         # check if just querying container fails
         req = Request.blank('/sda1/p/a/c',
             environ={'REQUEST_METHOD': 'POST'},
-            headers={'x-zerovm-execute': '1.0'})
+            headers={'x-zerovm-execute': '1.0', 'x-account-name': 'a' })
         resp = req.get_response(self.app)
         self.assertEquals(resp.status_int, 400)
 
@@ -694,7 +696,7 @@ exit(0)
         req = Request.blank('/sda1/p/a/c/o'.encode('utf-16'),
             environ={'REQUEST_METHOD': 'POST'},
             headers={'Content-Type': 'application/x-gtar',
-                     'x-zerovm-execute': '1.0'})
+                     'x-zerovm-execute': '1.0', 'x-account-name': 'a' })
         req.body = ('SCRIPT')
         resp = req.get_response(self.app)
         self.assertEquals(resp.status_int, 412)
