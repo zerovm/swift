@@ -558,9 +558,14 @@ class ClusterController(Controller):
                                     '\\*', '.*'
                                 )
                                 mask = re.compile(object)
-                                for obj in self.list_container(req,
-                                    self.account_name, container, mask):
-                                    list.append('/' + container + '/' + obj)
+                                try:
+                                    for obj in self.list_container(req,
+                                        self.account_name, container, mask):
+                                        list.append('/' + container + '/' + obj)
+                                except Exception:
+                                    return HTTPBadRequest(request=req,
+                                        body='Error querying object server '
+                                             'for container %s' % container)
                             if not list:
                                 return HTTPBadRequest(request=req,
                                     body='No objects found in path %s' % path)
@@ -825,6 +830,8 @@ class ClusterController(Controller):
 
         error = self.parse_cluster_config(req, cluster_config)
         if error:
+            self.app.logger.warn(
+                _('ERROR Error parsing config: %s'), cluster_config)
             return error
 
         node_list = []
