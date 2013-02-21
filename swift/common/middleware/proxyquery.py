@@ -239,6 +239,7 @@ class ProxyQueryMiddleware(object):
         self.app.cdr_account = conf.get('user_stats_account', 'userstats')
         self.app.version = 'v1'
         self.app.zerovm_uses_newest = conf.get('zerovm_uses_newest', 'f').lower() in TRUE_VALUES
+        self.app.zerovm_accounting_enabled = conf.get('zerovm_accounting_enabled', 'f').lower() in TRUE_VALUES
 
     def __call__(self, env, start_response):
 
@@ -1064,7 +1065,8 @@ class ClusterController(Controller):
                 conn.nexe_headers['x-nexe-error'] = conn.error
 
             #print [final_response.headers, conn.nexe_headers]
-            self._store_accounting_data(req, conn)
+            if self.app.zerovm_accounting_enabled:
+                self._store_accounting_data(req, conn)
             merge_headers(final_response.headers, conn.nexe_headers)
             if resp and resp.content_length > 0:
                 if final_body:
@@ -1075,7 +1077,8 @@ class ClusterController(Controller):
                     final_response.app_iter = final_body
                     final_response.content_length = resp.content_length
         ns_server.stop()
-        self._store_accounting_data(req)
+        if self.app.zerovm_accounting_enabled:
+            self._store_accounting_data(req)
         return final_response
 
     def create_name(self, node_name, i):
