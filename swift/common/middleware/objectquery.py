@@ -84,7 +84,7 @@ class ObjectQueryMiddleware(object):
             self.proxy_addr, self.proxy_port = self.direct_put.split(':')[:2]
             self.proxy_port, self.proxy_version = self.proxy_port.split('/')[:2]
             self.proxy_addr = self.proxy_addr.split('//')[1:]
-            print [self.proxy_addr, self.proxy_port, self.proxy_version]
+            print [self.direct_put, self.proxy_addr, self.proxy_port, self.proxy_version]
         self.zerovm_manifest_ver = conf.get('zerovm_manifest_ver','09082012')
         self.zerovm_exename = [i.strip() for i in conf.get('zerovm_exename', 'zerovm').split() if i.strip()]
         #self.zerovm_xparams = set(i.strip() for i in conf.get('zerovm_xparams', '').split() if i.strip())
