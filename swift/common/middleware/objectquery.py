@@ -232,7 +232,7 @@ class ObjectQueryMiddleware(object):
         and int(req.headers['content-length']) > self.zerovm_maxinput:
             return HTTPRequestEntityTooLarge(body='Your request is too large'
                 , request=req, content_type='text/plain', headers=nexe_headers)
-        if 'Content-Type' not in req.headers:
+        if 'content-type' not in req.headers:
             return HTTPBadRequest(request=req, content_type='text/plain'
                 , body='No content type', headers=nexe_headers)
         if not req.headers['Content-Type'] in TAR_MIMES:
@@ -479,36 +479,36 @@ class ObjectQueryMiddleware(object):
 
                 tar_stream = TarStream()
                 resp_size = 0
-                account = req.headers['x-account-name']
+#                account = req.headers['x-account-name']
                 immediate_responses = []
                 for ch in response_channels:
                     file_size = self.os_interface.path.getsize(ch['lpath'])
-                    path = ch.get('path', None)
-                    if self.direct_put and path:
-                        dest_header = '/%s/%s%s' % (self.proxy_version, account, unquote(path))
-                        dest_req = Request.blank(dest_header,
-                            environ=req.environ, headers=req.headers)
-                        dest_req.path_info = dest_header
-                        dest_req.method = 'PUT'
-                        dest_req.headers['Content-Length'] = file_size
-                        if 'expect' in dest_req.headers:
-                            del dest_req.headers['expect']
-                        if 'transfer-encoding' in dest_req.headers:
-                            del dest_req.headers['transfer-encoding']
-                        reader = iter(lambda: open(ch['lpath'], 'rb').read(self.app.network_chunk_size), '')
-                        print dest_req.__dict__
-                        conn = http_connect_raw(self.proxy_addr, self.proxy_port, 'PUT', dest_req.path_info, dest_req.headers)
-                        if conn:
-                            for chunk in reader:
-                                conn.send(chunk)
-                            resp = conn.getresponse()
-                            print [resp.status, resp.reason, resp.getheaders()]
-                            if resp.status >= 300:
-                                response.body = resp.read()
-                                response.status = '%d %s' % (resp.status, resp.reason)
-                                return response
-                            resp.read()
-                            continue
+#                    path = ch.get('path', None)
+#                    if self.direct_put and path:
+#                        dest_header = '/%s/%s%s' % (self.proxy_version, account, unquote(path))
+#                        dest_req = Request.blank(dest_header,
+#                            environ=req.environ, headers=req.headers)
+#                        dest_req.path_info = dest_header
+#                        dest_req.method = 'PUT'
+#                        dest_req.headers['Content-Length'] = file_size
+#                        if 'expect' in dest_req.headers:
+#                            del dest_req.headers['expect']
+#                        if 'transfer-encoding' in dest_req.headers:
+#                            del dest_req.headers['transfer-encoding']
+#                        reader = iter(lambda: open(ch['lpath'], 'rb').read(self.app.network_chunk_size), '')
+#                        print dest_req.__dict__
+#                        conn = http_connect_raw(self.proxy_addr, self.proxy_port, 'PUT', dest_req.path_info, dest_req.headers)
+#                        if conn:
+#                            for chunk in reader:
+#                                conn.send(chunk)
+#                            resp = conn.getresponse()
+#                            print [resp.status, resp.reason, resp.getheaders()]
+#                            if resp.status >= 300:
+#                                response.body = resp.read()
+#                                response.status = '%d %s' % (resp.status, resp.reason)
+#                                return response
+#                            resp.read()
+#                            continue
                     info = tar_stream.create_tarinfo(REGTYPE, ch['device'],
                         file_size)
                     resp_size += len(info) + \

@@ -190,10 +190,10 @@ class PseudoFile():
 #            self.file = None
 
 
-class FcgiHTTPResponse(HTTPResponse):
-
-    def __init__(self, fp, debuglevel=0, strict=0, method=None, buffering=False):
-        HTTPResponse.__init__(self, PseudoSocket(fp), debuglevel, strict, method, buffering)
+#class FcgiHTTPResponse(HTTPResponse):
+#
+#    def __init__(self, fp, debuglevel=0, strict=0, method=None, buffering=False):
+#        HTTPResponse.__init__(self, PseudoSocket(fp), debuglevel, strict, method, buffering)
 
 class Record(object):
     """
@@ -294,11 +294,18 @@ if __name__ == '__main__':
 #        sum += len(data)
 #    print sum
     if pf.type == FCGI_STDOUT:
-        resp = FcgiHTTPResponse(pf)
+        resp = HTTPResponse(PseudoSocket(pf))
         resp.begin()
-        print resp.__dict__
-        print resp.getheaders()
-        print len(resp.read())
+        rr = Response(status='%d %s' %
+                           (resp.status,
+                            resp.reason),
+        app_iter=iter(lambda: resp.read(65536),''),
+        headers = dict(resp.getheaders()))
+        print rr.status
+        print rr.headers
+        #print resp.__dict__
+        #print resp.getheaders()
+        #print len(resp.read())
 #    data = pf.read()
 #    sum = len(data)
 #    while data:

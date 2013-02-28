@@ -68,7 +68,7 @@ def setup():
             'mount_check': 'false', 'allowed_headers':
         'content-encoding, x-object-manifest, content-disposition, foo',
             'disable_fallocate': 'true',
-            'zerovm_proxy': '127.0.0.1:%d' % prolis.getsockname()[1],
+            'zerovm_proxy': 'http://127.0.0.1:%d/v1/' % prolis.getsockname()[1],
             'zerovm_maxoutput': 1024 * 1024 * 10 }
     _test_sockets =\
     (prolis, acc1lis, acc2lis, con1lis, con2lis, obj1lis, obj2lis)
@@ -324,7 +324,7 @@ class TestProxyQuery(unittest.TestCase):
         else:
             return pickle.dumps(numlist, protocol=0)
 
-    def setup_QUERY(self):
+    def setup_QUERY(self, mock=None):
 
         def set_zerovm_mock():
             def_mock = \
@@ -342,6 +342,17 @@ def errdump(zvm_errcode, nexe_validity, nexe_errcode, nexe_etag, nexe_accounting
     print '%d\n%d\n%s\n%s\n%s' % (nexe_validity, nexe_errcode, nexe_etag,
                                   ' '.join([str(val) for val in nexe_accounting]), status_line)
     exit(zvm_errcode)
+
+def eval_as_function(code, local_vars={}, global_vars=None):
+    if not global_vars:
+        global_vars = globals()
+    retval = None
+    context = {}
+    code = re.sub(r"(?m)^", "    ", code)
+    code = "def anon(" + ','.join(local_vars.keys()) + "):\n" + code
+    exec code in global_vars, context
+    retval = context['anon'](*(local_vars.values()))
+    return retval
 
 parser = ArgumentParser()
 parser.add_argument('-M', dest='manifest')
@@ -492,7 +503,7 @@ if valid < 2:
 
     od = ''
     try:
-        od = pickle.dumps(eval(exe))
+        od = str(eval_as_function(exe))
     except Exception, e:
         err.write(e.message+'\n')
         accounting[6] += 1
@@ -517,14 +528,17 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             (_prosrv, _acc1srv, _acc2srv, _con1srv,
              _con2srv, _obj1srv, _obj2srv) = _test_servers
             fd, zerovm_mock = mkstemp()
-            os.write(fd, def_mock)
+            if mock:
+                os.write(fd, mock)
+            else:
+                os.write(fd, def_mock)
             _obj1srv.zerovm_exename = ['python', zerovm_mock]
             #_obj1srv.zerovm_nexe_xparams = ['ok.', '0']
             _obj2srv.zerovm_exename = ['python', zerovm_mock]
             #_obj2srv.zerovm_nexe_xparams = ['ok.', '0']
 
         self._randomnumbers = self.get_random_numbers()
-        self._nexescript = ('sorted(id)')
+        self._nexescript = ('return pickle.dumps(sorted(id))')
         self._nexescript_etag = md5()
         self._nexescript_etag.update(self._nexescript)
         self._nexescript_etag = self._nexescript_etag.hexdigest()
@@ -1189,7 +1203,6 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
             res = req.get_response(prosrv)
             print res
 
-
     def test_QUERY_immediate_stdout(self):
         self.setup_QUERY()
         conf = [
@@ -1208,18 +1221,89 @@ errdump(0, valid, retcode, mnfst.NexeEtag, accounting, status)
         req.body = conf
         res = req.get_response(prosrv)
         self.assertEqual(res.status_int, 200)
-        resp = [
-                {
-                'status': '200 OK',
-                'body': self.get_sorted_numbers(),
-                'name': 'sort',
-                'nexe_etag': '07405c77e6bdc4533612831e02bed9fb',
-                'nexe_status': 'ok.',
-                'nexe_retcode': 0
+        self.assertEqual(res.content_type, 'text/html')
+        self.assertEqual(res.body, self.get_sorted_numbers())
+        conf = [
+            {
+                'name':'sort',
+                'exec':{'path':'/c/exe'},
+                'file_list':[
+                    {'device':'stdin','path':'/c/o'},
+                    {'device':'stdout', 'content-type': 'application/x-pickle'}
+                ]
             }
         ]
-        self.assertEqual(res.body, json.dumps(resp))
-        self.assertEqual(res.headers['content-type'], 'application/json')
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.content_type, 'application/x-pickle')
+        self.assertEqual(res.body, self.get_sorted_numbers())
+
+    def test_QUERY_immediate_response(self):
+        self.setup_QUERY()
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+        nexe = \
+r'''
+content = '<html><body>Test this</body></html>\r\n'
+return ('Status: 200 OK\r\n'
+       'Content-Type: text/html\r\n'
+       'Content-Length: %d'
+       '\r\n' % len(content)
+       + content)
+'''[1:-1]
+        self.create_object(prolis, '/v1/a/c/exe2', nexe)
+        conf = [
+            {
+                'name':'http',
+                'exec':{'path':'/c/exe2'},
+                'file_list':[
+                    {'device':'stdout', 'content-type': 'message/http'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        print res.headers
+        print res.body
+
+    def test_QUERY_store_meta(self):
+        self.setup_QUERY()
+        prolis = _test_sockets[0]
+        prosrv = _test_servers[0]
+        nexe =\
+r'''
+return 'Test Test'
+'''[1:-1]
+        self.create_object(prolis, '/v1/a/c/exe2', nexe)
+        conf = [
+            {
+                'name':'http',
+                'exec':{'path':'/c/exe2'},
+                'file_list':[
+                    {'device':'stdout', 'content-type': 'text/plain',
+                     'meta': {'key1': 'test1', 'key2': 'test2'},
+                     'path': '/c/o3'
+                    }
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        req = self.object_request('/v1/a/c/o3')
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.headers['content-type'], 'text/plain')
+        self.assertEqual(res.headers['x-object-meta-key1'], 'test1')
+        self.assertEqual(res.headers['x-object-meta-key2'], 'test2')
+        self.assertEqual(res.body, 'Test Test')
 
     def test_QUERY_sort_immediate_stdout_stderr(self):
         self.setup_QUERY()

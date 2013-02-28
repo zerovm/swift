@@ -29,7 +29,7 @@ from swift.proxy.server import Controller, ObjectController, ContainerController
 from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout, ChunkReadTimeout, \
     ChunkWriteTimeout
-from swift.common.constraints import check_utf8, MAX_FILE_SIZE
+from swift.common.constraints import check_utf8, MAX_FILE_SIZE, MAX_META_NAME_LENGTH, MAX_META_VALUE_LENGTH, MAX_META_COUNT, MAX_META_OVERALL_SIZE
 from swift.common.swob import Request, Response, HTTPNotFound, HTTPPreconditionFailed,\
     HTTPRequestTimeout, HTTPRequestEntityTooLarge, HTTPBadRequest,\
     HTTPUnprocessableEntity, HTTPServiceUnavailable, HTTPClientDisconnect
@@ -240,11 +240,13 @@ class ProxyQueryMiddleware(object):
         self.app.version = 'v1'
         self.app.zerovm_uses_newest = conf.get('zerovm_uses_newest', 'f').lower() in TRUE_VALUES
         self.app.zerovm_accounting_enabled = conf.get('zerovm_accounting_enabled', 'f').lower() in TRUE_VALUES
+        self.app.zerovm_content_type = conf.get('zerovm_default_content_type', 'application/octet-stream')
 
     def __call__(self, env, start_response):
 
         req = Request(env)
         if req.method == 'POST' and 'x-zerovm-execute' in req.headers:
+            controller = None
             if req.content_length and req.content_length < 0:
                 return HTTPBadRequest(request=req,
                     body='Invalid Content-Length')(env, start_response)
@@ -302,8 +304,9 @@ class ZvmNode(object):
         self.connect = []
         self.bind = []
 
-    def add_channel(self, device, access, path=None):
-        channel = ZvmChannel(device, access, path)
+    def add_channel(self, device, access, path=None,
+                    content_type='application/octet-stream', meta_data=None):
+        channel = ZvmChannel(device, access, path, content_type, meta_data)
         self.channels.append(channel)
 
     def get_channel(self, device=None, path=None):
@@ -339,10 +342,13 @@ class ZvmNode(object):
 
 
 class ZvmChannel(object):
-    def __init__(self, device, access, path=None):
+    def __init__(self, device, access, path=None,
+                 content_type='application/octet-stream', meta_data=None):
         self.device = device
         self.access = access
         self.path = path
+        self.content_type = content_type
+        self.meta = meta_data if meta_data else {}
 
 
 class ZvmResponse(object):
@@ -611,6 +617,8 @@ class ClusterController(Controller):
                         device = f.get('device')
                         access = device_map.get(device)
                         path = f.get('path')
+                        content_type = f.get('content-type', self.app.zerovm_content_type)
+                        meta = f.get('meta', None)
                         if path and '*' in path:
                             if read_group:
                                 read_mask = read_list[0].get('path')
@@ -635,7 +643,8 @@ class ClusterController(Controller):
                                         new_path = new_path.replace('*',
                                             m.group(j), 1)
                                     new_node.add_channel(device, access,
-                                        path=new_path)
+                                        path=new_path, content_type=content_type,
+                                        meta_data=meta)
                             else:
                                 for i in range(1, node_count + 1):
                                     new_name = self.create_name(node_name, i)
@@ -648,7 +657,8 @@ class ClusterController(Controller):
                                         nid += 1
                                         self.nodes[new_name] = new_node
                                     new_node.add_channel(device, access,
-                                        path=new_path)
+                                        path=new_path, content_type=content_type,
+                                        meta_data=meta)
                         elif path:
                             if node_count > 1:
                                 return HTTPBadRequest(request=req,
@@ -661,7 +671,9 @@ class ClusterController(Controller):
                                     nexe_args, nexe_env)
                                 nid += 1
                                 self.nodes[node_name] = new_node
-                            new_node.add_channel(device, access, path=path)
+                            new_node.add_channel(device, access,
+                                path=path, content_type=content_type,
+                                meta_data=meta)
                         else:
                             if 'stdout' not in device \
                             and 'stderr' not in device:
@@ -679,7 +691,8 @@ class ClusterController(Controller):
                                         nexe_path, nexe_args, nexe_env)
                                     nid += 1
                                     self.nodes[node_name] = new_node
-                                new_node.add_channel(device, access)
+                                new_node.add_channel(device, access,
+                                    content_type=f.get('content-type', 'text/html'))
 
                     for f in other_list:
                         # only debug channel is here, for now
@@ -1076,6 +1089,7 @@ class ClusterController(Controller):
                     final_body = FinalBody(resp.app_iter)
                     final_response.app_iter = final_body
                     final_response.content_length = resp.content_length
+                    final_response.content_type = resp.content_type
         ns_server.stop()
         if self.app.zerovm_accounting_enabled:
             self._store_accounting_data(req)
@@ -1126,6 +1140,12 @@ class ClusterController(Controller):
             untar_stream.update_buffer(data)
             info = untar_stream.get_next_tarinfo()
             while info:
+                if 'sysmap' in info.name:
+                    untar_stream.to_write = info.size
+                    untar_stream.offset_data = info.offset_data
+                    self._load_channel_data(node, ExtractedFile(untar_stream))
+                    info = untar_stream.get_next_tarinfo()
+                    continue
                 chan = node.get_channel(device=info.name)
                 if not chan:
                     conn.error = 'Channel name %s not found' % info.name
@@ -1137,6 +1157,7 @@ class ClusterController(Controller):
                         total_size=info.size))
                     resp.app_iter = app_iter
                     resp.content_length = info.size
+                    resp.content_type = chan.content_type
                     return conn
                 dest_header = unquote(chan.path)
                 acct = request.path_info.split('/', 2)[1]
@@ -1147,11 +1168,16 @@ class ClusterController(Controller):
                     environ=request.environ, headers=request.headers)
                 dest_req.path_info = dest_header
                 dest_req.method = 'PUT'
-                dest_req.headers['Content-Length'] = info.size
+                dest_req.headers['content-length'] = info.size
                 untar_stream.to_write = info.size
                 untar_stream.offset_data = info.offset_data
                 dest_req.environ['wsgi.input'] =\
                     ExtractedFile(untar_stream)
+                dest_req.headers['content-type'] = chan.content_type
+                error = self._update_metadata(dest_req, chan.meta)
+                if error:
+                    conn.error = error
+                    return conn
                 dest_resp = \
                     ObjectController(self.app, acct,
                     dest_container_name, dest_obj_name).PUT(dest_req)
@@ -1252,6 +1278,34 @@ class ClusterController(Controller):
             if resp.status_int >= 300:
                 self.app.logger.warn(
                     _('ERROR Cannot write stats for account %s'), self.account_name)
+
+    def _load_channel_data(self, node, file):
+        config = json.loads(file.read())
+        for new_ch in config['channels']:
+            old_ch = node.get_channel(device=new_ch['device'])
+            if old_ch:
+                old_ch.content_type = new_ch.content_type
+                if new_ch.get('meta', None):
+                    for k,v in new_ch.get('meta').iteritems():
+                        old_ch.meta[k] = v
+
+    def _update_metadata(self, request, meta_data):
+        if not meta_data:
+            return None
+        meta_count = 0
+        meta_size = 0
+        for key,value in meta_data.iteritems():
+            meta_count += 1
+            meta_size += len(key) + len(value)
+            if len(key) > MAX_META_NAME_LENGTH:
+                return 'Metadata name too long; max %d' % MAX_META_NAME_LENGTH
+            elif len(value) > MAX_META_VALUE_LENGTH:
+                return 'Metadata value too long; max %d' % MAX_META_VALUE_LENGTH
+            elif meta_count > MAX_META_COUNT:
+                return 'Too many metadata items; max %d' % MAX_META_COUNT
+            elif meta_size > MAX_META_OVERALL_SIZE:
+                return 'Total metadata too large; max %d' % MAX_META_OVERALL_SIZE
+            request.headers['x-object-meta-%s' % key] = value
 
 
 def filter_factory(global_conf, **local_conf):
