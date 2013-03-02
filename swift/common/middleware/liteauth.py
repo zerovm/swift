@@ -29,6 +29,7 @@ class LiteAuth(object):
         #conf_path = conf.get('__file__')
         #self.swift = InternalClient('/etc/swift/proxy-server.conf', 'LiteAuth', 3)
         self.google_auth = '/login/google/'
+        self.shared_container = '/share/load'
         self.google_prefix = 'g_'
         self.logger = get_logger(conf, log_route='lite-auth')
         self.log_headers = conf.get('log_headers', 'f').lower() in TRUE_VALUES
@@ -65,14 +66,36 @@ class LiteAuth(object):
                     else:
                         return self.do_google_login(env, code[0], state[0])(env, start_response)
             return self.do_google_oauth(state[0])(env, start_response)
-        auth_token = self.extract_auth_token(env)
-        if auth_token:
-            env['HTTP_X_AUTH_TOKEN'] = auth_token
-            env['HTTP_X_STORAGE_TOKEN'] = auth_token
-        token = env.get('HTTP_X_AUTH_TOKEN', env.get('HTTP_X_STORAGE_TOKEN', None))
+        token = self.extract_auth_token(env)
         if token:
+            env['HTTP_X_AUTH_TOKEN'] = token
+            env['HTTP_X_STORAGE_TOKEN'] = token
             user_data = self.get_cached_user_data(env, token)
             if user_data:
+                if env.get('PATH_INFO', '').startswith(self.shared_container):
+                    path = env.get('PATH_INFO', '')[len(self.shared_container):]
+                    try:
+                        account, container = split_path(path, 1, 2, True)
+                    except ValueError, e:
+                        return HTTPNotFound(body=str(e))(env, start_response)
+                    account_req = Request.blank('/%s/%s' % (self.version, user_data))
+                    account_req.method = 'HEAD'
+                    resp = account_req.get_response(self.app)
+                    if resp.status_int >= 300:
+                        return HTTPNotFound(body=resp.body)(env, start_response)
+                    shared = {}
+                    if 'x-account-meta-shared' in resp.headers:
+                        try:
+                            shared = json.loads(resp.headers['x-account-meta-shared'])
+                        except Exception:
+                            pass
+                    shared['%s/%s' % (account, container)] = 'shared'
+                    account_req = Request.blank('/%s/%s' % (self.version, user_data))
+                    account_req.method = 'POST'
+                    self.copy_account_metadata(resp.headers, account_req.headers)
+                    account_req.headers['x-account-meta-shared'] = json.dumps(shared)
+                    return account_req.get_response(self.app)(env, start_response)
+
                 env['REMOTE_USER'] = user_data
                 env['HTTP_X_AUTH_TOKEN'] = '%s,%s' % (user_data, token)
                 env['swift.authorize'] = self.authorize
@@ -142,6 +165,7 @@ class LiteAuth(object):
         if not 'x-account-meta-userdata' in resp.headers:
             userdata_req = Request.blank('/%s/%s' % (self.version, user_data))
             userdata_req.method = 'POST'
+            self.copy_account_metadata(resp.headers, userdata_req.headers)
             userdata_req.headers['x-account-meta-userdata'] = json.dumps(c.request('/userinfo'))
             userdata_req.get_response(self.app)
         cookie = self.create_session_cookie(token=token, expires_in=c.expires_in)
@@ -262,6 +286,12 @@ class LiteAuth(object):
                      req.headers.get('etag', '-'),
                      req.environ.get('swift.trans_id', '-'), logged_headers or '-',
                      trans_time)))
+
+    def copy_account_metadata(self, src_headers, dst_headers):
+        prefix = 'x-account-meta-'
+        for k, v in src_headers.iteritems():
+            if k.startswith(prefix):
+                dst_headers[k] = v
 
 
 def filter_factory(global_conf, **local_conf):
