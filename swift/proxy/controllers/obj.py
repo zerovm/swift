@@ -916,36 +916,55 @@ class ObjectController(Controller):
 
         reader = req.environ['wsgi.input'].read
         data_source = iter(lambda: reader(self.app.client_chunk_size), '')
+        long_source = False
         source_header = req.headers.get('X-Copy-From')
+        if not source_header:
+            source_header = req.headers.get('X-Copy-From-Account')
+            if source_header:
+                long_source = True
         source_resp = None
         if source_header:
             source_header = unquote(source_header)
-            acct = req.path_info.split('/', 2)[1]
-            if isinstance(acct, unicode):
-                acct = acct.encode('utf-8')
             if not source_header.startswith('/'):
                 source_header = '/' + source_header
-            source_header = '/' + acct + source_header
-            try:
-                src_container_name, src_obj_name = \
-                    source_header.split('/', 3)[2:]
-            except ValueError:
-                return HTTPPreconditionFailed(
-                    request=req,
-                    body='X-Copy-From header must be of the form'
-                         '<container name>/<object name>')
+            if long_source:
+                try:
+                    acct, src_container_name, src_obj_name = \
+                        source_header.split('/', 3)[1:]
+                except ValueError:
+                    return HTTPPreconditionFailed(
+                        request=req,
+                        body='X-Copy-From-Account header must be of the form'
+                             '<account name>/<container name>/<object name>')
+            else:
+                acct = req.path_info.split('/', 2)[1]
+            if isinstance(acct, unicode):
+                acct = acct.encode('utf-8')
+            if not long_source:
+                source_header = '/' + acct + source_header
+                try:
+                    src_container_name, src_obj_name = \
+                        source_header.split('/', 3)[2:]
+                except ValueError:
+                    return HTTPPreconditionFailed(
+                        request=req,
+                        body='X-Copy-From header must be of the form'
+                             '<container name>/<object name>')
             source_req = req.copy_get()
             source_req.path_info = source_header
             source_req.headers['X-Newest'] = 'true'
             orig_obj_name = self.object_name
             orig_container_name = self.container_name
+            orig_account_name = self.account_name
             self.object_name = src_obj_name
             self.container_name = src_container_name
+            self.account_name = acct
             source_resp = self.GET(source_req)
             if source_resp.status_int >= HTTP_MULTIPLE_CHOICES:
                 return source_resp
             self.object_name = orig_obj_name
             self.container_name = orig_container_name
+            self.account_name = orig_account_name
             new_req = Request.blank(req.path_info,
                                     environ=req.environ, headers=req.headers)
             data_source = source_resp.app_iter
@@ -960,7 +979,10 @@ class ObjectController(Controller):
                 return HTTPRequestEntityTooLarge(request=req)
             new_req.etag = source_resp.etag
             # we no longer need the X-Copy-From header
-            del new_req.headers['X-Copy-From']
+            if long_source:
+                del new_req.headers['X-Copy-From-Account']
+            else:
+                del new_req.headers['X-Copy-From']
             if not content_type_manually_set:
                 new_req.headers['Content-Type'] = \
                     source_resp.headers['Content-Type']
@@ -1111,8 +1133,12 @@ class ObjectController(Controller):
         resp = self.best_response(req, statuses, reasons, bodies,
                                   _('Object PUT'), etag=etag)
         if source_header:
-            resp.headers['X-Copied-From'] = quote(
-                source_header.split('/', 2)[2])
+            if long_source:
+                resp.headers['X-Copied-From-Account'] = quote(
+                    source_header.split('/', 1)[1])
+            else:
+                resp.headers['X-Copied-From'] = quote(
+                    source_header.split('/', 2)[2])
             if 'last-modified' in source_resp.headers:
                 resp.headers['X-Copied-From-Last-Modified'] = \
                     source_resp.headers['last-modified']
